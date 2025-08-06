@@ -90,37 +90,73 @@ class SetVAEModule(nn.Module):
             self.dim_reducer = None
             embed_input = input_dim
             out_output = input_dim
-        self.embed = nn.Linear(embed_input, latent_dim)
+        
+        self.embed = nn.Sequential(
+            nn.Linear(embed_input, latent_dim),
+            nn.LayerNorm(latent_dim),  # 添加层归一化
+            nn.GELU()  # 使用GELU激活函数
+        )
+        
         self.encoder_layers = nn.ModuleList(
             [ISAB(latent_dim, heads, m) for _ in range(levels)]
         )
         self.decoder_layers = nn.ModuleList(
             [AttentiveBottleneckLayer(latent_dim, heads, m) for _ in range(levels)]
         )
+        
+        # 改进的mu和logvar网络
         self.mu_logvar = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
-            nn.ReLU(),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(latent_dim, latent_dim * 2),
         )
-        self.out = nn.Linear(latent_dim, out_output)
+        
+        self.out = nn.Sequential(
+            nn.Linear(latent_dim, out_output),
+            nn.Tanh()  # 添加输出激活函数，限制输出范围
+        )
 
-        # Xavier initialization for Linear layers
+        # 改进的初始化
+        self._init_weights()
+
+    def _init_weights(self):
+        """改进的权重初始化"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
+                # 使用Xavier uniform初始化
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def encode(self, x):
         embeds = self.embed(x)
         current = embeds
         z_list = []
         for layer in self.encoder_layers:
-            current = layer(current) + current
+            # 添加残差连接
+            residual = current
+            current = layer(current)
+            current = current + residual  # 残差连接
+            
+            # 聚合并生成潜在变量
             agg = current.mean(dim=1, keepdim=True)
             mu_logvar = self.mu_logvar(agg)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
+            
+            # 限制logvar的范围，防止数值不稳定
+            logvar = torch.clamp(logvar, min=-10, max=10)
             std = torch.exp(0.5 * logvar)
+            
+            # 添加噪声防止过拟合
+            if self.training:
+                eps = torch.randn_like(std) * 0.1
+                std = std + eps.abs()
+                
             dist = Normal(mu, std)
             z_sampled = dist.rsample()
             z_list.append((z_sampled, mu, logvar))
@@ -130,8 +166,10 @@ class SetVAEModule(nn.Module):
         idx = 1 if use_mean else 0
         current = z_list[-1][idx]
         for l in range(self.levels - 1, -1, -1):
+            # 添加残差连接
+            residual = current
             layer_out = self.decoder_layers[l](current, target_n, noise_std=noise_std)
-            current = layer_out + current.expand_as(layer_out)
+            current = layer_out + residual.expand_as(layer_out)
         recon = self.out(current)
         return recon
 
@@ -140,9 +178,18 @@ class SetVAEModule(nn.Module):
             reduced = self.dim_reducer(var)
         else:
             reduced = var
+        
+        # 改进的归一化方法
         norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+        # 添加小的随机噪声防止除零
+        norms = norms + torch.randn_like(norms) * 1e-8
         reduced_normalized = reduced / (norms + 1e-8)
         x = reduced_normalized * val
+        
+        # 添加输入dropout
+        if self.training:
+            x = F.dropout(x, p=0.1, training=True)
+            
         z_list, encoded = self.encode(x)
         target_n = x.size(1)
         recon = self.decode(z_list, target_n)
@@ -223,17 +270,34 @@ def recon_loss(
 
 
 def elbo_loss(recon, target, z_list, free_bits=0.1):
+    """
+    改进的ELBO损失函数，防止后验坍缩
+    """
     r_loss = recon_loss(recon, target)
-    kl = 0
+    
+    total_kl = 0
     latent_dim = z_list[0][1].size(-1)
     min_kl = free_bits * latent_dim
-    for _, mu, logvar in z_list:
-        raw_kl_term = (
-            -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
-        )  # Positive KL
-        clamped_kl = torch.clamp(raw_kl_term, min=min_kl)
-        kl += clamped_kl
-    return r_loss, kl
+    
+    for layer_idx, (z_sample, mu, logvar) in enumerate(z_list):
+        # 标准KL散度
+        kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+        
+        # 应用free bits
+        kl_div = torch.clamp(kl_div, min=min_kl)
+        
+        # 添加层级权重，深层的KL损失权重更高
+        layer_weight = (layer_idx + 1) / len(z_list)
+        
+        # 防止方差坍缩的正则化项
+        var_reg = -0.1 * torch.mean(logvar)  # 鼓励更大的方差
+        
+        # 防止均值坍缩的正则化项  
+        mean_reg = 0.01 * torch.mean(mu.pow(2))  # 轻微惩罚过大的均值
+        
+        total_kl += layer_weight * (kl_div.mean() + var_reg + mean_reg)
+    
+    return r_loss, total_kl
 
 
 # --------------------- Test functions for each module ----------------------------
