@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+import math
 
 
 # MAB
 class MAB(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
-        self.multihead = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.multihead = nn.MultiheadAttention(dim, heads)
         self.ln1 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
             nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
@@ -16,12 +17,13 @@ class MAB(nn.Module):
         self.ln2 = nn.LayerNorm(dim)
 
     def forward(self, q, kv):
-        assert (
-            q.dim() == 3 and kv.dim() == 3
-        ), f"MAB input dims invalid: q={q.shape}, kv={kv.shape}"
-        attn_output, _ = self.multihead(q, kv, kv)  # (B, N, D)
-        h = self.ln1(q + attn_output)  # residual + norm
-        return self.ln2(h + self.ff(h))
+        q_t = q.transpose(0, 1)
+        kv_t = kv.transpose(0, 1)
+        attn_output, _ = self.multihead(q_t, kv_t, kv_t)
+        attn_output = attn_output.transpose(0, 1)
+        a = self.ln1(attn_output)
+        ff_out = self.ff(a)
+        return self.ln2(ff_out)
 
 
 # ISAB
@@ -101,23 +103,21 @@ class SetVAEModule(nn.Module):
             nn.Linear(latent_dim, latent_dim * 2),
         )
         self.out = nn.Linear(latent_dim, out_output)
-        self.pma_agg = PoolingByMultiheadAttention(latent_dim, heads)
 
         # Xavier initialization for Linear layers
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
 
     def encode(self, x):
         embeds = self.embed(x)
         current = embeds
         z_list = []
         for layer in self.encoder_layers:
-            layer_out = layer(current)
-            current = layer_out + current + embeds
-            agg = self.pma_agg(current, target_n=1).squeeze(1)
+            current = layer(current) + current
+            agg = current.mean(dim=1, keepdim=True)
             mu_logvar = self.mu_logvar(agg)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
             std = torch.exp(0.5 * logvar)
@@ -128,10 +128,10 @@ class SetVAEModule(nn.Module):
 
     def decode(self, z_list, target_n, use_mean=False, noise_std=0.5):
         idx = 1 if use_mean else 0
-        current = z_list[-1][idx].unsqueeze(1)  # [B, 1, D] instead of [B, D]
+        current = z_list[-1][idx]
         for l in range(self.levels - 1, -1, -1):
             layer_out = self.decoder_layers[l](current, target_n, noise_std=noise_std)
-            current = layer_out + current  # broadcasting [B, 1, D] over [B, N, D]
+            current = layer_out + current.expand_as(layer_out)
         recon = self.out(current)
         return recon
 
