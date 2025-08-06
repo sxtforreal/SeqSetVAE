@@ -22,8 +22,17 @@ pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs
 w = 0.5
 free_bits = 0.2
 
+# 后验坍缩防护参数
+use_spectral_norm = True
+beta_strategy = "cyclical"  # "linear", "cyclical", "sigmoid"
+min_beta = 0.0
+cycle_length = 5000
+beta_warmup_steps = 1000
+use_tc_decomposition = False
+pc_threshold = 0.1
+
 # Logger
-name = "SeqSetVAE-v2"
+name = "SeqSetVAE-v3-improved"
 log_every_n_steps = 200
 ckpt_every_n_steps = 200
 

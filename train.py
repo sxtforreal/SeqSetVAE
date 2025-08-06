@@ -40,6 +40,14 @@ if __name__ == "__main__":
         pretrained_ckpt=config.pretrained_ckpt,
         w=config.w,
         free_bits=config.free_bits,
+        # 新增的后验坍缩防护参数
+        use_spectral_norm=config.use_spectral_norm,
+        beta_strategy=config.beta_strategy,
+        min_beta=config.min_beta,
+        cycle_length=config.cycle_length,
+        beta_warmup_steps=config.beta_warmup_steps,
+        use_tc_decomposition=config.use_tc_decomposition,
+        pc_threshold=config.pc_threshold,
     )
 
     checkpoint = ModelCheckpoint(

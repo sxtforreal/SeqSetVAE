@@ -2,6 +2,99 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+import math
+
+# 添加谱归一化装饰器
+def spectral_norm_layer(layer):
+    """Apply spectral normalization to a layer"""
+    return nn.utils.spectral_norm(layer)
+
+# 后验坍缩诊断工具
+class PosteriorCollapseMonitor:
+    def __init__(self, threshold=0.1):
+        self.threshold = threshold
+        self.reset()
+    
+    def reset(self):
+        self.kl_values = []
+        self.active_units = []
+        self.mutual_info = []
+    
+    def update(self, z_list, reconstruction_loss):
+        """更新后验坍缩监控指标"""
+        total_kl = 0
+        active_count = 0
+        
+        for z_sample, mu, logvar in z_list:
+            # 计算每个维度的KL散度
+            kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+            kl_mean = kl_per_dim.mean(dim=0)  # 平均每个维度
+            
+            # 统计活跃单元（KL > threshold的维度）
+            active_dims = (kl_mean > self.threshold).sum().item()
+            active_count += active_dims
+            total_kl += kl_per_dim.sum()
+        
+        self.kl_values.append(total_kl.item())
+        self.active_units.append(active_count)
+        
+        # 简单的互信息估计（基于重构损失和KL的比值）
+        if reconstruction_loss > 0:
+            mi_estimate = total_kl.item() / (reconstruction_loss + 1e-8)
+            self.mutual_info.append(mi_estimate)
+    
+    def get_metrics(self):
+        if not self.kl_values:
+            return {}
+        return {
+            'avg_kl': sum(self.kl_values) / len(self.kl_values),
+            'avg_active_units': sum(self.active_units) / len(self.active_units),
+            'avg_mutual_info': sum(self.mutual_info) / len(self.mutual_info) if self.mutual_info else 0,
+            'collapse_ratio': 1.0 - (sum(self.active_units) / len(self.active_units)) / (len(self.kl_values) * 256)  # 假设256维
+        }
+
+# 改进的β退火策略
+class BetaScheduler:
+    def __init__(self, strategy='cyclical', max_beta=1.0, min_beta=0.0, cycle_length=10000, warmup_steps=1000):
+        self.strategy = strategy
+        self.max_beta = max_beta
+        self.min_beta = min_beta
+        self.cycle_length = cycle_length
+        self.warmup_steps = warmup_steps
+        self.step_count = 0
+    
+    def get_beta(self):
+        if self.strategy == 'linear':
+            return self._linear_annealing()
+        elif self.strategy == 'cyclical':
+            return self._cyclical_annealing()
+        elif self.strategy == 'sigmoid':
+            return self._sigmoid_annealing()
+        else:
+            return self.max_beta
+    
+    def _linear_annealing(self):
+        if self.step_count < self.warmup_steps:
+            return self.min_beta + (self.max_beta - self.min_beta) * (self.step_count / self.warmup_steps)
+        return self.max_beta
+    
+    def _cyclical_annealing(self):
+        cycle_pos = (self.step_count % self.cycle_length) / self.cycle_length
+        if cycle_pos < 0.5:
+            # 前半周期：从min_beta增长到max_beta
+            return self.min_beta + (self.max_beta - self.min_beta) * (cycle_pos * 2)
+        else:
+            # 后半周期：从max_beta降到min_beta
+            return self.max_beta - (self.max_beta - self.min_beta) * ((cycle_pos - 0.5) * 2)
+    
+    def _sigmoid_annealing(self):
+        # Sigmoid退火
+        x = (self.step_count - self.warmup_steps / 2) / (self.warmup_steps / 4)
+        sigmoid_val = 1 / (1 + math.exp(-x))
+        return self.min_beta + (self.max_beta - self.min_beta) * sigmoid_val
+    
+    def step(self):
+        self.step_count += 1
 
 
 # MAB
@@ -76,39 +169,55 @@ class AttentiveBottleneckLayer(nn.Module):
 
 # SetVAE
 class SetVAEModule(nn.Module):
-    def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m):
+    def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m, use_spectral_norm=True):
         super().__init__()
         self.reduced_dim = reduced_dim
         self.levels = levels
+        self.use_spectral_norm = use_spectral_norm
+        
         if reduced_dim is not None:
-            self.dim_reducer = nn.Linear(input_dim, reduced_dim)
+            self.dim_reducer = spectral_norm_layer(nn.Linear(input_dim, reduced_dim)) if use_spectral_norm else nn.Linear(input_dim, reduced_dim)
             embed_input = reduced_dim
             out_output = reduced_dim
         else:
             self.dim_reducer = None
             embed_input = input_dim
             out_output = input_dim
-        self.embed = nn.Linear(embed_input, latent_dim)
+            
+        self.embed = spectral_norm_layer(nn.Linear(embed_input, latent_dim)) if use_spectral_norm else nn.Linear(embed_input, latent_dim)
         self.encoder_layers = nn.ModuleList(
             [ISAB(latent_dim, heads, m) for _ in range(levels)]
         )
         self.decoder_layers = nn.ModuleList(
             [AttentiveBottleneckLayer(latent_dim, heads, m) for _ in range(levels)]
         )
+        
+        # 改进的μ和logvar网络，增加更多非线性
         self.mu_logvar = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim * 2),
+            spectral_norm_layer(nn.Linear(latent_dim, latent_dim * 2)) if use_spectral_norm else nn.Linear(latent_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            spectral_norm_layer(nn.Linear(latent_dim * 2, latent_dim * 2)) if use_spectral_norm else nn.Linear(latent_dim * 2, latent_dim * 2),
         )
-        self.out = nn.Linear(latent_dim, out_output)
+        
+        self.out = spectral_norm_layer(nn.Linear(latent_dim, out_output)) if use_spectral_norm else nn.Linear(latent_dim, out_output)
         self.pma_agg = PoolingByMultiheadAttention(latent_dim, heads)
 
-        # Xavier initialization for Linear layers
+        # 改进的初始化策略
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """改进的权重初始化策略"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
+                # 使用He初始化对于GELU激活函数更合适
+                torch.nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                torch.nn.init.ones_(module.weight)
+                torch.nn.init.zeros_(module.bias)
 
     def encode(self, x):
         embeds = self.embed(x)
@@ -120,7 +229,12 @@ class SetVAEModule(nn.Module):
             agg = self.pma_agg(current, target_n=1).squeeze(1)
             mu_logvar = self.mu_logvar(agg)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
-            std = torch.exp(0.5 * logvar)
+            
+            # 限制logvar的范围以避免数值不稳定
+            logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+            
+            # 添加一个小的噪声来鼓励多样性
+            std = torch.exp(0.5 * logvar) + 1e-6
             dist = Normal(mu, std)
             z_sampled = dist.rsample()
             z_list.append((z_sampled, mu, logvar))
@@ -222,18 +336,84 @@ def recon_loss(
     return total_loss
 
 
-def elbo_loss(recon, target, z_list, free_bits=0.1):
+def elbo_loss(recon, target, z_list, free_bits=0.1, beta=1.0, use_tc_decomposition=False):
+    """
+    改进的ELBO损失，包含多种后验坍缩防护措施
+    
+    Args:
+        recon: 重构输出
+        target: 目标输入
+        z_list: 潜在变量列表
+        free_bits: 自由位数
+        beta: KL权重
+        use_tc_decomposition: 是否使用Total Correlation分解
+    """
     r_loss = recon_loss(recon, target)
-    kl = 0
+    kl_total = 0
     latent_dim = z_list[0][1].size(-1)
-    min_kl = free_bits * latent_dim
-    for _, mu, logvar in z_list:
-        raw_kl_term = (
-            -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
-        )  # Positive KL
-        clamped_kl = torch.clamp(raw_kl_term, min=min_kl)
-        kl += clamped_kl
-    return r_loss, kl
+    
+    for level_idx, (z_sample, mu, logvar) in enumerate(z_list):
+        # 标准KL散度
+        kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        
+        # Free bits策略 - 每个维度独立应用
+        min_kl_per_dim = free_bits
+        kl_per_dim_clamped = torch.clamp(kl_per_dim, min=min_kl_per_dim)
+        
+        # 层次化的KL权重（深层权重更大）
+        level_weight = 1.0 + 0.1 * level_idx
+        
+        if use_tc_decomposition and z_sample.size(0) > 1:
+            # Total Correlation分解
+            kl_loss = beta_tc_vae_loss(z_sample, mu, logvar, beta=beta)
+        else:
+            kl_loss = kl_per_dim_clamped.sum(dim=-1).mean()
+        
+        kl_total += level_weight * kl_loss
+    
+    return r_loss, kl_total
+
+def beta_tc_vae_loss(z, mu, logvar, beta=1.0, alpha=1.0, gamma=1.0):
+    """
+    β-TC-VAE损失，分解KL散度为三个部分：
+    - Index-code MI: I(z; n)
+    - Total Correlation: TC(z)  
+    - Dimension-wise KL: ∑KL(q(zi|n)||p(zi))
+    """
+    batch_size = z.size(0)
+    latent_dim = z.size(-1)
+    
+    # 标准KL散度
+    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+    
+    # 计算log q(z|x)
+    log_qz_condx = gaussian_log_density(z, mu, logvar)
+    
+    # 计算log q(z) = log ∫ q(z|x)p(x)dx ≈ log (1/N ∑ q(z|xi))
+    # 使用重要性采样近似
+    _logqz = gaussian_log_density(
+        z.view(batch_size, 1, latent_dim),
+        mu.view(1, batch_size, latent_dim),
+        logvar.view(1, batch_size, latent_dim)
+    )
+    logqz_prodmarginals = torch.logsumexp(_logqz, dim=1, keepdim=False) - math.log(batch_size)
+    logqz = torch.logsumexp(_logqz.sum(2), dim=1, keepdim=False) - math.log(batch_size)
+    
+    # 计算各个项
+    index_code_mi = (log_qz_condx - logqz).mean()
+    total_corr = (logqz - logqz_prodmarginals.sum(1)).mean()
+    dim_wise_kl = kl_div.mean()
+    
+    # β-TC-VAE损失
+    return alpha * index_code_mi + beta * total_corr + gamma * dim_wise_kl
+
+def gaussian_log_density(samples, mu, logvar):
+    """计算高斯分布的对数密度"""
+    pi = torch.tensor(math.pi)
+    normalization = -0.5 * (logvar + torch.log(2 * pi))
+    inv_var = torch.exp(-logvar)
+    log_density = normalization - 0.5 * ((samples - mu) ** 2 * inv_var)
+    return log_density
 
 
 # --------------------- Test functions for each module ----------------------------

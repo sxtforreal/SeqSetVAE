@@ -11,6 +11,8 @@ from modules import (
     AttentiveBottleneckLayer,
     elbo_loss,
     recon_loss as chamfer_recon_loss,
+    BetaScheduler,
+    PosteriorCollapseMonitor,
 )
 
 
@@ -23,11 +25,30 @@ class SetVAE(pl.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.setvae = SetVAEModule(input_dim, reduced_dim, latent_dim, levels, heads, m)
+        
+        # 使用改进的SetVAE模块
+        use_spectral_norm = kwargs.get("use_spectral_norm", True)
+        self.setvae = SetVAEModule(input_dim, reduced_dim, latent_dim, levels, heads, m, use_spectral_norm)
+        
+        # β调度器
+        beta_strategy = kwargs.get("beta_strategy", "cyclical")
+        self.beta_scheduler = BetaScheduler(
+            strategy=beta_strategy,
+            max_beta=beta,
+            min_beta=kwargs.get("min_beta", 0.0),
+            cycle_length=kwargs.get("cycle_length", 10000),
+            warmup_steps=kwargs.get("beta_warmup_steps", 1000)
+        )
+        
+        # 后验坍缩监控器
+        self.pc_monitor = PosteriorCollapseMonitor(threshold=kwargs.get("pc_threshold", 0.1))
+        
         self.beta = beta
         self.lr = lr
         self.warmup_steps = kwargs.get("warmup_steps", 10_000)
         self.max_steps = kwargs.get("max_steps", 1_000_000)
+        self.use_tc_decomposition = kwargs.get("use_tc_decomposition", False)
+        self.free_bits = kwargs.get("free_bits", 0.1)
 
     def forward(self, var, val):
         return self.setvae(var, val)
@@ -39,12 +60,35 @@ class SetVAE(pl.LightningModule):
             self.setvae.dim_reducer(var) if self.setvae.dim_reducer is not None else var
         )
         input_x = reduced * val
-        recon_loss, kl = elbo_loss(recon, input_x, z_list)
-        loss = recon_loss + self.beta * kl
-        self.log_dict(
-            {"train_loss": loss, "train_recon": recon_loss, "train_kl": kl},
-            prog_bar=True,
+        
+        # 使用动态β值和改进的损失函数
+        current_beta = self.beta_scheduler.get_beta()
+        recon_loss, kl = elbo_loss(
+            recon, input_x, z_list, 
+            free_bits=self.free_bits,
+            beta=current_beta,
+            use_tc_decomposition=self.use_tc_decomposition
         )
+        
+        # 更新后验坍缩监控器
+        self.pc_monitor.update(z_list, recon_loss.item())
+        
+        loss = recon_loss + current_beta * kl
+        
+        # 更新β调度器
+        self.beta_scheduler.step()
+        
+        # 记录更多指标
+        pc_metrics = self.pc_monitor.get_metrics()
+        log_dict = {
+            "train_loss": loss, 
+            "train_recon": recon_loss, 
+            "train_kl": kl,
+            "current_beta": current_beta,
+        }
+        log_dict.update({f"train_{k}": v for k, v in pc_metrics.items()})
+        
+        self.log_dict(log_dict, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -54,8 +98,16 @@ class SetVAE(pl.LightningModule):
             self.setvae.dim_reducer(var) if self.setvae.dim_reducer is not None else var
         )
         input_x = reduced * val
-        recon_loss, kl = elbo_loss(recon, input_x, z_list)  # noqa: F405
-        loss = recon_loss + self.beta * kl
+        
+        current_beta = self.beta_scheduler.get_beta()
+        recon_loss, kl = elbo_loss(
+            recon, input_x, z_list,
+            free_bits=self.free_bits,
+            beta=current_beta,
+            use_tc_decomposition=self.use_tc_decomposition
+        )
+        loss = recon_loss + current_beta * kl
+        
         self.log_dict(
             {"val_loss": loss, "val_recon": recon_loss, "val_kl": kl}, prog_bar=True
         )
@@ -138,7 +190,7 @@ class SeqSetVAE(pl.LightningModule):
 
         super().__init__()
 
-        # Pretrained SetVAE
+        # Pretrained SetVAE with improved architecture
         self.setvae = SetVAE(
             input_dim,
             reduced_dim,
@@ -148,6 +200,10 @@ class SeqSetVAE(pl.LightningModule):
             m,
             beta,
             lr,
+            use_spectral_norm=True,
+            beta_strategy='cyclical',
+            use_tc_decomposition=False,
+            free_bits=free_bits
         )
         if pretrained_ckpt is not None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -203,6 +259,10 @@ class SeqSetVAE(pl.LightningModule):
         self.lr = lr
         self.free_bits = free_bits
         self.latent_dim = latent_dim
+        
+        # 添加后验坍缩监控器
+        self.pc_monitor = PosteriorCollapseMonitor(threshold=0.1)
+        
         self.save_hyperparameters(ignore=["setvae"])
 
     def _apply_rope(self, x: torch.Tensor, pos: torch.Tensor):
@@ -250,18 +310,24 @@ class SeqSetVAE(pl.LightningModule):
             pos_list.append(minute_val)
             recon, z_list, _ = self.setvae(var, val)
             # Clamp all logvar in z_list
+            # 改进的KL计算和监控
             for i in range(len(z_list)):
                 z_sample, mu, logvar = z_list[i]
-                logvar = torch.clamp(logvar, min=-1.0, max=1.0)
+                logvar = torch.clamp(logvar, min=-10.0, max=10.0)  # 更宽的范围
                 z_list[i] = (z_sample, mu, logvar)
+            
             z_sample, mu, logvar = z_list[-1]  # Choose the deepest layer
             z_prims.append(z_sample.squeeze(1))
-            for _, mu, logvar in z_list:
-                raw_kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
-                min_kl = self.free_bits * self.latent_dim
-                clamped_kl = torch.clamp(raw_kl, min=min_kl)
-                kl_total += clamped_kl.mean()
-        kl_total /= S * len(z_list)
+            
+            # 使用改进的KL计算
+            for level_idx, (_, mu, logvar) in enumerate(z_list):
+                kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                min_kl_per_dim = self.free_bits
+                kl_per_dim_clamped = torch.clamp(kl_per_dim, min=min_kl_per_dim)
+                level_weight = 1.0 + 0.1 * level_idx
+                kl_total += level_weight * kl_per_dim_clamped.sum(dim=-1).mean()
+        
+        kl_total /= S
         z_seq = torch.stack(z_prims, dim=1)
         pos_tensor = torch.stack(pos_list, dim=1)
         z_seq = self._apply_rope(z_seq, pos_tensor)
@@ -317,6 +383,15 @@ class SeqSetVAE(pl.LightningModule):
         pred_loss = F.cross_entropy(logits, label)
         total_loss = pred_loss + self.w * (recon_loss + kl_loss)
 
+        # 更新后验坍缩监控器
+        if hasattr(self, 'pc_monitor'):
+            # 收集所有z_list用于监控
+            all_z_list = []
+            for s_dict in sets:
+                _, z_list_temp, _ = self.setvae(s_dict["var"], s_dict["val"])
+                all_z_list.extend(z_list_temp)
+            self.pc_monitor.update(all_z_list, recon_loss.item())
+
         # Metrics for validation stage
         if stage == "val":
             z_mean = z_seq.mean(dim=1)
@@ -325,6 +400,11 @@ class SeqSetVAE(pl.LightningModule):
             else:
                 z_var = 0.0
             self.log("val_z_var", z_var, prog_bar=True)
+            
+            # 记录后验坍缩指标
+            pc_metrics = self.pc_monitor.get_metrics()
+            for k, v in pc_metrics.items():
+                self.log(f"val_{k}", v, prog_bar=True)
 
             if self.num_classes == 2:
                 probs = torch.softmax(logits, dim=1)[:, 1]
