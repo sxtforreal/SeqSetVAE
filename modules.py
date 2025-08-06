@@ -5,7 +5,7 @@ from torch.distributions import Normal
 import math
 
 
-# MAB
+# MAB - Multi-head Attention Block
 class MAB(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
@@ -26,7 +26,7 @@ class MAB(nn.Module):
         return self.ln2(ff_out)
 
 
-# ISAB
+# ISAB - Induced Set Attention Block
 class ISAB(nn.Module):
     def __init__(self, dim, heads, m):
         super().__init__()
@@ -76,7 +76,7 @@ class AttentiveBottleneckLayer(nn.Module):
         return self.pma(z, target_n, noise_std=noise_std)
 
 
-# SetVAE
+# SetVAE Module
 class SetVAEModule(nn.Module):
     def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m):
         super().__init__()
@@ -93,8 +93,8 @@ class SetVAEModule(nn.Module):
         
         self.embed = nn.Sequential(
             nn.Linear(embed_input, latent_dim),
-            nn.LayerNorm(latent_dim),  # 添加层归一化
-            nn.GELU()  # 使用GELU激活函数
+            nn.LayerNorm(latent_dim),  # Add layer normalization
+            nn.GELU()  # Use GELU activation function
         )
         
         self.encoder_layers = nn.ModuleList(
@@ -104,7 +104,7 @@ class SetVAEModule(nn.Module):
             [AttentiveBottleneckLayer(latent_dim, heads, m) for _ in range(levels)]
         )
         
-        # 改进的mu和logvar网络
+        # Improved mu and logvar networks
         self.mu_logvar = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
@@ -115,17 +115,17 @@ class SetVAEModule(nn.Module):
         
         self.out = nn.Sequential(
             nn.Linear(latent_dim, out_output),
-            nn.Tanh()  # 添加输出激活函数，限制输出范围
+            nn.Tanh()  # Add output activation function to limit output range
         )
 
-        # 改进的初始化
+        # Improved initialization
         self._init_weights()
 
     def _init_weights(self):
-        """改进的权重初始化"""
+        """Improved weight initialization"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # 使用Xavier uniform初始化
+                # Use Xavier uniform initialization
                 nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
@@ -138,21 +138,21 @@ class SetVAEModule(nn.Module):
         current = embeds
         z_list = []
         for layer in self.encoder_layers:
-            # 添加残差连接
+            # Add residual connection
             residual = current
             current = layer(current)
-            current = current + residual  # 残差连接
+            current = current + residual  # Residual connection
             
-            # 聚合并生成潜在变量
+            # Aggregate and generate latent variables
             agg = current.mean(dim=1, keepdim=True)
             mu_logvar = self.mu_logvar(agg)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
             
-            # 限制logvar的范围，防止数值不稳定
+            # Clamp logvar range to prevent numerical instability
             logvar = torch.clamp(logvar, min=-10, max=10)
             std = torch.exp(0.5 * logvar)
             
-            # 添加噪声防止过拟合
+            # Add noise to prevent overfitting
             if self.training:
                 eps = torch.randn_like(std) * 0.1
                 std = std + eps.abs()
@@ -166,7 +166,7 @@ class SetVAEModule(nn.Module):
         idx = 1 if use_mean else 0
         current = z_list[-1][idx]
         for l in range(self.levels - 1, -1, -1):
-            # 添加残差连接
+            # Add residual connection
             residual = current
             layer_out = self.decoder_layers[l](current, target_n, noise_std=noise_std)
             current = layer_out + residual.expand_as(layer_out)
@@ -179,14 +179,14 @@ class SetVAEModule(nn.Module):
         else:
             reduced = var
         
-        # 改进的归一化方法
+        # Improved normalization method
         norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
-        # 添加小的随机噪声防止除零
+        # Add small random noise to prevent division by zero
         norms = norms + torch.randn_like(norms) * 1e-8
         reduced_normalized = reduced / (norms + 1e-8)
         x = reduced_normalized * val
         
-        # 添加输入dropout
+        # Add input dropout
         if self.training:
             x = F.dropout(x, p=0.1, training=True)
             
@@ -196,7 +196,7 @@ class SetVAEModule(nn.Module):
         return recon, z_list, encoded
 
 
-# Loss function
+# Loss functions
 
 
 def recon_loss(
@@ -271,7 +271,7 @@ def recon_loss(
 
 def elbo_loss(recon, target, z_list, free_bits=0.1):
     """
-    改进的ELBO损失函数，防止后验坍缩
+    Improved ELBO loss function to prevent posterior collapse
     """
     r_loss = recon_loss(recon, target)
     
@@ -280,20 +280,20 @@ def elbo_loss(recon, target, z_list, free_bits=0.1):
     min_kl = free_bits * latent_dim
     
     for layer_idx, (z_sample, mu, logvar) in enumerate(z_list):
-        # 标准KL散度
+        # Standard KL divergence
         kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
         
-        # 应用free bits
+        # Apply free bits
         kl_div = torch.clamp(kl_div, min=min_kl)
         
-        # 添加层级权重，深层的KL损失权重更高
+        # Add layer weights, deeper layers have higher KL loss weights
         layer_weight = (layer_idx + 1) / len(z_list)
         
-        # 防止方差坍缩的正则化项
-        var_reg = -0.1 * torch.mean(logvar)  # 鼓励更大的方差
+        # Regularization term to prevent variance collapse
+        var_reg = -0.1 * torch.mean(logvar)  # Encourage larger variance
         
-        # 防止均值坍缩的正则化项  
-        mean_reg = 0.01 * torch.mean(mu.pow(2))  # 轻微惩罚过大的均值
+        # Regularization term to prevent mean collapse
+        mean_reg = 0.01 * torch.mean(mu.pow(2))  # Slightly penalize large means
         
         total_kl += layer_weight * (kl_div.mean() + var_reg + mean_reg)
     
