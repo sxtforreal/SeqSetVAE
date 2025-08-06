@@ -12,28 +12,28 @@ import argparse
 from datetime import datetime
 
 def setup_collapse_detector(args):
-    """设置后验塌缩检测器"""
+    """Set up posterior collapse detector"""
     
-    # 根据数据大小调整检测参数
+    # Adjust detection parameters based on data size
     if args.fast_detection:
-        # 快速检测模式 - 更频繁的检查，更敏感的阈值
+        # Fast detection mode - more frequent checks, more sensitive thresholds
         detector = PosteriorCollapseDetector(
-            kl_threshold=0.005,          # 更严格的KL阈值
-            var_threshold=0.05,          # 更严格的方差阈值
-            active_units_threshold=0.15, # 更严格的激活单元阈值
+            kl_threshold=0.005,          # Stricter KL threshold
+            var_threshold=0.05,          # Stricter variance threshold
+            active_units_threshold=0.15, # Stricter active units threshold
             
-            window_size=50,              # 较小的窗口，更快响应
-            check_frequency=20,          # 每20步检查一次
+            window_size=50,              # Smaller window, faster response
+            check_frequency=20,          # Check every 20 steps
             
-            early_stop_patience=100,     # 更快的早期停止
+            early_stop_patience=100,     # Faster early stopping
             auto_save_on_collapse=True,
             
             log_dir=args.log_dir,
-            plot_frequency=200,          # 更频繁的绘图
+            plot_frequency=200,          # More frequent plotting
             verbose=True,
         )
     else:
-        # 标准检测模式
+        # Standard detection mode
         detector = PosteriorCollapseDetector(
             kl_threshold=0.01,
             var_threshold=0.1,
@@ -50,90 +50,90 @@ def setup_collapse_detector(args):
             verbose=True,
         )
     
-    print(f"🔍 塌缩检测器设置完成:")
-    print(f"  - 检测模式: {'快速' if args.fast_detection else '标准'}")
-    print(f"  - KL阈值: {detector.kl_threshold}")
-    print(f"  - 检查频率: 每{detector.check_frequency}步")
-    print(f"  - 日志目录: {detector.log_dir}")
+    print(f"🔍 Collapse detector setup complete:")
+    print(f"  - Detection mode: {'Fast' if args.fast_detection else 'Standard'}")
+    print(f"  - KL threshold: {detector.kl_threshold}")
+    print(f"  - Check frequency: every {detector.check_frequency} steps")
+    print(f"  - Log directory: {detector.log_dir}")
     
     return detector
 
 class CollapseAwareEarlyStopping(EarlyStopping):
-    """集成塌缩检测的早期停止回调"""
+    """Early stopping callback integrated with collapse detection"""
     
     def __init__(self, collapse_detector, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.collapse_detector = collapse_detector
         
     def _should_stop_early(self, trainer, pl_module):
-        # 如果检测到持续塌缩，强制早期停止
+        # Force early stopping if persistent collapse is detected
         if (self.collapse_detector.collapse_detected and 
             self.collapse_detector.collapse_consecutive_steps >= 50):
             
-            print(f"\n🛑 由于检测到持续后验塌缩，强制早期停止训练！")
+            print(f"\n🛑 Forced early stopping due to persistent posterior collapse!")
             return True
             
-        # 否则使用标准早期停止逻辑
+        # Otherwise use standard early stopping logic
         return super()._should_stop_early(trainer, pl_module)
 
 def main():
-    parser = argparse.ArgumentParser(description='训练SeqSetVAE并检测后验塌缩')
+    parser = argparse.ArgumentParser(description='Train SeqSetVAE with posterior collapse detection')
     
-    # 基本训练参数
+    # Basic training parameters
     parser.add_argument('--max_epochs', type=int, default=config.max_epochs, 
-                       help='最大训练轮数')
+                       help='Maximum training epochs')
     parser.add_argument('--devices', type=int, default=config.devices,
-                       help='使用的GPU数量')
+                       help='Number of GPUs to use')
     
-    # 塌缩检测参数
+    # Collapse detection parameters
     parser.add_argument('--fast_detection', action='store_true',
-                       help='启用快速检测模式（更频繁检查，更敏感阈值）')
+                       help='Enable fast detection mode (more frequent checks, more sensitive thresholds)')
     parser.add_argument('--log_dir', type=str, 
                        default=f"./collapse_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                       help='塌缩检测日志目录')
+                       help='Collapse detection log directory')
     parser.add_argument('--disable_collapse_detection', action='store_true',
-                       help='禁用后验塌缩检测')
+                       help='Disable posterior collapse detection')
     
-    # 数据路径参数
+    # Data path parameters
     parser.add_argument('--data_dir', type=str, 
                        default="/home/sunx/data/aiiih/data/mimic/processed/patient_ehr",
-                       help='数据目录路径')
+                       help='Data directory path')
     parser.add_argument('--params_map_path', type=str,
                        default="/home/sunx/data/aiiih/data/mimic/processed/stats.csv",
-                       help='参数映射文件路径')
+                       help='Parameter mapping file path')
     parser.add_argument('--label_path', type=str,
                        default="/home/sunx/data/aiiih/data/mimic/processed/oc.csv", 
-                       help='标签文件路径')
+                       help='Label file path')
     
-    # 输出路径参数
+    # Output path parameters
     parser.add_argument('--output_dir', type=str,
                        default="/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs",
-                       help='输出目录路径')
+                       help='Output directory path')
     
     args = parser.parse_args()
     
-    print("🚀 开始训练SeqSetVAE with 后验塌缩检测")
+    print("🚀 Starting SeqSetVAE training with posterior collapse detection")
     print("=" * 60)
     
-    # 设置随机种子
+    # Set random seed
     seed_everything(0, workers=True)
     
-    # 准备数据
-    print("📊 准备数据...")
+    # Prepare data
+    print("📊 Preparing data...")
     data_module = SeqSetVAEDataModule(args.data_dir, args.params_map_path, args.label_path)
     data_module.setup()
-    print(f"  - 训练数据: {len(data_module.train_dataset)}")
-    print(f"  - 验证数据: {len(data_module.val_dataset)}")
-    print(f"  - 测试数据: {len(data_module.test_dataset)}")
+    print(f"  - Training data: {len(data_module.train_dataset)}")
+    print(f"  - Validation data: {len(data_module.val_dataset)}")
+    print(f"  - Test data: {len(data_module.test_dataset)}")
     
-    # 设置日志记录器
+    # Set up logger
     logger = TensorBoardLogger(
         save_dir=os.path.join(args.output_dir, "logs"),
         name=f"{config.name}_with_collapse_detection",
     )
     
-    # 创建模型
-    print("🧠 创建模型...")
+    # Create model
+    print("🧠 Creating model...")
     model = SeqSetVAE(
         input_dim=config.input_dim,
         reduced_dim=config.reduced_dim,
@@ -157,39 +157,39 @@ def main():
         kl_annealing=config.kl_annealing,
     )
     
-    # 设置回调函数
+    # Set up callbacks
     callbacks = []
     
-    # 模型检查点
+    # Model checkpoint
     checkpoint = ModelCheckpoint(
         dirpath=os.path.join(args.output_dir, "checkpoints"),
         filename=f"best_{config.name}_collapse_aware",
         save_weights_only=True,
-        save_last=True,  # 保存最后一个检查点
+        save_last=True,  # Save last checkpoint
         every_n_train_steps=config.ckpt_every_n_steps,
         monitor="val_auc",
         mode="max",
-        save_top_k=3,  # 保存前3个最佳模型
+        save_top_k=3,  # Save top 3 best models
         enable_version_counter=True,
     )
     callbacks.append(checkpoint)
     
-    # 设置塌缩检测器
+    # Set up collapse detector
     if not args.disable_collapse_detection:
         collapse_detector = setup_collapse_detector(args)
         callbacks.append(collapse_detector)
         
-        # 集成塌缩检测的早期停止
+        # Early stopping integrated with collapse detection
         early_stopping = CollapseAwareEarlyStopping(
             collapse_detector=collapse_detector,
             monitor="val_auc",
             mode="max", 
-            patience=5,  # 增加耐心值，因为有塌缩检测
+            patience=5,  # Increase patience since we have collapse detection
             verbose=True,
             strict=True,
         )
     else:
-        print("⚠️  后验塌缩检测已禁用")
+        print("⚠️  Posterior collapse detection disabled")
         early_stopping = EarlyStopping(
             monitor="val_auc",
             mode="max",
@@ -200,8 +200,8 @@ def main():
     
     callbacks.append(early_stopping)
     
-    # 创建训练器
-    print("⚡ 设置训练器...")
+    # Create trainer
+    print("⚡ Setting up trainer...")
     trainer = pl.Trainer(
         accelerator=config.accelerator,
         devices=args.devices,
@@ -211,40 +211,40 @@ def main():
         min_epochs=1,
         precision=config.precision,
         callbacks=callbacks,
-        profiler="simple",  # 使用简单profiler减少开销
+        profiler="simple",  # Use simple profiler to reduce overhead
         log_every_n_steps=config.log_every_n_steps,
         gradient_clip_val=config.gradient_clip_val,
         gradient_clip_algorithm="norm",
-        val_check_interval=0.05,  # 稍微增加验证频率
-        limit_val_batches=0.2,   # 增加验证批次数量
+        val_check_interval=0.05,  # Slightly increase validation frequency
+        limit_val_batches=0.2,   # Increase number of validation batches
         accumulate_grad_batches=1,
-        detect_anomaly=False,    # 关闭异常检测以提高性能
+        detect_anomaly=False,    # Turn off anomaly detection for better performance
         enable_checkpointing=True,
         enable_progress_bar=True,
         enable_model_summary=True,
     )
     
-    # 打印训练配置
-    print("\n📋 训练配置:")
-    print(f"  - 最大轮数: {args.max_epochs}")
-    print(f"  - 设备数量: {args.devices}")
-    print(f"  - 精度: {config.precision}")
-    print(f"  - 学习率: {config.lr}")
-    print(f"  - Beta值: {config.beta}")
-    print(f"  - 塌缩检测: {'启用' if not args.disable_collapse_detection else '禁用'}")
+    # Print training configuration
+    print("\n📋 Training configuration:")
+    print(f"  - Max epochs: {args.max_epochs}")
+    print(f"  - Number of devices: {args.devices}")
+    print(f"  - Precision: {config.precision}")
+    print(f"  - Learning rate: {config.lr}")
+    print(f"  - Beta value: {config.beta}")
+    print(f"  - Collapse detection: {'Enabled' if not args.disable_collapse_detection else 'Disabled'}")
     
-    # 开始训练
-    print("\n🎯 开始训练...")
+    # Start training
+    print("\n🎯 Starting training...")
     print("=" * 60)
     
     try:
         trainer.fit(model, data_module)
         
-        # 训练完成后的总结
-        print("\n✅ 训练完成！")
+        # Training completion summary
+        print("\n✅ Training completed!")
         
         if not args.disable_collapse_detection:
-            print("\n📊 塌缩检测总结:")
+            print("\n📊 Collapse detection summary:")
             detector = None
             for callback in trainer.callbacks:
                 if isinstance(callback, PosteriorCollapseDetector):
@@ -252,40 +252,40 @@ def main():
                     break
                     
             if detector:
-                print(f"  - 总检查次数: {detector.collapse_stats['total_checks']}")
-                print(f"  - 警告次数: {detector.collapse_stats['warnings_issued']}")
-                print(f"  - 检测到塌缩: {'是' if detector.collapse_detected else '否'}")
+                print(f"  - Total checks: {detector.collapse_stats['total_checks']}")
+                print(f"  - Warning count: {detector.collapse_stats['warnings_issued']}")
+                print(f"  - Collapse detected: {'Yes' if detector.collapse_detected else 'No'}")
                 if detector.collapse_step:
-                    print(f"  - 塌缩发生步数: {detector.collapse_step}")
-                print(f"  - 详细日志: {detector.log_file}")
+                    print(f"  - Collapse occurrence step: {detector.collapse_step}")
+                print(f"  - Detailed log: {detector.log_file}")
         
-        # 保存最终模型
+        # Save final model
         final_model_path = os.path.join(args.output_dir, "checkpoints", f"final_{config.name}.ckpt")
         trainer.save_checkpoint(final_model_path)
-        print(f"💾 最终模型已保存: {final_model_path}")
+        print(f"💾 Final model saved: {final_model_path}")
         
     except KeyboardInterrupt:
-        print("\n⏹️  训练被用户中断")
+        print("\n⏹️  Training interrupted by user")
         
-        # 保存中断时的模型
+        # Save model when interrupted
         interrupt_model_path = os.path.join(args.output_dir, "checkpoints", f"interrupted_{config.name}.ckpt")
         trainer.save_checkpoint(interrupt_model_path)
-        print(f"💾 中断时模型已保存: {interrupt_model_path}")
+        print(f"💾 Interrupted model saved: {interrupt_model_path}")
         
     except Exception as e:
-        print(f"\n❌ 训练过程中发生错误: {e}")
+        print(f"\n❌ Error occurred during training: {e}")
         
-        # 保存错误时的模型
+        # Save model when error occurs
         error_model_path = os.path.join(args.output_dir, "checkpoints", f"error_{config.name}.ckpt")
         try:
             trainer.save_checkpoint(error_model_path)
-            print(f"💾 错误时模型已保存: {error_model_path}")
+            print(f"💾 Error model saved: {error_model_path}")
         except:
-            print("❌ 无法保存错误时的模型")
+            print("❌ Unable to save error model")
         
         raise
     
-    print("\n🎉 程序执行完成！")
+    print("\n🎉 Program execution completed!")
 
 if __name__ == "__main__":
     main()
