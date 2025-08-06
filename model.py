@@ -295,6 +295,9 @@ class SeqSetVAE(pl.LightningModule):
         # Get current beta value
         current_beta = self.get_current_beta()
         
+        # 用于存储潜在变量信息（供塌缩检测器使用）
+        all_z_lists = []
+        
         for s_dict in sets:
             var, val, time = (
                 s_dict["var"],
@@ -308,6 +311,9 @@ class SeqSetVAE(pl.LightningModule):
             recon, z_list, _ = self.setvae(var, val)
             z_sample, mu, logvar = z_list[-1]  # Choose the deepest layer
             z_prims.append(z_sample.squeeze(1))  # -> [B, latent]
+            
+            # 收集潜在变量信息（供塌缩检测器使用）
+            all_z_lists.append(z_list)
             
             # Improved KL loss calculation
             # Use more stable KL divergence calculation
@@ -384,6 +390,11 @@ class SeqSetVAE(pl.LightningModule):
         final_rep = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
         
         logits = self.cls_head(final_rep)
+        
+        # 保存潜在变量信息供塌缩检测器使用
+        if all_z_lists:
+            # 合并所有集合的潜在变量信息（取第一个集合作为代表）
+            self._last_z_list = all_z_lists[0] if all_z_lists else None
         
         return logits, recon_loss_total, kl_total * current_beta
 
