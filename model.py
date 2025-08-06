@@ -8,8 +8,8 @@ import lightning.pytorch as pl
 from transformers import get_linear_schedule_with_warmup
 from modules import (
     SetVAEModule,
-    AttentiveBottleneckLayer,
     elbo_loss,
+    AttentiveBottleneckLayer,
     recon_loss as chamfer_recon_loss,
 )
 
@@ -79,32 +79,17 @@ class _SetDecoder(nn.Module):
     def __init__(self, latent_dim, reduced_dim, levels, heads, m):
         super().__init__()
         self.levels = levels
-        self.dir_layers = nn.ModuleList(
+        self.decoder_layers = nn.ModuleList(
             [AttentiveBottleneckLayer(latent_dim, heads, m) for _ in range(levels)]
         )
-        self.mag_layers = nn.ModuleList(
-            [AttentiveBottleneckLayer(latent_dim, heads, m) for _ in range(levels)]
-        )
-        self.dir_out = nn.Linear(latent_dim, reduced_dim)
-        self.mag_out = nn.Linear(latent_dim, 1)
+        self.out = nn.Linear(latent_dim, reduced_dim)
 
     def forward(self, h, target_n, noise_std=0.5):
-        # Direction branch
-        current_dir = h.unsqueeze(1)
+        current = h.unsqueeze(1)  # [B, 1, latent_dim]
         for l in range(self.levels - 1, -1, -1):
-            layer_out = self.dir_layers[l](current_dir, target_n, noise_std=noise_std)
-            current_dir = layer_out + current_dir.expand_as(layer_out) + h.unsqueeze(1)
-        dir_recon = self.dir_out(current_dir)
-        dir_norm = F.normalize(dir_recon, dim=-1)
-
-        # Magnitude branch
-        current_mag = h.unsqueeze(1)
-        for l in range(self.levels - 1, -1, -1):
-            layer_out = self.mag_layers[l](current_mag, target_n, noise_std=noise_std)
-            current_mag = layer_out + current_mag.expand_as(layer_out)
-        mag_recon = self.mag_out(current_mag)
-
-        recon = dir_norm * mag_recon
+            layer_out = self.decoder_layers[l](current, target_n, noise_std=noise_std)
+            current = layer_out + current.expand_as(layer_out)
+        recon = self.out(current)
         return recon
 
 
@@ -131,6 +116,7 @@ class SeqSetVAE(pl.LightningModule):
         ff_dim: int,
         transformer_heads: int,
         transformer_layers: int,
+        freeze_ratio: float,
         pretrained_ckpt: str,
         w: float = 1.0,
         free_bits: float = 0.1,
@@ -150,8 +136,7 @@ class SeqSetVAE(pl.LightningModule):
             lr,
         )
         if pretrained_ckpt is not None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            ckpt = torch.load(pretrained_ckpt, map_location=device)
+            ckpt = torch.load(pretrained_ckpt)
             state_dict = ckpt.get("state_dict", ckpt)
             setvae_state = {
                 k.replace("setvae.", ""): v
@@ -160,6 +145,12 @@ class SeqSetVAE(pl.LightningModule):
             }
             self.setvae.load_state_dict(setvae_state, strict=False)
             del ckpt, state_dict, setvae_state
+
+        # Freeze X% pretrained parameters
+        set_params = list(self.setvae.parameters())
+        freeze_cnt = int(len(set_params) * freeze_ratio)
+        for p in set_params[:freeze_cnt]:
+            p.requires_grad = False
 
         # Transformer encoder
         enc_layer = TransformerEncoderLayer(
@@ -186,9 +177,6 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         self.cls_head = nn.Linear(latent_dim, num_classes)
-        torch.nn.init.xavier_uniform_(self.cls_head.weight)
-        if self.cls_head.bias is not None:
-            nn.init.zeros_(self.cls_head.bias)
 
         # Metrics
         task_type = "binary" if num_classes == 2 else "multiclass"
@@ -199,7 +187,6 @@ class SeqSetVAE(pl.LightningModule):
 
         # Training hyperparameters
         self.w = w
-        self.beta = beta
         self.lr = lr
         self.free_bits = free_bits
         self.latent_dim = latent_dim
@@ -249,21 +236,20 @@ class SeqSetVAE(pl.LightningModule):
             minute_val = time.unique()
             pos_list.append(minute_val)
             recon, z_list, _ = self.setvae(var, val)
-            # Clamp all logvar in z_list
-            for i in range(len(z_list)):
-                z_sample, mu, logvar = z_list[i]
-                logvar = torch.clamp(logvar, min=-1.0, max=1.0)
-                z_list[i] = (z_sample, mu, logvar)
             z_sample, mu, logvar = z_list[-1]  # Choose the deepest layer
-            z_prims.append(z_sample.squeeze(1))
-            for _, mu, logvar in z_list:
-                raw_kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
-                min_kl = self.free_bits * self.latent_dim
-                clamped_kl = torch.clamp(raw_kl, min=min_kl)
-                kl_total += clamped_kl.mean()
-        kl_total /= S * len(z_list)
-        z_seq = torch.stack(z_prims, dim=1)
-        pos_tensor = torch.stack(pos_list, dim=1)
+            z_prims.append(z_sample.squeeze(1))  # -> [B, latent]
+            # KL with free bits
+            raw_kl = -0.5 * torch.sum(
+                1 + logvar - mu.pow(2) - logvar.exp(), dim=-1
+            )  # [B]
+            min_kl = self.free_bits * self.latent_dim
+            clamped_kl = torch.clamp(raw_kl, min=min_kl)
+            kl = clamped_kl.mean()
+            kl_total += kl
+        kl_total /= S
+        z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
+        pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
+        # Apply rotary positional encoding using minutes
         z_seq = self._apply_rope(z_seq, pos_tensor)
         h_seq = self.transformer(z_seq, mask=self._causal_mask(S, z_seq.device))
 
@@ -285,7 +271,7 @@ class SeqSetVAE(pl.LightningModule):
         # Classification
         final_rep = h_seq.mean(dim=1)
         logits = self.cls_head(final_rep)
-        return logits, recon_loss_total, kl_total, z_seq
+        return logits, recon_loss_total, kl_total
 
     # Helpers
     def _split_sets(self, var, val, time, set_ids):
@@ -313,19 +299,12 @@ class SeqSetVAE(pl.LightningModule):
             batch.get("label"),
         )
         sets = self._split_sets(var, val, time, set_ids)
-        logits, recon_loss, kl_loss, z_seq = self(sets)
+        logits, recon_loss, kl_loss = self(sets)
         pred_loss = F.cross_entropy(logits, label)
-        total_loss = pred_loss + self.w * (recon_loss + kl_loss)
+        total_loss = self.w * pred_loss + (recon_loss + kl_loss)
 
         # Metrics for validation stage
         if stage == "val":
-            z_mean = z_seq.mean(dim=1)
-            if z_mean.size(0) > 1:
-                z_var = torch.var(z_mean, dim=0).mean()
-            else:
-                z_var = 0.0
-            self.log("val_z_var", z_var, prog_bar=True)
-
             if self.num_classes == 2:
                 probs = torch.softmax(logits, dim=1)[:, 1]
             else:
