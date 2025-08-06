@@ -116,7 +116,7 @@ class SeqSetVAE(pl.LightningModule):
         ff_dim: int,
         transformer_heads: int,
         transformer_layers: int,
-        freeze_ratio: float = 0.0,  # 默认不冻结
+        freeze_ratio: float = 0.0,  # Default: no freezing
         pretrained_ckpt: str = None,
         w: float = 1.0,
         free_bits: float = 0.1,
@@ -162,17 +162,16 @@ class SeqSetVAE(pl.LightningModule):
             nhead=transformer_heads,
             dim_feedforward=ff_dim,
             dropout=0.1,
-            activation='gelu',  # 使用GELU激活函数
+            activation='gelu',  # Use GELU activation function
             batch_first=True,
             norm_first=True,  # Pre-norm for better training stability
         )
         self.transformer = TransformerEncoder(enc_layer, num_layers=transformer_layers)
 
-        # 学习的位置编码替代RoPE
-        self.max_seq_len = 512  # 假设最大序列长度
-        self.pos_embedding = nn.Embedding(self.max_seq_len, latent_dim)
+        # Dynamic positional encoding - no fixed max sequence length
+        self.pos_embedding = nn.Parameter(torch.randn(1, 1, latent_dim) * 0.02)
         
-        # 时间编码器 - 将连续时间转换为嵌入
+        # Time encoder - convert continuous time to embeddings
         self.time_encoder = nn.Sequential(
             nn.Linear(1, latent_dim // 4),
             nn.ReLU(),
@@ -189,7 +188,7 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # 改进的分类头
+        # Improved classification head
         self.cls_head = nn.Sequential(
             nn.Linear(latent_dim, latent_dim // 2),
             nn.ReLU(),
@@ -218,7 +217,7 @@ class SeqSetVAE(pl.LightningModule):
         self.save_hyperparameters(ignore=["setvae"])
 
     def get_current_beta(self):
-        """计算当前的beta值，支持warmup和annealing"""
+        """Calculate current beta value with support for warmup and annealing"""
         if not self.warmup_beta:
             return self.max_beta
             
@@ -228,47 +227,72 @@ class SeqSetVAE(pl.LightningModule):
         else:
             return self.max_beta
 
-    def _apply_positional_encoding(self, x: torch.Tensor, pos: torch.Tensor):
+    def _apply_positional_encoding(self, x: torch.Tensor, pos: torch.Tensor, padding_mask: torch.Tensor = None):
         """
-        Apply learned positional encoding and time encoding.
+        Apply learned positional encoding and time encoding for variable length sequences.
         
         Args:
             x: Tensor of shape [B, S, D]
-            pos: Tensor of shape [B, S] representing each set's minute value.
+            pos: Tensor of shape [B, S] representing each set's minute value
+            padding_mask: Boolean mask of shape [B, S] where True indicates padding
         Returns:
             Tensor of same shape as x with positional encoding applied.
         """
         B, S, D = x.shape
         
-        # 位置编码（基于序列位置）
+        # Positional encoding (based on sequence position)
         positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
-        pos_emb = self.pos_embedding(positions)
+        pos_emb = self.pos_embedding.expand(B, S, -1) * torch.sin(positions.unsqueeze(-1).float() * 0.01)
         
-        # 时间编码（基于实际时间）
+        # Time encoding (based on actual time)
         time_emb = self.time_encoder(pos.unsqueeze(-1))
         
-        # 组合位置编码和时间编码
-        return x + pos_emb + time_emb
+        # Combine positional and time encoding
+        encoded = x + pos_emb + time_emb
+        
+        # Zero out padding positions
+        if padding_mask is not None:
+            encoded = encoded.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        
+        return encoded
 
-    def _causal_mask(self, unique_sets, device):
-        # 使用更宽松的causal mask，允许一定程度的双向信息流
+    def _create_causal_mask(self, seq_len, device, padding_mask=None):
+        """Create causal mask for variable length sequences with padding support"""
+        # Create basic causal mask
         mask = torch.triu(
-            torch.ones(unique_sets, unique_sets, device=device), diagonal=1
-        )
-        # 添加一些随机性，允许部分未来信息泄露（模拟真实临床场景）
+            torch.ones(seq_len, seq_len, device=device), diagonal=1
+        ).bool()
+        
+        # Add some randomness during training (simulate real clinical scenarios)
         if self.training:
-            random_mask = torch.rand(unique_sets, unique_sets, device=device) < 0.1
+            random_mask = torch.rand(seq_len, seq_len, device=device) < 0.1
             mask = mask & ~random_mask
-        return mask.bool()
+        
+        # Handle padding: padded positions should not attend to anything
+        if padding_mask is not None:
+            # padding_mask: [B, S] -> expand to [B, S, S]
+            batch_size = padding_mask.size(0)
+            expanded_padding = padding_mask.unsqueeze(1).expand(batch_size, seq_len, seq_len)
+            # If source is padded, it shouldn't attend to anything
+            mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+            mask = mask | expanded_padding
+            # If target is padded, nothing should attend to it
+            mask = mask | expanded_padding.transpose(-1, -2)
+        
+        return mask
 
-    def forward(self, sets):
-        """sets : list of dict{[B, N, D],[B, N, 1],[B, N, 1]}"""
+    def forward(self, sets, padding_mask=None):
+        """
+        Forward pass with support for variable length sequences
+        sets: list of dict{[B, N, D],[B, N, 1],[B, N, 1]}
+        padding_mask: [B, S] boolean mask where True indicates padding
+        """
 
         S = len(sets)
         z_prims, kl_total = [], 0.0
         pos_list = []
         
-        # 获取当前beta值
+        # Get current beta value
         current_beta = self.get_current_beta()
         
         for s_dict in sets:
@@ -278,22 +302,22 @@ class SeqSetVAE(pl.LightningModule):
                 s_dict["minute"],
             )
             assert time.unique().numel() == 1, "Time is not constant in this set"
-            minute_val = time.unique().float()  # 确保是float类型
+            minute_val = time.unique().float()  # Ensure float type
             pos_list.append(minute_val)
             
             recon, z_list, _ = self.setvae(var, val)
             z_sample, mu, logvar = z_list[-1]  # Choose the deepest layer
             z_prims.append(z_sample.squeeze(1))  # -> [B, latent]
             
-            # 改进的KL损失计算
-            # 使用更稳定的KL散度计算
+            # Improved KL loss calculation
+            # Use more stable KL divergence calculation
             kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
             
-            # 应用free bits
+            # Apply free bits
             min_kl = self.free_bits * self.latent_dim
             kl_div = torch.clamp(kl_div, min=min_kl)
             
-            # 添加KL正则化项，防止方差过小
+            # Add KL regularization term to prevent variance from being too small
             var_reg = -0.1 * torch.mean(logvar)
             kl_total += kl_div.mean() + var_reg
             
@@ -302,18 +326,37 @@ class SeqSetVAE(pl.LightningModule):
         pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
         
         # Apply positional and time encoding
-        z_seq = self._apply_positional_encoding(z_seq, pos_tensor)
+        z_seq = self._apply_positional_encoding(z_seq, pos_tensor, padding_mask)
         
-        # 添加层归一化
+        # Add layer normalization
         z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
         
-        h_seq = self.transformer(z_seq, mask=self._causal_mask(S, z_seq.device))
+        # Create attention mask for transformer
+        attn_mask = self._create_causal_mask(S, z_seq.device, padding_mask)
+        
+        # Apply transformer with proper masking
+        if padding_mask is not None:
+            # Convert padding mask to key_padding_mask format (True = ignore)
+            key_padding_mask = padding_mask
+        else:
+            key_padding_mask = None
+            
+        h_seq = self.transformer(
+            z_seq, 
+            mask=attn_mask[0] if attn_mask.dim() == 3 else attn_mask,
+            src_key_padding_mask=key_padding_mask
+        )
 
         # Reconstruction with improved loss
         recon_loss_total = 0.0
+        valid_sets = 0
         for idx, s_dict in enumerate(sets):
+            # Skip padded positions
+            if padding_mask is not None and padding_mask[0, idx]:
+                continue
+                
             N_t = s_dict["var"].size(1)
-            recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)  # 降低噪声
+            recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)  # Reduce noise
             if self.setvae.setvae.dim_reducer is not None:
                 reduced = self.setvae.setvae.dim_reducer(s_dict["var"])
             else:
@@ -322,11 +365,22 @@ class SeqSetVAE(pl.LightningModule):
             reduced_normalized = reduced / (norms + 1e-8)
             target_x = reduced_normalized * s_dict["val"]
             recon_loss_total += chamfer_recon_loss(recon, target_x)
-        recon_loss_total /= S
+            valid_sets += 1
+            
+        if valid_sets > 0:
+            recon_loss_total /= valid_sets
 
         # Classification with attention pooling
-        # 使用注意力机制进行序列级聚合
-        attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
+        # Use attention mechanism for sequence-level aggregation
+        if padding_mask is not None:
+            # Mask out padded positions for attention computation
+            attn_scores = torch.sum(h_seq * z_seq, dim=-1)  # [B, S]
+            attn_scores = attn_scores.masked_fill(padding_mask, float('-inf'))
+            attn_weights = F.softmax(attn_scores, dim=1)  # [B, S]
+            attn_weights = attn_weights.masked_fill(padding_mask, 0.0)
+        else:
+            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
+            
         final_rep = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
         
         logits = self.cls_head(final_rep)
@@ -359,14 +413,16 @@ class SeqSetVAE(pl.LightningModule):
             batch.get("label"),
         )
         sets = self._split_sets(var, val, time, set_ids)
+        
+        # No padding mask needed for batch_size=1 case
         logits, recon_loss, kl_loss = self(sets)
         
-        # 改进的损失计算
-        pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)  # 添加标签平滑
+        # Improved loss calculation
+        pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)  # Add label smoothing
         
-        # 动态权重调整
+        # Dynamic weight adjustment
         if stage == "train":
-            # 训练早期更关注重构，后期更关注分类
+            # Focus more on reconstruction early in training, more on classification later
             recon_weight = max(0.5, 1.0 - self.current_step / 10000)
             pred_weight = min(self.w, self.current_step / 5000)
         else:
@@ -386,7 +442,7 @@ class SeqSetVAE(pl.LightningModule):
             preds = logits.argmax(dim=1)
             self.val_acc.update(preds, label)
 
-        # 记录更多有用的指标
+        # Log more useful metrics
         current_beta = self.get_current_beta()
         self.log_dict(
             {
@@ -432,7 +488,7 @@ class SeqSetVAE(pl.LightningModule):
         self.val_acc.reset()
 
     def configure_optimizers(self):
-        # 分别为不同部分设置不同的学习率
+        # Set different learning rates for different parts
         setvae_params = list(self.setvae.parameters())
         transformer_params = list(self.transformer.parameters())
         other_params = [
@@ -440,7 +496,7 @@ class SeqSetVAE(pl.LightningModule):
             if not any(n.startswith(prefix) for prefix in ['setvae', 'transformer'])
         ]
         
-        # 为预训练的SetVAE使用较小的学习率
+        # Use smaller learning rate for pretrained SetVAE
         param_groups = [
             {'params': setvae_params, 'lr': self.lr * 0.1, 'name': 'setvae'},
             {'params': transformer_params, 'lr': self.lr, 'name': 'transformer'},
@@ -452,16 +508,16 @@ class SeqSetVAE(pl.LightningModule):
             lr=self.lr,
             betas=(0.9, 0.999),
             eps=1e-8,
-            weight_decay=0.01,  # 添加权重衰减
+            weight_decay=0.01,  # Add weight decay
         )
         
-        # 改进的学习率调度器
+        # Improved learning rate scheduler
         from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, 
-            T_0=1000,  # 第一次重启的步数
-            T_mult=2,  # 重启间隔的倍增因子
-            eta_min=self.lr * 0.01  # 最小学习率
+            T_0=1000,  # Steps for first restart
+            T_mult=2,  # Multiplication factor for restart intervals
+            eta_min=self.lr * 0.01  # Minimum learning rate
         )
         
         return {
