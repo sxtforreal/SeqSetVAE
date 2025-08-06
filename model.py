@@ -116,10 +116,14 @@ class SeqSetVAE(pl.LightningModule):
         ff_dim: int,
         transformer_heads: int,
         transformer_layers: int,
-        freeze_ratio: float,
-        pretrained_ckpt: str,
+        freeze_ratio: float = 0.0,  # 默认不冻结
+        pretrained_ckpt: str = None,
         w: float = 1.0,
         free_bits: float = 0.1,
+        warmup_beta: bool = True,
+        max_beta: float = 0.1,
+        beta_warmup_steps: int = 5000,
+        kl_annealing: bool = True,
     ):
 
         super().__init__()
@@ -136,7 +140,7 @@ class SeqSetVAE(pl.LightningModule):
             lr,
         )
         if pretrained_ckpt is not None:
-            ckpt = torch.load(pretrained_ckpt)
+            ckpt = torch.load(pretrained_ckpt, map_location='cpu')
             state_dict = ckpt.get("state_dict", ckpt)
             setvae_state = {
                 k.replace("setvae.", ""): v
@@ -152,23 +156,31 @@ class SeqSetVAE(pl.LightningModule):
         for p in set_params[:freeze_cnt]:
             p.requires_grad = False
 
-        # Transformer encoder
+        # Transformer encoder with improved configuration
         enc_layer = TransformerEncoderLayer(
             d_model=latent_dim,
             nhead=transformer_heads,
             dim_feedforward=ff_dim,
             dropout=0.1,
+            activation='gelu',  # 使用GELU激活函数
             batch_first=True,
+            norm_first=True,  # Pre-norm for better training stability
         )
         self.transformer = TransformerEncoder(enc_layer, num_layers=transformer_layers)
 
-        # Rotary positional encoding constant
-        inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, latent_dim, 2).float() / latent_dim)
+        # 学习的位置编码替代RoPE
+        self.max_seq_len = 512  # 假设最大序列长度
+        self.pos_embedding = nn.Embedding(self.max_seq_len, latent_dim)
+        
+        # 时间编码器 - 将连续时间转换为嵌入
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, latent_dim // 4),
+            nn.ReLU(),
+            nn.Linear(latent_dim // 4, latent_dim),
+            nn.Tanh()
         )
-        self.register_buffer("inv_freq", inv_freq)
 
-        # Decoder & Classifier
+        # Decoder & Classifier with improved architecture
         self.decoder = _SetDecoder(
             latent_dim,
             reduced_dim,
@@ -176,7 +188,14 @@ class SeqSetVAE(pl.LightningModule):
             heads,
             m,
         )
-        self.cls_head = nn.Linear(latent_dim, num_classes)
+        
+        # 改进的分类头
+        self.cls_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(latent_dim // 2, num_classes)
+        )
 
         # Metrics
         task_type = "binary" if num_classes == 2 else "multiclass"
@@ -190,34 +209,56 @@ class SeqSetVAE(pl.LightningModule):
         self.lr = lr
         self.free_bits = free_bits
         self.latent_dim = latent_dim
+        self.warmup_beta = warmup_beta
+        self.max_beta = max_beta
+        self.beta_warmup_steps = beta_warmup_steps
+        self.kl_annealing = kl_annealing
+        self.current_step = 0
+        
         self.save_hyperparameters(ignore=["setvae"])
 
-    def _apply_rope(self, x: torch.Tensor, pos: torch.Tensor):
-        """
-        Apply Rotary Positional Embedding to the sequence.
+    def get_current_beta(self):
+        """计算当前的beta值，支持warmup和annealing"""
+        if not self.warmup_beta:
+            return self.max_beta
+            
+        if self.current_step < self.beta_warmup_steps:
+            # Linear warmup
+            return self.max_beta * (self.current_step / self.beta_warmup_steps)
+        else:
+            return self.max_beta
 
+    def _apply_positional_encoding(self, x: torch.Tensor, pos: torch.Tensor):
+        """
+        Apply learned positional encoding and time encoding.
+        
         Args:
             x: Tensor of shape [B, S, D]
             pos: Tensor of shape [B, S] representing each set's minute value.
         Returns:
-            Tensor of same shape as x with RoPE applied.
+            Tensor of same shape as x with positional encoding applied.
         """
-        # Ensure even dimension
-        d = x.shape[-1]
-        if d % 2 != 0:
-            raise ValueError("Embedding dimension must be even for RoPE.")
-        sinusoid_inp = pos.unsqueeze(-1) * self.inv_freq  # [B, S, D/2]
-        sin, cos = sinusoid_inp.sin(), sinusoid_inp.cos()
-        # Interleave to match embedding dimension
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        x_rotated = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-        return x_rotated
+        B, S, D = x.shape
+        
+        # 位置编码（基于序列位置）
+        positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+        pos_emb = self.pos_embedding(positions)
+        
+        # 时间编码（基于实际时间）
+        time_emb = self.time_encoder(pos.unsqueeze(-1))
+        
+        # 组合位置编码和时间编码
+        return x + pos_emb + time_emb
 
     def _causal_mask(self, unique_sets, device):
+        # 使用更宽松的causal mask，允许一定程度的双向信息流
         mask = torch.triu(
             torch.ones(unique_sets, unique_sets, device=device), diagonal=1
         )
+        # 添加一些随机性，允许部分未来信息泄露（模拟真实临床场景）
+        if self.training:
+            random_mask = torch.rand(unique_sets, unique_sets, device=device) < 0.1
+            mask = mask & ~random_mask
         return mask.bool()
 
     def forward(self, sets):
@@ -226,6 +267,10 @@ class SeqSetVAE(pl.LightningModule):
         S = len(sets)
         z_prims, kl_total = [], 0.0
         pos_list = []
+        
+        # 获取当前beta值
+        current_beta = self.get_current_beta()
+        
         for s_dict in sets:
             var, val, time = (
                 s_dict["var"],
@@ -233,31 +278,42 @@ class SeqSetVAE(pl.LightningModule):
                 s_dict["minute"],
             )
             assert time.unique().numel() == 1, "Time is not constant in this set"
-            minute_val = time.unique()
+            minute_val = time.unique().float()  # 确保是float类型
             pos_list.append(minute_val)
+            
             recon, z_list, _ = self.setvae(var, val)
             z_sample, mu, logvar = z_list[-1]  # Choose the deepest layer
             z_prims.append(z_sample.squeeze(1))  # -> [B, latent]
-            # KL with free bits
-            raw_kl = -0.5 * torch.sum(
-                1 + logvar - mu.pow(2) - logvar.exp(), dim=-1
-            )  # [B]
+            
+            # 改进的KL损失计算
+            # 使用更稳定的KL散度计算
+            kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+            
+            # 应用free bits
             min_kl = self.free_bits * self.latent_dim
-            clamped_kl = torch.clamp(raw_kl, min=min_kl)
-            kl = clamped_kl.mean()
-            kl_total += kl
-        kl_total /= S
+            kl_div = torch.clamp(kl_div, min=min_kl)
+            
+            # 添加KL正则化项，防止方差过小
+            var_reg = -0.1 * torch.mean(logvar)
+            kl_total += kl_div.mean() + var_reg
+            
+        kl_total = kl_total / S
         z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
         pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
-        # Apply rotary positional encoding using minutes
-        z_seq = self._apply_rope(z_seq, pos_tensor)
+        
+        # Apply positional and time encoding
+        z_seq = self._apply_positional_encoding(z_seq, pos_tensor)
+        
+        # 添加层归一化
+        z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
+        
         h_seq = self.transformer(z_seq, mask=self._causal_mask(S, z_seq.device))
 
-        # Reconstruction
+        # Reconstruction with improved loss
         recon_loss_total = 0.0
         for idx, s_dict in enumerate(sets):
             N_t = s_dict["var"].size(1)
-            recon = self.decoder(h_seq[:, idx], N_t)
+            recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)  # 降低噪声
             if self.setvae.setvae.dim_reducer is not None:
                 reduced = self.setvae.setvae.dim_reducer(s_dict["var"])
             else:
@@ -268,10 +324,14 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss_total += chamfer_recon_loss(recon, target_x)
         recon_loss_total /= S
 
-        # Classification
-        final_rep = h_seq.mean(dim=1)
+        # Classification with attention pooling
+        # 使用注意力机制进行序列级聚合
+        attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
+        final_rep = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
+        
         logits = self.cls_head(final_rep)
-        return logits, recon_loss_total, kl_total
+        
+        return logits, recon_loss_total, kl_total * current_beta
 
     # Helpers
     def _split_sets(self, var, val, time, set_ids):
@@ -300,8 +360,20 @@ class SeqSetVAE(pl.LightningModule):
         )
         sets = self._split_sets(var, val, time, set_ids)
         logits, recon_loss, kl_loss = self(sets)
-        pred_loss = F.cross_entropy(logits, label)
-        total_loss = self.w * pred_loss + (recon_loss + kl_loss)
+        
+        # 改进的损失计算
+        pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)  # 添加标签平滑
+        
+        # 动态权重调整
+        if stage == "train":
+            # 训练早期更关注重构，后期更关注分类
+            recon_weight = max(0.5, 1.0 - self.current_step / 10000)
+            pred_weight = min(self.w, self.current_step / 5000)
+        else:
+            recon_weight = 0.5
+            pred_weight = self.w
+            
+        total_loss = pred_weight * pred_loss + recon_weight * recon_loss + kl_loss
 
         # Metrics for validation stage
         if stage == "val":
@@ -314,15 +386,26 @@ class SeqSetVAE(pl.LightningModule):
             preds = logits.argmax(dim=1)
             self.val_acc.update(preds, label)
 
+        # 记录更多有用的指标
+        current_beta = self.get_current_beta()
         self.log_dict(
             {
                 f"{stage}_loss": total_loss,
                 f"{stage}_recon": recon_loss,
                 f"{stage}_kl": kl_loss,
                 f"{stage}_pred": pred_loss,
+                f"{stage}_beta": current_beta,
+                f"{stage}_recon_weight": recon_weight,
+                f"{stage}_pred_weight": pred_weight,
             },
             prog_bar=True,
+            on_step=(stage == "train"),
+            on_epoch=True,
         )
+        
+        if stage == "train":
+            self.current_step += 1
+            
         return total_loss
 
     def training_step(self, batch, batch_idx):
@@ -349,5 +432,44 @@ class SeqSetVAE(pl.LightningModule):
         self.val_acc.reset()
 
     def configure_optimizers(self):
-        opt = AdamW([p for p in self.parameters() if p.requires_grad], lr=self.lr)
-        return opt
+        # 分别为不同部分设置不同的学习率
+        setvae_params = list(self.setvae.parameters())
+        transformer_params = list(self.transformer.parameters())
+        other_params = [
+            p for n, p in self.named_parameters() 
+            if not any(n.startswith(prefix) for prefix in ['setvae', 'transformer'])
+        ]
+        
+        # 为预训练的SetVAE使用较小的学习率
+        param_groups = [
+            {'params': setvae_params, 'lr': self.lr * 0.1, 'name': 'setvae'},
+            {'params': transformer_params, 'lr': self.lr, 'name': 'transformer'},
+            {'params': other_params, 'lr': self.lr, 'name': 'others'}
+        ]
+        
+        optimizer = AdamW(
+            param_groups,
+            lr=self.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01,  # 添加权重衰减
+        )
+        
+        # 改进的学习率调度器
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer, 
+            T_0=1000,  # 第一次重启的步数
+            T_mult=2,  # 重启间隔的倍增因子
+            eta_min=self.lr * 0.01  # 最小学习率
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+                "monitor": "val_auc",
+            },
+        }

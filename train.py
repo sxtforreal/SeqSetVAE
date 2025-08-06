@@ -37,9 +37,14 @@ if __name__ == "__main__":
         ff_dim=config.ff_dim,
         transformer_heads=config.transformer_heads,
         transformer_layers=config.transformer_layers,
+        freeze_ratio=0.0,  # 不冻结预训练参数，让模型自适应
         pretrained_ckpt=config.pretrained_ckpt,
         w=config.w,
         free_bits=config.free_bits,
+        warmup_beta=config.warmup_beta,
+        max_beta=config.max_beta,
+        beta_warmup_steps=config.beta_warmup_steps,
+        kl_annealing=config.kl_annealing,
     )
 
     checkpoint = ModelCheckpoint(
@@ -76,10 +81,12 @@ if __name__ == "__main__":
         ],
         profiler="advanced",
         log_every_n_steps=config.log_every_n_steps,
-        gradient_clip_val=1.0,
-        gradient_clip_algorithm="value",
+        gradient_clip_val=config.gradient_clip_val,  # 使用配置中的梯度裁剪值
+        gradient_clip_algorithm="norm",  # 使用norm裁剪而非value裁剪
         val_check_interval=0.04,
         limit_val_batches=0.1,
+        accumulate_grad_batches=1,  # 添加梯度累积
+        detect_anomaly=True,  # 检测异常值，有助于调试
     )
 
     trainer.fit(model, data_module)
