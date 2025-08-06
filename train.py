@@ -37,7 +37,7 @@ if __name__ == "__main__":
         ff_dim=config.ff_dim,
         transformer_heads=config.transformer_heads,
         transformer_layers=config.transformer_layers,
-        freeze_ratio=0.0,  # 不冻结预训练参数，让模型自适应
+        freeze_ratio=0.0,  # Don't freeze pretrained parameters, let model adapt
         pretrained_ckpt=config.pretrained_ckpt,
         w=config.w,
         free_bits=config.free_bits,
@@ -81,12 +81,12 @@ if __name__ == "__main__":
         ],
         profiler="advanced",
         log_every_n_steps=config.log_every_n_steps,
-        gradient_clip_val=config.gradient_clip_val,  # 使用配置中的梯度裁剪值
-        gradient_clip_algorithm="norm",  # 使用norm裁剪而非value裁剪
+        gradient_clip_val=config.gradient_clip_val,  # Use gradient clipping value from config
+        gradient_clip_algorithm="norm",  # Use norm clipping instead of value clipping
         val_check_interval=0.04,
         limit_val_batches=0.1,
-        accumulate_grad_batches=1,  # 添加梯度累积
-        detect_anomaly=True,  # 检测异常值，有助于调试
+        accumulate_grad_batches=1,  # Add gradient accumulation
+        detect_anomaly=True,  # Detect anomalies for debugging
     )
 
     trainer.fit(model, data_module)

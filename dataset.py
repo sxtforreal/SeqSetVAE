@@ -242,6 +242,103 @@ class SeqSetVAEDataset(Dataset):
         return df, tsid
 
 
+def dynamic_collate_fn(batch: List[Tuple[pd.DataFrame, str]], cached_embs: Dict, params_map: Dict, label_map: Dict) -> Dict[str, Any]:
+    """
+    Enhanced collate function that supports variable batch sizes with dynamic padding.
+    
+    Args:
+        batch: List of (DataFrame, tsid) tuples
+        cached_embs: Dictionary mapping variable names to embeddings
+        params_map: Dictionary for value normalization
+        label_map: Dictionary mapping tsid to labels
+    
+    Returns:
+        Dictionary with batched and padded tensors
+    """
+    batch_size = len(batch)
+    
+    # Process each patient in the batch
+    all_vars, all_vals, all_minutes, all_set_ids, all_labels = [], [], [], [], []
+    max_events = 0
+    
+    for df, tsid in batch:
+        # Event variable embeddings
+        var_tensors = [cached_embs[v] for v in df["variable"]]
+        var_tsr = torch.stack(var_tensors) if var_tensors else torch.empty(0, cached_embs[next(iter(cached_embs))].shape[0])
+        
+        # Value normalization
+        raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
+        norm_vals = torch.zeros_like(raw_vals)
+        for i, ev in enumerate(df["variable"].to_numpy()):
+            if ev in params_map:
+                m, s = params_map[ev]["mean"], params_map[ev]["std"]
+                norm_vals[i] = (raw_vals[i] - m) / s
+            else:
+                norm_vals[i] = raw_vals[i]
+        
+        # Minute tensor
+        minute_tsr = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(-1, 1)
+        
+        # Set ID tensor (derive from minute changes if not present)
+        if "set_index" in df.columns:
+            setids = torch.tensor(df["set_index"].to_numpy(dtype=np.int64)).view(-1, 1)
+        else:
+            setids = torch.tensor(
+                (df["minute"].diff().fillna(0) != 0).cumsum().to_numpy(dtype=np.int64)
+            ).view(-1, 1)
+        
+        # Label lookup
+        label_val = label_map.get(int(float(tsid)), 0)  # Default to 0 if not found
+        
+        all_vars.append(var_tsr)
+        all_vals.append(norm_vals)
+        all_minutes.append(minute_tsr)
+        all_set_ids.append(setids)
+        all_labels.append(label_val)
+        
+        max_events = max(max_events, len(df))
+    
+    # Pad sequences to max length in batch
+    if max_events == 0:
+        # Handle empty batch case
+        embed_dim = cached_embs[next(iter(cached_embs))].shape[0]
+        return {
+            "var": torch.zeros(batch_size, 1, embed_dim),
+            "val": torch.zeros(batch_size, 1, 1),
+            "minute": torch.zeros(batch_size, 1, 1),
+            "set_id": torch.zeros(batch_size, 1, 1, dtype=torch.long),
+            "label": torch.tensor(all_labels, dtype=torch.long),
+            "padding_mask": torch.ones(batch_size, 1, dtype=torch.bool)
+        }
+    
+    # Create padded tensors
+    embed_dim = all_vars[0].shape[1] if len(all_vars[0]) > 0 else cached_embs[next(iter(cached_embs))].shape[0]
+    
+    padded_vars = torch.zeros(batch_size, max_events, embed_dim)
+    padded_vals = torch.zeros(batch_size, max_events, 1)
+    padded_minutes = torch.zeros(batch_size, max_events, 1)
+    padded_set_ids = torch.zeros(batch_size, max_events, 1, dtype=torch.long)
+    padding_mask = torch.ones(batch_size, max_events, dtype=torch.bool)
+    
+    for i, (var_tsr, val_tsr, min_tsr, set_tsr) in enumerate(zip(all_vars, all_vals, all_minutes, all_set_ids)):
+        seq_len = len(var_tsr)
+        if seq_len > 0:
+            padded_vars[i, :seq_len] = var_tsr
+            padded_vals[i, :seq_len] = val_tsr
+            padded_minutes[i, :seq_len] = min_tsr
+            padded_set_ids[i, :seq_len] = set_tsr
+            padding_mask[i, :seq_len] = False  # False indicates real data
+    
+    return {
+        "var": padded_vars,
+        "val": padded_vals,
+        "minute": padded_minutes,
+        "set_id": padded_set_ids,
+        "label": torch.tensor(all_labels, dtype=torch.long),
+        "padding_mask": padding_mask
+    }
+
+
 class SeqSetVAEDataModule(pl.LightningDataModule):
     """Lightning DataModule handling patient-level parquet & label lookup (oc)."""
 
@@ -286,12 +383,18 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         self.test_dataset = SeqSetVAEDataset("test", self.saved_dir)
 
     def _create_loader(self, ds, shuffle=False):
+        # Use standard collate function for batch_size=1, enhanced for larger batches
+        if self.batch_size == 1:
+            collate_fn = self._collate_fn
+        else:
+            collate_fn = lambda batch: dynamic_collate_fn(batch, self.cached_embs, self.params_map, self.label_map)
+            
         return DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=2,
-            collate_fn=self._collate_fn,
+            collate_fn=collate_fn,
             pin_memory=True,
         )
 
@@ -305,7 +408,7 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         return self._create_loader(self.test_dataset, shuffle=False)
 
     def _collate_fn(self, batch: List[Tuple[pd.DataFrame, str]]) -> Dict[str, Any]:
-        # batch_size is 1 (patient-level) but keep generic
+        # Standard collate function for batch_size=1 (patient-level)
         assert len(batch) == 1, "batch size must be 1 (one patient)"
         df, tsid = batch[0]
 
