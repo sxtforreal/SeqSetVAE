@@ -1,73 +1,102 @@
-import torch
 import os
+
+# 延迟初始化设备配置
+_device_config = None
 
 def get_optimal_device_config():
     """
     智能检测并返回最优的设备配置
     自适应选择：如果有GPU就使用GPU，否则使用CPU
     """
-    # 检查CUDA是否可用
-    cuda_available = torch.cuda.is_available()
-    
-    if cuda_available:
-        # 获取GPU信息
-        gpu_count = torch.cuda.device_count()
-        gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown"
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if gpu_count > 0 else 0
+    try:
+        import torch
         
-        print(f"🚀 GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
+        # 检查CUDA是否可用
+        cuda_available = torch.cuda.is_available()
         
-        # 根据GPU内存调整配置
-        if gpu_memory >= 16:  # 16GB+ GPU
-            devices = min(gpu_count, 2)  # 最多使用2个GPU
-            precision = "16-mixed"
-            batch_size_recommendation = 8
-        elif gpu_memory >= 8:  # 8-16GB GPU
-            devices = 1
-            precision = "16-mixed"
-            batch_size_recommendation = 4
-        else:  # 小于8GB GPU
-            devices = 1
-            precision = "32"  # 使用32位精度避免内存不足
-            batch_size_recommendation = 2
+        if cuda_available:
+            # 获取GPU信息
+            gpu_count = torch.cuda.device_count()
+            gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown"
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if gpu_count > 0 else 0
             
-        accelerator = "gpu"
-        device = torch.device("cuda")
+            print(f"🚀 GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
+            
+            # 根据GPU内存调整配置
+            if gpu_memory >= 16:  # 16GB+ GPU
+                devices = min(gpu_count, 2)  # 最多使用2个GPU
+                precision = "16-mixed"
+                batch_size_recommendation = 8
+            elif gpu_memory >= 8:  # 8-16GB GPU
+                devices = 1
+                precision = "16-mixed"
+                batch_size_recommendation = 4
+            else:  # 小于8GB GPU
+                devices = 1
+                precision = "32"  # 使用32位精度避免内存不足
+                batch_size_recommendation = 2
+                
+            accelerator = "gpu"
+            device = torch.device("cuda")
+            
+            print(f"   - Using {devices} GPU(s)")
+            print(f"   - Precision: {precision}")
+            print(f"   - Recommended batch size: {batch_size_recommendation}")
+            
+        else:
+            # CPU配置
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
+            
+            print(f"💻 CPU detected: {cpu_count} cores")
+            
+            devices = 1
+            accelerator = "cpu"
+            precision = "32"  # CPU训练使用32位精度
+            device = torch.device("cpu")
+            batch_size_recommendation = 1
+            
+            print(f"   - Using CPU training")
+            print(f"   - Precision: {precision}")
+            print(f"   - Recommended batch size: {batch_size_recommendation}")
         
-        print(f"   - Using {devices} GPU(s)")
-        print(f"   - Precision: {precision}")
-        print(f"   - Recommended batch size: {batch_size_recommendation}")
+        return {
+            'device': device,
+            'accelerator': accelerator,
+            'devices': devices,
+            'precision': precision,
+            'batch_size_recommendation': batch_size_recommendation,
+            'cuda_available': cuda_available
+        }
         
-    else:
-        # CPU配置
-        import multiprocessing
-        cpu_count = multiprocessing.cpu_count()
-        
-        print(f"💻 CPU detected: {cpu_count} cores")
-        
-        devices = 1
-        accelerator = "cpu"
-        precision = "32"  # CPU训练使用32位精度
-        device = torch.device("cpu")
-        batch_size_recommendation = 1
-        
-        print(f"   - Using CPU training")
-        print(f"   - Precision: {precision}")
-        print(f"   - Recommended batch size: {batch_size_recommendation}")
-    
-    return {
-        'device': device,
-        'accelerator': accelerator,
-        'devices': devices,
-        'precision': precision,
-        'batch_size_recommendation': batch_size_recommendation,
-        'cuda_available': cuda_available
-    }
+    except ImportError:
+        # 如果没有torch，返回默认CPU配置
+        print("⚠️  PyTorch not available, using default CPU configuration")
+        return {
+            'device': 'cpu',
+            'accelerator': 'cpu',
+            'devices': 1,
+            'precision': '32',
+            'batch_size_recommendation': 1,
+            'cuda_available': False
+        }
 
-# 获取最优设备配置
-device_config = get_optimal_device_config()
+def get_device_config():
+    """获取设备配置，延迟初始化"""
+    global _device_config
+    if _device_config is None:
+        _device_config = get_optimal_device_config()
+    return _device_config
 
-# Device Configuration
+# 设备配置属性
+def get_device_config_attr():
+    """获取设备配置，延迟初始化"""
+    return get_device_config()
+
+# 将设备配置作为模块属性
+device_config = get_device_config_attr()
+
+# 从设备配置中提取常用属性
 device = device_config['device']
 accelerator = device_config['accelerator']
 devices = device_config['devices']
