@@ -283,11 +283,37 @@ class SeqSetVAE(pl.LightningModule):
 
     def forward(self, sets, padding_mask=None):
         """
-        Forward pass with support for variable length sequences
-        sets: list of dict{[B, N, D],[B, N, 1],[B, N, 1]}
-        padding_mask: [B, S] boolean mask where True indicates padding
+        Forward pass with support for variable length sequences and batch processing.
+        
+        Args:
+            sets: List of patient sets, where each patient has a list of set dictionaries
+                  Each set dict contains: {"var": [1, N, D], "val": [1, N, 1], "minute": [1, N, 1]}
+            padding_mask: [B, S] boolean mask where True indicates padding (optional)
+        
+        Returns:
+            logits: [B, num_classes] Classification logits
+            recon_loss: Scalar reconstruction loss
+            kl_loss: Scalar KL divergence loss
         """
+        if isinstance(sets, list) and len(sets) > 0 and isinstance(sets[0], list):
+            # Multi-patient batch case
+            return self._forward_batch(sets, padding_mask)
+        else:
+            # Single patient case (backward compatibility)
+            return self._forward_single(sets)
 
+    def _forward_single(self, sets):
+        """
+        Forward pass for single patient (original implementation).
+        
+        Args:
+            sets: List of set dictionaries for one patient
+            
+        Returns:
+            logits: [1, num_classes] Classification logits
+            recon_loss: Scalar reconstruction loss
+            kl_loss: Scalar KL divergence loss
+        """
         S = len(sets)
         z_prims, kl_total = [], 0.0
         pos_list = []
@@ -332,35 +358,21 @@ class SeqSetVAE(pl.LightningModule):
         pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
         
         # Apply positional and time encoding
-        z_seq = self._apply_positional_encoding(z_seq, pos_tensor, padding_mask)
+        z_seq = self._apply_positional_encoding(z_seq, pos_tensor, None)
         
         # Add layer normalization
         z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
         
         # Create attention mask for transformer
-        attn_mask = self._create_causal_mask(S, z_seq.device, padding_mask)
+        attn_mask = self._create_causal_mask(S, z_seq.device, None)
         
-        # Apply transformer with proper masking
-        if padding_mask is not None:
-            # Convert padding mask to key_padding_mask format (True = ignore)
-            key_padding_mask = padding_mask
-        else:
-            key_padding_mask = None
-            
-        h_seq = self.transformer(
-            z_seq, 
-            mask=attn_mask[0] if attn_mask.dim() == 3 else attn_mask,
-            src_key_padding_mask=key_padding_mask
-        )
+        # Apply transformer
+        h_seq = self.transformer(z_seq, mask=attn_mask[0] if attn_mask.dim() == 3 else attn_mask)
 
         # Reconstruction with improved loss
         recon_loss_total = 0.0
         valid_sets = 0
         for idx, s_dict in enumerate(sets):
-            # Skip padded positions
-            if padding_mask is not None and padding_mask[0, idx]:
-                continue
-                
             N_t = s_dict["var"].size(1)
             recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)  # Reduce noise
             if self.setvae.setvae.dim_reducer is not None:
@@ -377,16 +389,7 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss_total /= valid_sets
 
         # Classification with attention pooling
-        # Use attention mechanism for sequence-level aggregation
-        if padding_mask is not None:
-            # Mask out padded positions for attention computation
-            attn_scores = torch.sum(h_seq * z_seq, dim=-1)  # [B, S]
-            attn_scores = attn_scores.masked_fill(padding_mask, float('-inf'))
-            attn_weights = F.softmax(attn_scores, dim=1)  # [B, S]
-            attn_weights = attn_weights.masked_fill(padding_mask, 0.0)
-        else:
-            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
-            
+        attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
         final_rep = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
         
         logits = self.cls_head(final_rep)
@@ -398,22 +401,123 @@ class SeqSetVAE(pl.LightningModule):
         
         return logits, recon_loss_total, kl_total * current_beta
 
+    def _forward_batch(self, all_patient_sets, padding_mask=None):
+        """
+        Forward pass for multi-patient batch.
+        
+        Args:
+            all_patient_sets: List of patient sets, where each patient has a list of set dictionaries
+            padding_mask: [B, S] boolean mask where True indicates padding (optional)
+            
+        Returns:
+            logits: [B, num_classes] Classification logits
+            recon_loss: Scalar reconstruction loss
+            kl_loss: Scalar KL divergence loss
+        """
+        batch_size = len(all_patient_sets)
+        all_logits = []
+        total_recon_loss = 0.0
+        total_kl_loss = 0.0
+        valid_patients = 0
+        
+        for patient_idx, patient_sets in enumerate(all_patient_sets):
+            if len(patient_sets) == 0:
+                # Skip empty patients
+                continue
+                
+            # Process this patient's sets
+            patient_logits, patient_recon_loss, patient_kl_loss = self._forward_single(patient_sets)
+            all_logits.append(patient_logits)
+            total_recon_loss += patient_recon_loss
+            total_kl_loss += patient_kl_loss
+            valid_patients += 1
+        
+        if valid_patients == 0:
+            # Handle case where all patients are empty
+            device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
+            logits = torch.zeros(batch_size, self.num_classes, device=device)
+            recon_loss = torch.tensor(0.0, device=device)
+            kl_loss = torch.tensor(0.0, device=device)
+        else:
+            # Concatenate logits and average losses
+            logits = torch.cat(all_logits, dim=0)  # [B, num_classes]
+            recon_loss = total_recon_loss / valid_patients
+            kl_loss = total_kl_loss / valid_patients
+        
+        return logits, recon_loss, kl_loss
+
     # Helpers
-    def _split_sets(self, var, val, time, set_ids):
-        """Split a concatenated patient sequence into list-of-set dicts."""
-        sets = []
-        s = set_ids[0]
-        _, counts = torch.unique_consecutive(s, return_counts=True)
-        indices = torch.split(torch.arange(s.size(0), device=s.device), counts.tolist())
-        for idx in indices:
-            sets.append(
-                {
-                    "var": var[0, idx].unsqueeze(0),
-                    "val": val[0, idx].unsqueeze(0),
-                    "minute": time[0, idx].unsqueeze(0),
-                }
-            )
-        return sets
+    def _split_sets(self, var, val, time, set_ids, padding_mask=None):
+        """
+        Split a concatenated patient sequence into list-of-set dicts.
+        Supports both single-patient and multi-patient batches.
+        
+        Args:
+            var: [B, N, D] Variable embeddings
+            val: [B, N, 1] Values
+            time: [B, N, 1] Time stamps
+            set_ids: [B, N, 1] Set identifiers
+            padding_mask: [B, N] Boolean mask where True indicates padding
+            
+        Returns:
+            List of set dictionaries for each patient in the batch
+        """
+        batch_size = var.size(0)
+        all_sets = []
+        
+        for b in range(batch_size):
+            patient_sets = []
+            
+            # Get data for this patient
+            patient_var = var[b]  # [N, D]
+            patient_val = val[b]  # [N, 1]
+            patient_time = time[b]  # [N, 1]
+            patient_set_ids = set_ids[b]  # [N, 1]
+            
+            # Apply padding mask if provided
+            if padding_mask is not None:
+                patient_padding_mask = padding_mask[b]  # [N]
+                # Only keep non-padded positions
+                valid_indices = ~patient_padding_mask
+                if not valid_indices.any():
+                    # All positions are padded, create empty set
+                    patient_sets.append({
+                        "var": torch.empty(0, patient_var.size(-1), device=patient_var.device).unsqueeze(0),
+                        "val": torch.empty(0, 1, device=patient_val.device).unsqueeze(0),
+                        "minute": torch.empty(0, 1, device=patient_time.device).unsqueeze(0),
+                    })
+                    all_sets.append(patient_sets)
+                    continue
+                
+                patient_var = patient_var[valid_indices]
+                patient_val = patient_val[valid_indices]
+                patient_time = patient_time[valid_indices]
+                patient_set_ids = patient_set_ids[valid_indices]
+            
+            # Split into sets based on set_ids
+            if len(patient_set_ids) == 0:
+                # Empty patient, create empty set
+                patient_sets.append({
+                    "var": torch.empty(0, patient_var.size(-1), device=patient_var.device).unsqueeze(0),
+                    "val": torch.empty(0, 1, device=patient_val.device).unsqueeze(0),
+                    "minute": torch.empty(0, 1, device=patient_time.device).unsqueeze(0),
+                })
+            else:
+                # Find unique consecutive set IDs
+                unique_set_ids, counts = torch.unique_consecutive(patient_set_ids.squeeze(-1), return_counts=True)
+                indices = torch.split(torch.arange(len(patient_set_ids), device=patient_set_ids.device), counts.tolist())
+                
+                for idx in indices:
+                    if len(idx) > 0:  # Only add non-empty sets
+                        patient_sets.append({
+                            "var": patient_var[idx].unsqueeze(0),  # [1, set_size, D]
+                            "val": patient_val[idx].unsqueeze(0),  # [1, set_size, 1]
+                            "minute": patient_time[idx].unsqueeze(0),  # [1, set_size, 1]
+                        })
+            
+            all_sets.append(patient_sets)
+        
+        return all_sets
 
     def _step(self, batch, stage: str):
         var, val, time, set_ids, label = (
@@ -423,10 +527,43 @@ class SeqSetVAE(pl.LightningModule):
             batch["set_id"],
             batch.get("label"),
         )
-        sets = self._split_sets(var, val, time, set_ids)
         
-        # No padding mask needed for batch_size=1 case
-        logits, recon_loss, kl_loss = self(sets)
+        # Get padding mask if available
+        padding_mask = batch.get("padding_mask", None)
+        
+        # Split sets for each patient in the batch
+        all_patient_sets = self._split_sets(var, val, time, set_ids, padding_mask)
+        
+        # Process each patient separately and collect results
+        all_logits = []
+        total_recon_loss = 0.0
+        total_kl_loss = 0.0
+        valid_patients = 0
+        
+        for patient_sets in all_patient_sets:
+            if len(patient_sets) == 0:
+                # Skip empty patients
+                continue
+                
+            # Process this patient's sets
+            logits, recon_loss, kl_loss = self(patient_sets)
+            all_logits.append(logits)
+            total_recon_loss += recon_loss
+            total_kl_loss += kl_loss
+            valid_patients += 1
+        
+        if valid_patients == 0:
+            # Handle case where all patients are empty
+            batch_size = var.size(0)
+            device = var.device
+            logits = torch.zeros(batch_size, self.num_classes, device=device)
+            recon_loss = torch.tensor(0.0, device=device)
+            kl_loss = torch.tensor(0.0, device=device)
+        else:
+            # Average losses across patients
+            logits = torch.cat(all_logits, dim=0)  # [B, num_classes]
+            recon_loss = total_recon_loss / valid_patients
+            kl_loss = total_kl_loss / valid_patients
         
         # Improved loss calculation
         pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)  # Add label smoothing
