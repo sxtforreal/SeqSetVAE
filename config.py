@@ -1,39 +1,39 @@
 import os
 
-# 延迟初始化设备配置
+# Lazy initialization of device configuration
 _device_config = None
 
 def get_optimal_device_config():
     """
-    智能检测并返回最优的设备配置
-    自适应选择：如果有GPU就使用GPU，否则使用CPU
+    Intelligently detect and return optimal device configuration
+    Adaptive selection: use GPU if available, otherwise use CPU
     """
     try:
         import torch
         
-        # 检查CUDA是否可用
+        # Check if CUDA is available
         cuda_available = torch.cuda.is_available()
         
         if cuda_available:
-            # 获取GPU信息
+            # Get GPU information
             gpu_count = torch.cuda.device_count()
             gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown"
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if gpu_count > 0 else 0
             
             print(f"🚀 GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
             
-            # 根据GPU内存调整配置
+            # Adjust configuration based on GPU memory
             if gpu_memory >= 16:  # 16GB+ GPU
-                devices = min(gpu_count, 2)  # 最多使用2个GPU
+                devices = min(gpu_count, 2)  # Use at most 2 GPUs
                 precision = "16-mixed"
                 batch_size_recommendation = 8
             elif gpu_memory >= 8:  # 8-16GB GPU
                 devices = 1
                 precision = "16-mixed"
                 batch_size_recommendation = 4
-            else:  # 小于8GB GPU
+            else:  # Less than 8GB GPU
                 devices = 1
-                precision = "32"  # 使用32位精度避免内存不足
+                precision = "32"  # Use 32-bit precision to avoid memory issues
                 batch_size_recommendation = 2
                 
             accelerator = "gpu"
@@ -44,7 +44,7 @@ def get_optimal_device_config():
             print(f"   - Recommended batch size: {batch_size_recommendation}")
             
         else:
-            # CPU配置
+            # CPU configuration
             import multiprocessing
             cpu_count = multiprocessing.cpu_count()
             
@@ -52,7 +52,7 @@ def get_optimal_device_config():
             
             devices = 1
             accelerator = "cpu"
-            precision = "32"  # CPU训练使用32位精度
+            precision = "32"  # Use 32-bit precision for CPU training
             device = torch.device("cpu")
             batch_size_recommendation = 1
             
@@ -70,7 +70,7 @@ def get_optimal_device_config():
         }
         
     except ImportError:
-        # 如果没有torch，返回默认CPU配置
+        # If torch is not available, return default CPU configuration
         print("⚠️  PyTorch not available, using default CPU configuration")
         return {
             'device': 'cpu',
@@ -82,21 +82,21 @@ def get_optimal_device_config():
         }
 
 def get_device_config():
-    """获取设备配置，延迟初始化"""
+    """Get device configuration with lazy initialization"""
     global _device_config
     if _device_config is None:
         _device_config = get_optimal_device_config()
     return _device_config
 
-# 设备配置属性
+# Device configuration attributes
 def get_device_config_attr():
-    """获取设备配置，延迟初始化"""
+    """Get device configuration with lazy initialization"""
     return get_device_config()
 
-# 将设备配置作为模块属性
+# Set device configuration as module attributes
 device_config = get_device_config_attr()
 
-# 从设备配置中提取常用属性
+# Extract commonly used attributes from device configuration
 device = device_config['device']
 accelerator = device_config['accelerator']
 devices = device_config['devices']
