@@ -128,6 +128,34 @@ class PosteriorCollapseDetector(Callback):
         # Update historical data
         self.update_history(metrics)
         
+        # Log all metrics periodically
+        if self.global_step % self.check_frequency == 0:
+            metric_log = f"Step {self.global_step} - Metrics: "
+            metric_parts = []
+            
+            if 'kl_divergence' in metrics:
+                metric_parts.append(f"KL: {metrics['kl_divergence']:.6f}")
+            if 'mean_variance' in metrics:
+                metric_parts.append(f"Variance: {metrics['mean_variance']:.6f}")
+            if 'mean_active_ratio' in metrics:
+                metric_parts.append(f"Active Units: {metrics['mean_active_ratio']:.3f}")
+            if 'recon_loss' in metrics:
+                metric_parts.append(f"Recon Loss: {metrics['recon_loss']:.6f}")
+            
+            if metric_parts:
+                metric_log += ", ".join(metric_parts)
+                logger.info(metric_log)
+                
+            # Log detailed layer-wise metrics if available
+            if 'layer_variances' in metrics and self.verbose:
+                for i, var in enumerate(metrics['layer_variances']):
+                    layer_log = f"  Layer {i}: Variance={var:.6f}"
+                    if 'active_units_ratios' in metrics and i < len(metrics['active_units_ratios']):
+                        layer_log += f", Active Ratio={metrics['active_units_ratios'][i]:.3f}"
+                    if 'layer_mean_magnitudes' in metrics and i < len(metrics['layer_mean_magnitudes']):
+                        layer_log += f", Mean Magnitude={metrics['layer_mean_magnitudes'][i]:.6f}"
+                    logger.info(layer_log)
+        
         # Perform collapse detection
         collapse_detected, warnings = self.detect_collapse(metrics)
         

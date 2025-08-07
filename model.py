@@ -470,8 +470,17 @@ class SeqSetVAE(pl.LightningModule):
             on_epoch=True,
         )
         
+        # Store logged metrics for collapse detector
         if stage == "train":
+            self.logged_metrics = {
+                'train_kl': kl_loss,
+                'train_recon': recon_loss,
+            }
             self.current_step += 1
+            
+        # Expose latent variables for collapse detector
+        if hasattr(self, 'setvae') and hasattr(self.setvae, '_last_z_list'):
+            self._last_z_list = self.setvae._last_z_list
             
         return total_loss
 
