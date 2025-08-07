@@ -3,21 +3,20 @@
 ## 系统概述
 
 ### 解决的问题
-您的训练数据非常大，完成一个epoch需要24小时。为了避免浪费大量训练时间，本系统能够在训练早期（2-4小时内）检测到后验塌缩（Posterior Collapse）的迹象，帮您及时发现问题并采取措施。
+您的训练数据非常大，完成一个epoch需要24小时。为了避免浪费大量训练时间，本系统能够在训练过程中监控关键的后验指标，帮您及时发现问题并采取措施。
 
 ### 核心特性
-- **实时监控**：训练过程中持续监控关键指标
-- **早期预警**：在塌缩初期就发出警告信号
-- **自动保存**：检测到塌缩时自动备份模型
+- **指标监控**：训练过程中持续监控四个关键后验指标
+- **定期更新**：每隔几个step更新指标数据
+- **自动保存**：定期保存指标图表
 - **可视化面板**：实时图表显示各项指标变化
-- **智能停止**：持续塌缩时建议停止训练
 - **批量训练**：支持多病人批量训练，显著提高训练速度
 
 ## 系统架构
 
 ### 核心文件结构
 ```
-├── posterior_collapse_detector.py          # 核心检测器 - Main collapse detector
+├── posterior_collapse_detector.py          # 后验指标监控器 - Posterior metrics monitor
 ├── train_with_collapse_detection.py        # 增强训练脚本 - Enhanced training script
 ├── collapse_visualizer.py                  # 实时可视化工具 - Real-time visualization
 ├── analyze_training_curves.py              # 训练曲线分析工具 - Training curves analysis
@@ -29,20 +28,19 @@
 └── train_original_backup.py                # 原始训练脚本备份 - Original training backup
 ```
 
-### 1. 核心检测器 (`posterior_collapse_detector.py`)
+### 1. 后验指标监控器 (`posterior_collapse_detector.py`)
 ```python
-# Main collapse detection callback class
-class PosteriorCollapseDetector(Callback):
+# Simple posterior metrics monitoring callback class
+class PosteriorMetricsMonitor(Callback):
     def __init__(
         self,
-        kl_threshold: float = 0.01,          # KL divergence threshold for collapse detection
-        var_threshold: float = 0.1,          # Variance threshold for collapse detection  
-        active_units_threshold: float = 0.1,  # Active units ratio threshold
-        check_frequency: int = 50,           # Check every N training steps
-        early_stop_patience: int = 200,      # Stop after N consecutive collapse detections
-        auto_save_on_collapse: bool = True,  # Auto-save model when collapse detected
-        log_dir: str = "./collapse_logs",    # Directory for logging (默认与主日志同目录)
-        verbose: bool = True,                # Enable detailed logging
+        update_frequency: int = 50,           # Update metrics every N steps
+        plot_frequency: int = 500,            # Save plot every N steps
+        window_size: int = 100,               # History window size
+        
+        # Output settings
+        log_dir: str = "./posterior_metrics", # Log save directory
+        verbose: bool = True,                 # Whether to output information,
     ):
         # Initialize monitoring variables and setup logging
         pass
@@ -50,32 +48,29 @@ class PosteriorCollapseDetector(Callback):
 
 ### 2. 增强训练脚本 (`train_with_collapse_detection.py`)
 ```python
-# Enhanced training script with integrated collapse detection
-def setup_collapse_detector(args):
-    """Setup collapse detector based on training requirements"""
+# Enhanced training script with integrated metrics monitoring
+def setup_metrics_monitor(args):
+    """Setup metrics monitor based on training requirements"""
     if args.fast_detection:
-        # Fast detection mode - more frequent checks, stricter thresholds
-        detector = PosteriorCollapseDetector(
-            kl_threshold=0.005,          # Stricter KL threshold
-            var_threshold=0.05,          # Stricter variance threshold
-            active_units_threshold=0.15, # Stricter active units threshold
-            window_size=50,              # Smaller window for faster response
-            check_frequency=20,          # Check every 20 steps
-            early_stop_patience=100,     # Faster early stopping
+        # Fast monitoring mode - more frequent updates
+        monitor = PosteriorMetricsMonitor(
+            update_frequency=20,          # Update every 20 steps
+            plot_frequency=200,           # Save plot every 200 steps
+            window_size=100,              # History window size
         )
     else:
-        # Standard detection mode
-        detector = PosteriorCollapseDetector(
-            kl_threshold=0.01,
-            var_threshold=0.1,
-            check_frequency=50,
+        # Standard monitoring mode
+        monitor = PosteriorMetricsMonitor(
+            update_frequency=50,          # Update every 50 steps
+            plot_frequency=500,           # Save plot every 500 steps
+            window_size=100,              # History window size
         )
-    return detector
+    return monitor
 ```
 
 ### 3. 实时可视化工具 (`collapse_visualizer.py`)
 ```python
-# Real-time visualization dashboard for collapse monitoring
+# Real-time visualization dashboard for metrics monitoring
 class RealTimeCollapseVisualizer:
     def __init__(self, log_dir: str, update_interval: int = 1000):
         # Data storage for monitoring metrics
@@ -90,9 +85,9 @@ class RealTimeCollapseVisualizer:
         }
 ```
 
-## 检测原理
+## 监控原理
 
-### 监控的关键指标
+### 监控的四个关键指标
 
 #### 1. KL散度 (KL Divergence)
 ```python
@@ -100,8 +95,7 @@ class RealTimeCollapseVisualizer:
 kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
 
 # Normal range: > 0.01, Collapse risk: < 0.01
-if kl_val < self.kl_threshold:
-    warnings.append(f"KL散度过低: {kl_val:.6f} < {self.kl_threshold}")
+# This metric helps identify if the posterior is collapsing to the prior
 ```
 
 #### 2. 潜在变量方差 (Latent Variable Variance)
@@ -111,8 +105,7 @@ var = torch.exp(logvar)
 mean_var = var.mean().item()
 
 # Normal range: > 0.1, Collapse risk: < 0.1
-if mean_var < self.var_threshold:
-    warnings.append(f"潜在变量方差过低: {mean_var:.6f}")
+# This metric shows how much the latent variables are varying
 ```
 
 #### 3. 激活单元比例 (Active Units Ratio)
@@ -121,8 +114,16 @@ if mean_var < self.var_threshold:
 active_units = (var > 0.01).float().mean().item()
 
 # Normal range: > 0.1, Collapse risk: < 0.1
-if active_units < self.active_units_threshold:
-    warnings.append(f"激活单元比例过低: {active_units:.3f}")
+# This metric indicates how many latent dimensions are being used
+```
+
+#### 4. 重建损失 (Reconstruction Loss)
+```python
+# Reconstruction loss from the model
+recon_loss = model.reconstruction_loss
+
+# Should decrease over time, stagnation may indicate problems
+# This metric shows how well the model is reconstructing the input
 ```
 
 ## 使用方法
@@ -131,12 +132,12 @@ if active_units < self.active_units_threshold:
 
 #### 1. 基本训练（推荐）
 ```bash
-# 启动带塌缩检测的训练 (推荐)
+# 启动带指标监控的训练 (推荐)
 python train_with_collapse_detection.py --fast_detection
 
 # 可选：启动实时监控面板
-# 注意：collapse logs现在默认保存在主日志目录下的collapse_detection子目录中
-python collapse_visualizer.py --log_dir ./outputs/logs/SeqSetVAE_with_collapse_detection/version_X/collapse_detection
+# 注意：metrics logs现在默认保存在主日志目录下的posterior_metrics子目录中
+python collapse_visualizer.py --log_dir ./outputs/logs/SeqSetVAE_with_metrics_monitoring/version_X/posterior_metrics
 ```
 
 #### 2. 批量训练
@@ -174,11 +175,15 @@ python train_with_collapse_detection.py \
   - 自动处理不同长度的序列
   - 使用padding mask忽略填充位置
 
-#### 检测参数
-- `--fast_detection`: 快速检测模式
-  - 更频繁的检查（每20步）
-  - 更严格的阈值
-  - 更快的早期停止
+#### 监控参数
+- `--fast_detection`: 快速监控模式
+  - 更频繁的更新（每20步）
+  - 更频繁的图表保存（每200步）
+  - 适合需要更详细监控的情况
+
+- `--disable_metrics_monitoring`: 禁用指标监控
+  - 完全关闭指标监控功能
+  - 适合只需要基本训练的情况
 
 ### 性能优化建议
 
@@ -207,7 +212,7 @@ python analyze_training_curves.py --log_dir /path/to/tensorboard/logs --save_dir
 
 # 示例
 python analyze_training_curves.py \
-    --log_dir /home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/logs/SeqSetVAE_with_collapse_detection/version_0 \
+    --log_dir /home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/logs/SeqSetVAE_with_metrics_monitoring/version_0 \
     --save_dir ./my_training_analysis
 ```
 
@@ -361,23 +366,20 @@ def _dynamic_collate_fn(self, batch):
 4. **损失计算**：考虑padding mask的损失计算
 5. **反向传播**：批量梯度更新
 
-### 3. 检测器集成
+### 3. 监控器集成
 
 ```python
-# 在训练脚本中集成检测器
-detector = PosteriorCollapseDetector(
-    kl_threshold=0.01,
-    var_threshold=0.1,
-    active_units_threshold=0.1,
-    check_frequency=50,
-    early_stop_patience=200,
-    auto_save_on_collapse=True,
-    log_dir=os.path.join(logger.log_dir, "collapse_detection")
+# 在训练脚本中集成监控器
+monitor = PosteriorMetricsMonitor(
+    update_frequency=50,
+    plot_frequency=500,
+    window_size=100,
+    log_dir=os.path.join(logger.log_dir, "posterior_metrics")
 )
 
 # 添加到训练器
 trainer = pl.Trainer(
-    callbacks=[detector],
+    callbacks=[monitor],
     # ... 其他参数
 )
 ```
@@ -391,10 +393,10 @@ trainer = pl.Trainer(
    - 限制序列长度
    - 使用梯度累积
 
-2. **检测器不工作**
+2. **监控器不工作**
    - 检查日志目录权限
    - 确认模型输出格式
-   - 验证阈值设置
+   - 验证更新频率设置
 
 3. **可视化问题**
    - 检查matplotlib后端
@@ -408,32 +410,32 @@ trainer = pl.Trainer(
    python train_with_collapse_detection.py --verbose
    ```
 
-2. **检查检测器状态**
+2. **检查监控器状态**
    ```python
-   # 在训练过程中检查检测器状态
-   print(f"Collapse detected: {detector.collapse_detected}")
-   print(f"Current step: {detector.global_step}")
+   # 在训练过程中检查监控器状态
+   print(f"Steps monitored: {len(monitor.steps_history)}")
+   print(f"Current step: {monitor.global_step}")
    ```
 
 3. **手动分析日志**
    ```bash
-   # 查看检测器日志
-   tail -f ./collapse_logs/collapse_detection_*.log
+   # 查看监控器日志
+   ls ./posterior_metrics/
    ```
 
 ## 总结
 
-本系统提供了完整的VAE后验塌缩检测解决方案，包括：
+本系统提供了完整的VAE后验指标监控解决方案，包括：
 
-1. **实时检测**：在训练早期发现塌缩迹象
+1. **指标监控**：在训练过程中监控四个关键后验指标
 2. **批量训练**：显著提高训练效率
 3. **可视化分析**：全面的训练过程分析
-4. **智能监控**：自动化的监控和预警系统
+4. **智能监控**：自动化的监控和图表保存系统
 
 通过使用本系统，您可以：
-- 节省大量训练时间（避免24小时训练后发现塌缩）
+- 及时发现问题（通过监控关键指标）
 - 提高训练效率（批量训练）
 - 获得更好的模型性能（及时发现问题并调整）
 - 深入了解模型行为（可视化分析）
 
-建议从快速检测模式开始使用，根据实际情况调整参数和批量大小。
+建议从快速监控模式开始使用，根据实际情况调整参数和批量大小。
