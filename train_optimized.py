@@ -181,7 +181,23 @@ def main():
     if args.resume_from_checkpoint:
         if not os.path.exists(args.resume_from_checkpoint):
             raise FileNotFoundError(f"Checkpoint file not found: {args.resume_from_checkpoint}")
-        print(f"🔄 Resuming training from checkpoint: {args.resume_from_checkpoint}")
+        
+        # Validate checkpoint file
+        try:
+            checkpoint = torch.load(args.resume_from_checkpoint, map_location='cpu')
+            if 'optimizer_states' not in checkpoint:
+                print("⚠️  Warning: Checkpoint contains only model weights (save_weights_only=True)")
+                print("   This checkpoint cannot be used to resume training with optimizer state.")
+                print("   Consider starting fresh or using a checkpoint with full training state.")
+                print("   The model will be loaded but training will start from the beginning.")
+                # Set resume_from_checkpoint to None to start fresh
+                args.resume_from_checkpoint = None
+            else:
+                print(f"🔄 Resuming training from checkpoint: {args.resume_from_checkpoint}")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not validate checkpoint file: {e}")
+            print("   Proceeding with fresh training start.")
+            args.resume_from_checkpoint = None
     
     # Set random seed for reproducibility
     seed_everything(config.seed, workers=True)
@@ -275,14 +291,15 @@ def main():
     # Set up callbacks
     callbacks = []
     
-    # Model checkpointing - only save the best checkpoint
+    # Model checkpointing - save both best and last checkpoints
     checkpoint = ModelCheckpoint(
         dirpath=os.path.join(experiment_output_dir, "checkpoints"),
         filename=f"best_{config.name}_optimized_batch{args.batch_size}",
         monitor="val_auc",
         mode="max",
         save_top_k=1,  # Only save the best checkpoint
-        save_last=False,  # Don't save the last checkpoint to save space
+        save_last=True,  # Save the last checkpoint for resuming training
+        save_weights_only=False,  # Save full training state including optimizer
         verbose=True,
     )
     callbacks.append(checkpoint)
