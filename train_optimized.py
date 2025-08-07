@@ -12,6 +12,63 @@ import argparse
 from datetime import datetime
 import torch
 
+def get_adaptive_training_config(args):
+    """
+    根据设备配置自适应调整训练参数
+    """
+    # 获取设备配置
+    device_config = config.device_config
+    
+    # 根据设备类型调整参数
+    if device_config['cuda_available']:
+        # GPU训练配置
+        if device_config['devices'] > 1:
+            # 多GPU训练
+            strategy = DDPStrategy(find_unused_parameters=False)
+            effective_batch_size = args.batch_size * args.gradient_accumulation_steps * device_config['devices']
+        else:
+            # 单GPU训练
+            strategy = "auto"
+            effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+            
+        # 根据GPU内存调整worker数量
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if gpu_memory >= 16:
+            num_workers = min(args.num_workers, 12)
+        elif gpu_memory >= 8:
+            num_workers = min(args.num_workers, 8)
+        else:
+            num_workers = min(args.num_workers, 4)
+            
+        pin_memory = True
+        compile_model = args.compile_model and hasattr(torch, 'compile')
+        
+    else:
+        # CPU训练配置
+        strategy = "auto"
+        effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+        
+        # CPU训练时减少worker数量避免过载
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        num_workers = min(args.num_workers, max(1, cpu_count // 2))
+        
+        pin_memory = False  # CPU训练不需要pin_memory
+        compile_model = False  # CPU训练时禁用compile
+        
+        # CPU训练时强制使用32位精度
+        if args.precision != "32":
+            print("⚠️  CPU training detected, switching to 32-bit precision")
+            args.precision = "32"
+    
+    return {
+        'strategy': strategy,
+        'effective_batch_size': effective_batch_size,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'compile_model': compile_model
+    }
+
 def setup_metrics_monitor(args, experiment_output_dir):
     """Set up posterior metrics monitor with optimized settings"""
     
@@ -156,16 +213,19 @@ def main():
         use_dynamic_padding=args.use_dynamic_padding,
     )
     
-    # Override data loader settings for better performance
-    data_module.num_workers = args.num_workers
-    data_module.pin_memory = args.pin_memory
+    # 获取自适应训练配置
+    adaptive_config = get_adaptive_training_config(args)
+    
+    # Override data loader settings with adaptive configuration
+    data_module.num_workers = adaptive_config['num_workers']
+    data_module.pin_memory = adaptive_config['pin_memory']
     
     # Print data configuration
     print(f"  - Batch size: {args.batch_size}")
     print(f"  - Max sequence length: {args.max_sequence_length or 'No limit'}")
     print(f"  - Dynamic padding: {args.use_dynamic_padding}")
-    print(f"  - Number of workers: {args.num_workers}")
-    print(f"  - Pin memory: {args.pin_memory}")
+    print(f"  - Number of workers: {adaptive_config['num_workers']}")
+    print(f"  - Pin memory: {adaptive_config['pin_memory']}")
     
     # Set up logging
     logger = TensorBoardLogger(
@@ -204,8 +264,11 @@ def main():
         skip_pretrained_on_resume=args.resume_from_checkpoint is not None,  # 如果从checkpoint恢复，跳过预训练加载
     )
     
-    # Apply torch.compile if requested
-    if args.compile_model and hasattr(torch, 'compile'):
+    # 获取自适应训练配置
+    adaptive_config = get_adaptive_training_config(args)
+    
+    # Apply torch.compile if requested and supported
+    if adaptive_config['compile_model']:
         print("🔧 Compiling model with torch.compile...")
         model = torch.compile(model, mode="reduce-overhead")
     
@@ -249,16 +312,16 @@ def main():
     
     callbacks.append(early_stopping)
     
-    # Create trainer with optimized settings
-    print("⚡ Setting up optimized trainer...")
+    # Create trainer with adaptive settings
+    print("⚡ Setting up adaptive trainer...")
     trainer = pl.Trainer(
         accelerator=config.accelerator,
-        devices=args.devices,
-        strategy=DDPStrategy(find_unused_parameters=False) if args.devices > 1 else "auto",  # Disabled find_unused_parameters
+        devices=config.devices,  # 使用自适应配置的设备数量
+        strategy=adaptive_config['strategy'],
         logger=logger,
         max_epochs=args.max_epochs,
         min_epochs=1,
-        precision=args.precision,  # Use command line precision
+        precision=config.precision,  # 使用自适应配置的精度
         callbacks=callbacks,
         profiler=None,  # Disable profiler for better performance
         log_every_n_steps=config.log_every_n_steps,
@@ -275,18 +338,21 @@ def main():
         use_distributed_sampler=True,
     )
     
-    # Print training configuration
-    print("\n📋 Optimized training configuration:")
+    # Print adaptive training configuration
+    print("\n📋 Adaptive training configuration:")
     print(f"  - Max epochs: {args.max_epochs}")
-    print(f"  - Number of devices: {args.devices}")
+    print(f"  - Accelerator: {config.accelerator}")
+    print(f"  - Number of devices: {config.devices}")
     print(f"  - Batch size: {args.batch_size}")
-    print(f"  - Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.devices}")
-    print(f"  - Precision: {args.precision}")
+    print(f"  - Effective batch size: {adaptive_config['effective_batch_size']}")
+    print(f"  - Precision: {config.precision}")
     print(f"  - Learning rate: {config.lr}")
     print(f"  - Beta value: {config.beta}")
-    print(f"  - Number of workers: {args.num_workers}")
+    print(f"  - Number of workers: {adaptive_config['num_workers']}")
+    print(f"  - Pin memory: {adaptive_config['pin_memory']}")
     print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
-    print(f"  - Model compilation: {'Enabled' if args.compile_model else 'Disabled'}")
+    print(f"  - Model compilation: {'Enabled' if adaptive_config['compile_model'] else 'Disabled'}")
+    print(f"  - Strategy: {adaptive_config['strategy']}")
     print(f"  - Metrics monitoring: {'Enabled' if not args.disable_metrics_monitoring else 'Disabled'}")
     if args.resume_from_checkpoint:
         print(f"  - Resuming from checkpoint: {args.resume_from_checkpoint}")
