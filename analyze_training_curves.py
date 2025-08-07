@@ -394,13 +394,42 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze training curves from TensorBoard logs')
     parser.add_argument('--log_dir', type=str, required=True,
                        help='Path to TensorBoard log directory')
-    parser.add_argument('--save_dir', type=str, default='./training_analysis',
-                       help='Directory to save analysis results')
+    parser.add_argument('--save_dir', type=str, default=None,
+                       help='Directory to save analysis results (default: auto-detect from log_dir)')
+    parser.add_argument('--config_name', type=str, default=None,
+                       help='Config name for output directory (default: auto-detect from log_dir)')
     
     args = parser.parse_args()
     
+    # Auto-detect config.name and save_dir if not provided
+    if args.config_name is None or args.save_dir is None:
+        # Try to extract config.name from log_dir path
+        log_dir_parts = args.log_dir.split(os.sep)
+        config_name = None
+        
+        # Look for config.name in the path
+        for i, part in enumerate(log_dir_parts):
+            if part in ['SeqSetVAE-v2', 'SeqSetVAE-v1', 'SeqSetVAE']:  # Common config names
+                config_name = part
+                break
+        
+        if config_name is None:
+            # Default config name
+            config_name = "SeqSetVAE-v2"
+        
+        if args.config_name is None:
+            args.config_name = config_name
+        
+        if args.save_dir is None:
+            # Create save_dir based on config.name
+            base_output_dir = os.path.dirname(args.log_dir) if os.path.dirname(args.log_dir) else "."
+            args.save_dir = os.path.join(base_output_dir, args.config_name, "analysis")
+    
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
+    
+    print(f"📁 Analysis results will be saved to: {args.save_dir}")
+    print(f"🔍 Using config name: {args.config_name}")
     
     # Load metrics
     try:
