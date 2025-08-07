@@ -14,6 +14,36 @@ from modules import (
 )
 
 
+def load_checkpoint_weights(checkpoint_path, device='cpu'):
+    """
+    Load weights from checkpoint - handles both full PyTorch Lightning checkpoints 
+    and direct state dicts (weights only).
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        device: Device to load the checkpoint on
+    
+    Returns:
+        state_dict: The model state dict containing only weights
+    """
+    print(f"📦 Loading weights from: {checkpoint_path}")
+    print("📦 Loading weights only (no optimizer state or other metadata)")
+    
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    
+    # Handle different checkpoint formats
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        # Full PyTorch Lightning checkpoint
+        state_dict = ckpt["state_dict"]
+        print(f"✅ Found PyTorch Lightning checkpoint with state_dict")
+    else:
+        # Direct state dict (weights only)
+        state_dict = ckpt
+        print(f"✅ Found direct state dict (weights only)")
+    
+    return state_dict
+
+
 ##### SetVAE
 class SetVAE(pl.LightningModule):
     """Set representation without historical information."""
@@ -144,15 +174,29 @@ class SeqSetVAE(pl.LightningModule):
         # 只有在不是从checkpoint恢复时才加载预训练的setvae权重
         if pretrained_ckpt is not None and not skip_pretrained_on_resume:
             print(f"🔄 Loading pretrained SetVAE weights from: {pretrained_ckpt}")
-            ckpt = torch.load(pretrained_ckpt, map_location='cpu')
-            state_dict = ckpt.get("state_dict", ckpt)
+            
+            # Load checkpoint weights using utility function
+            state_dict = load_checkpoint_weights(pretrained_ckpt, device='cpu')
+            
+            # Extract SetVAE weights
             setvae_state = {
                 k.replace("setvae.", ""): v
                 for k, v in state_dict.items()
                 if k.startswith("setvae.")
             }
-            self.setvae.load_state_dict(setvae_state, strict=False)
-            del ckpt, state_dict, setvae_state
+            
+            # Load SetVAE weights
+            missing_keys, unexpected_keys = self.setvae.load_state_dict(setvae_state, strict=False)
+            
+            if missing_keys:
+                print(f"⚠️  Missing SetVAE keys: {len(missing_keys)} parameters not loaded")
+            else:
+                print("✅ All SetVAE parameters loaded successfully")
+            
+            if unexpected_keys:
+                print(f"⚠️  Unexpected SetVAE keys: {len(unexpected_keys)} extra parameters ignored")
+            
+            del state_dict, setvae_state
         elif pretrained_ckpt is not None and skip_pretrained_on_resume:
             print(f"⏭️  Skipping pretrained SetVAE loading (resuming from checkpoint)")
         elif pretrained_ckpt is None:
