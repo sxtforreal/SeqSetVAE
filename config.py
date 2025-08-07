@@ -38,6 +38,7 @@ gradient_clip_val = 0.5          # Gradient clipping value (reduced to prevent e
 name = "SeqSetVAE-v2"            # Experiment name for logging
 log_every_n_steps = 200          # Log metrics every N training steps
 ckpt_every_n_steps = 200         # Save checkpoint every N training steps
+seed = 0
 
 # Compute Configuration
 accelerator = "gpu"              # Training accelerator type (gpu/cpu/tpu)
