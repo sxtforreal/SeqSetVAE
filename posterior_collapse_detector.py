@@ -7,8 +7,9 @@ import logging
 from typing import Optional, Dict, Any
 import json
 from datetime import datetime
+import lightning.pytorch as pl
 
-class PosteriorMetricsMonitor:
+class PosteriorMetricsMonitor(pl.Callback):
     """
     Monitors and detects posterior collapse during VAE training.
     
@@ -263,3 +264,32 @@ class PosteriorMetricsMonitor:
             self.close()
         except:
             pass
+    
+    # PyTorch Lightning callback methods
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Called at the end of each training batch."""
+        # Extract KL divergence and reconstruction loss from outputs
+        if outputs is not None and isinstance(outputs, dict):
+            kl_loss = outputs.get('kl_loss', 0.0)
+            recon_loss = outputs.get('recon_loss', 0.0)
+            
+            # Convert to float if they're tensors
+            if torch.is_tensor(kl_loss):
+                kl_loss = kl_loss.item()
+            if torch.is_tensor(recon_loss):
+                recon_loss = recon_loss.item()
+            
+            # Update monitoring
+            self.update(trainer.global_step, kl_loss, recon_loss)
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        """Called at the end of each training epoch."""
+        # Generate plots at epoch end
+        if self.step_count % self.plot_frequency == 0:
+            self._generate_plots()
+    
+    def on_fit_end(self, trainer, pl_module):
+        """Called when training ends."""
+        # Generate final plots and cleanup
+        self._generate_plots()
+        self.close()

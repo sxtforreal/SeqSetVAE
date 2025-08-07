@@ -105,14 +105,8 @@ def setup_metrics_monitor(args, experiment_output_dir):
     
     return monitor
 
-class OptimizedEarlyStopping(EarlyStopping):
-    """Optimized early stopping callback"""
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-    def _should_stop_early(self, trainer, pl_module):
-        return super()._should_stop_early(trainer, pl_module)
+# Remove the custom OptimizedEarlyStopping class as it doesn't add value
+# We'll use the standard EarlyStopping directly
 
 def main():
     parser = argparse.ArgumentParser(description='Train SeqSetVAE with optimized performance')
@@ -310,7 +304,7 @@ def main():
         callbacks.append(metrics_monitor)
         
         # Early stopping
-        early_stopping = OptimizedEarlyStopping(
+        early_stopping = EarlyStopping(
             monitor="val_auc",
             mode="max", 
             patience=3,  # Reduced patience for faster training
@@ -319,7 +313,7 @@ def main():
         )
     else:
         print("⚠️  Posterior metrics monitoring disabled")
-        early_stopping = OptimizedEarlyStopping(
+        early_stopping = EarlyStopping(
             monitor="val_auc",
             mode="max",
             patience=3,
