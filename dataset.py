@@ -548,7 +548,7 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
 
     def _create_loader(self, ds, shuffle=False):
         """
-        Create a data loader with appropriate collate function.
+        Create a data loader with appropriate collate function and optimized settings.
         
         Uses standard collate function for batch_size=1, enhanced dynamic collate
         function for larger batches.
@@ -565,15 +565,20 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         else:
             # Use improved dynamic collate function
             collate_fn = lambda batch: self._dynamic_collate_fn(batch)
-            
+        
+        # Optimized worker count based on batch size and system capabilities
+        num_workers = getattr(self, 'num_workers', 4 if self.batch_size > 1 else 2)
+        pin_memory = getattr(self, 'pin_memory', True)
+        
         return DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=shuffle,
-            num_workers=4 if self.batch_size > 1 else 2,  # Increase worker count for parallel processing
+            num_workers=num_workers,
             collate_fn=collate_fn,
-            pin_memory=True,
+            pin_memory=pin_memory,
             drop_last=False,  # Don't drop the last incomplete batch
+            persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
         )
 
     def _dynamic_collate_fn(self, batch: List[Tuple[pd.DataFrame, str]]) -> Dict[str, Any]:
