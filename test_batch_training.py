@@ -188,11 +188,75 @@ def test_memory_usage():
             print(f"  ❌ Memory test failed for batch size {batch_size}: {e}")
             continue
 
-if __name__ == "__main__":
-    # Test basic functionality
-    test_batch_training()
+def test_model_forward_simple():
+    """Test the model's forward method with simple synthetic data"""
     
-    # Test memory usage
-    test_memory_usage()
+    print("🧪 Testing model forward method with synthetic data...")
+    print("=" * 50)
+    
+    try:
+        # Create a simple model
+        model = SeqSetVAE(
+            input_dim=768,
+            reduced_dim=256,
+            latent_dim=256,
+            levels=2,
+            heads=2,
+            m=16,
+            beta=0.1,
+            lr=1e-4,
+            num_classes=2,
+            ff_dim=256,
+            transformer_heads=2,
+            transformer_layers=2,
+            freeze_ratio=0.0,
+            pretrained_ckpt=None,
+            w=1.0,
+            free_bits=0.1,
+            warmup_beta=True,
+            max_beta=0.1,
+            beta_warmup_steps=5000,
+            kl_annealing=True,
+        )
+        
+        # Create synthetic batch data
+        batch_size = 2
+        seq_len = 10
+        embed_dim = 768
+        
+        batch = {
+            "var": torch.randn(batch_size, seq_len, embed_dim),
+            "val": torch.randn(batch_size, seq_len, 1),
+            "minute": torch.randn(batch_size, seq_len, 1),
+            "set_id": torch.randint(0, 3, (batch_size, seq_len, 1)),
+            "label": torch.randint(0, 2, (batch_size,)),
+            "padding_mask": torch.zeros(batch_size, seq_len, dtype=torch.bool)
+        }
+        
+        print(f"  - Created synthetic batch with shape: {batch['var'].shape}")
+        
+        # Test forward pass
+        with torch.no_grad():
+            logits, recon_loss, kl_loss = model(batch)
+            print(f"  - logits shape: {logits.shape}")
+            print(f"  - recon_loss: {recon_loss.item():.4f}")
+            print(f"  - kl_loss: {kl_loss.item():.4f}")
+            print(f"  ✅ Forward pass successful with synthetic data")
+            
+    except Exception as e:
+        print(f"  ❌ Forward pass failed with synthetic data: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # Test simple forward pass first
+    test_model_forward_simple()
+    
+    # Test basic functionality (if dependencies are available)
+    try:
+        test_batch_training()
+        test_memory_usage()
+    except ImportError as e:
+        print(f"⚠️  Skipping full tests due to missing dependencies: {e}")
     
     print("\n🎯 All tests completed!")

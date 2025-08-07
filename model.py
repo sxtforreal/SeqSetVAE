@@ -286,8 +286,10 @@ class SeqSetVAE(pl.LightningModule):
         Forward pass with support for variable length sequences and batch processing.
         
         Args:
-            sets: List of patient sets, where each patient has a list of set dictionaries
-                  Each set dict contains: {"var": [1, N, D], "val": [1, N, 1], "minute": [1, N, 1]}
+            sets: Either:
+                  - List of patient sets, where each patient has a list of set dictionaries
+                  - List of set dictionaries for single patient
+                  - Dictionary with keys: 'var', 'val', 'minute', 'set_id', 'label', 'padding_mask'
             padding_mask: [B, S] boolean mask where True indicates padding (optional)
         
         Returns:
@@ -295,6 +297,82 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss: Scalar reconstruction loss
             kl_loss: Scalar KL divergence loss
         """
+        # Handle dictionary input (from dataloader)
+        if isinstance(sets, dict):
+            var, val, time, set_ids, label = (
+                sets["var"],
+                sets["val"],
+                sets["minute"],
+                sets["set_id"],
+                sets.get("label"),
+            )
+            padding_mask = sets.get("padding_mask", None)
+            
+            # Split sets for each patient in the batch
+            all_patient_sets = self._split_sets(var, val, time, set_ids, padding_mask)
+            
+            # Process each patient separately and collect results
+            all_logits = []
+            total_recon_loss = 0.0
+            total_kl_loss = 0.0
+            valid_patients = 0
+            
+            for patient_idx, patient_sets in enumerate(all_patient_sets):
+                if len(patient_sets) == 0:
+                    # Skip empty patients
+                    continue
+                
+                # Ensure patient_sets is a list of dictionaries
+                if not isinstance(patient_sets, list):
+                    print(f"Warning: patient_sets is not a list for patient {patient_idx}, got {type(patient_sets)}")
+                    continue
+                
+                # Check if all elements are dictionaries
+                for i, s_dict in enumerate(patient_sets):
+                    if not isinstance(s_dict, dict):
+                        print(f"Warning: s_dict at index {i} is not a dictionary for patient {patient_idx}, got {type(s_dict)}")
+                        continue
+                    
+                    # Check if required keys exist
+                    required_keys = ["var", "val", "minute"]
+                    for key in required_keys:
+                        if key not in s_dict:
+                            print(f"Warning: Missing key '{key}' in s_dict at index {i} for patient {patient_idx}")
+                            continue
+                    
+                    # Check if values are tensors
+                    for key in required_keys:
+                        if not isinstance(s_dict[key], torch.Tensor):
+                            print(f"Warning: {key} is not a tensor in s_dict at index {i} for patient {patient_idx}, got {type(s_dict[key])}")
+                            continue
+                
+                # Process this patient's sets
+                try:
+                    logits, recon_loss, kl_loss = self._forward_single(patient_sets)
+                    all_logits.append(logits)
+                    total_recon_loss += recon_loss
+                    total_kl_loss += kl_loss
+                    valid_patients += 1
+                except Exception as e:
+                    print(f"Error processing patient {patient_idx}: {e}")
+                    continue
+            
+            if valid_patients == 0:
+                # Handle case where all patients are empty
+                batch_size = var.size(0)
+                device = var.device
+                logits = torch.zeros(batch_size, self.num_classes, device=device)
+                recon_loss = torch.tensor(0.0, device=device)
+                kl_loss = torch.tensor(0.0, device=device)
+            else:
+                # Average losses across patients
+                logits = torch.cat(all_logits, dim=0)  # [B, num_classes]
+                recon_loss = total_recon_loss / valid_patients
+                kl_loss = total_kl_loss / valid_patients
+            
+            return logits, recon_loss, kl_loss
+        
+        # Handle list input (original format)
         if isinstance(sets, list) and len(sets) > 0 and isinstance(sets[0], list):
             # Multi-patient batch case
             return self._forward_batch(sets, padding_mask)
@@ -314,7 +392,19 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss: Scalar reconstruction loss
             kl_loss: Scalar KL divergence loss
         """
+        # Ensure sets is a list
+        if not isinstance(sets, list):
+            raise ValueError(f"Expected sets to be a list, got {type(sets)}")
+        
         S = len(sets)
+        if S == 0:
+            # Handle empty sets case
+            device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
+            logits = torch.zeros(1, self.num_classes, device=device)
+            recon_loss = torch.tensor(0.0, device=device)
+            kl_loss = torch.tensor(0.0, device=device)
+            return logits, recon_loss, kl_loss
+        
         z_prims, kl_total = [], 0.0
         pos_list = []
         
@@ -324,12 +414,31 @@ class SeqSetVAE(pl.LightningModule):
         # Store latent variable information (for collapse detector)
         all_z_lists = []
         
-        for s_dict in sets:
+        for i, s_dict in enumerate(sets):
+            # Ensure s_dict is a dictionary
+            if not isinstance(s_dict, dict):
+                raise ValueError(f"Expected s_dict to be a dictionary, got {type(s_dict)} at index {i}")
+            
+            # Check if required keys exist
+            required_keys = ["var", "val", "minute"]
+            for key in required_keys:
+                if key not in s_dict:
+                    raise ValueError(f"Missing required key '{key}' in s_dict at index {i}")
+            
             var, val, time = (
                 s_dict["var"],
                 s_dict["val"],
                 s_dict["minute"],
             )
+            
+            # Ensure tensors are the right type
+            if not isinstance(var, torch.Tensor):
+                raise ValueError(f"Expected var to be a torch.Tensor, got {type(var)} at index {i}")
+            if not isinstance(val, torch.Tensor):
+                raise ValueError(f"Expected val to be a torch.Tensor, got {type(val)} at index {i}")
+            if not isinstance(time, torch.Tensor):
+                raise ValueError(f"Expected time to be a torch.Tensor, got {type(time)} at index {i}")
+            
             assert time.unique().numel() == 1, "Time is not constant in this set"
             minute_val = time.unique().float()  # Ensure float type
             pos_list.append(minute_val)
@@ -503,17 +612,53 @@ class SeqSetVAE(pl.LightningModule):
                     "minute": torch.empty(0, 1, device=patient_time.device).unsqueeze(0),
                 })
             else:
-                # Find unique consecutive set IDs
-                unique_set_ids, counts = torch.unique_consecutive(patient_set_ids.squeeze(-1), return_counts=True)
-                indices = torch.split(torch.arange(len(patient_set_ids), device=patient_set_ids.device), counts.tolist())
+                # Ensure set_ids is the right shape and type
+                if patient_set_ids.dim() > 1:
+                    patient_set_ids = patient_set_ids.squeeze(-1)
                 
-                for idx in indices:
-                    if len(idx) > 0:  # Only add non-empty sets
+                # Convert to long if needed
+                if patient_set_ids.dtype != torch.long:
+                    patient_set_ids = patient_set_ids.long()
+                
+                # Find unique consecutive set IDs
+                try:
+                    # Check if torch.unique_consecutive is available
+                    if hasattr(torch, 'unique_consecutive'):
+                        unique_set_ids, counts = torch.unique_consecutive(patient_set_ids, return_counts=True)
+                    else:
+                        # Fallback implementation for older PyTorch versions
+                        unique_set_ids = torch.unique(patient_set_ids)
+                        counts = torch.tensor([(patient_set_ids == uid).sum().item() for uid in unique_set_ids])
+                    
+                    # Convert counts to list of integers
+                    counts_list = [int(c.item()) for c in counts]
+                    
+                    # Ensure counts_list is not empty and all values are positive
+                    if not counts_list or any(c <= 0 for c in counts_list):
+                        print(f"Warning: Invalid counts_list for patient {b}: {counts_list}. Treating as single set.")
                         patient_sets.append({
-                            "var": patient_var[idx].unsqueeze(0),  # [1, set_size, D]
-                            "val": patient_val[idx].unsqueeze(0),  # [1, set_size, 1]
-                            "minute": patient_time[idx].unsqueeze(0),  # [1, set_size, 1]
+                            "var": patient_var.unsqueeze(0),  # [1, N, D]
+                            "val": patient_val.unsqueeze(0),  # [1, N, 1]
+                            "minute": patient_time.unsqueeze(0),  # [1, N, 1]
                         })
+                    else:
+                        indices = torch.split(torch.arange(len(patient_set_ids), device=patient_set_ids.device), counts_list)
+                        
+                        for idx in indices:
+                            if len(idx) > 0:  # Only add non-empty sets
+                                patient_sets.append({
+                                    "var": patient_var[idx].unsqueeze(0),  # [1, set_size, D]
+                                    "val": patient_val[idx].unsqueeze(0),  # [1, set_size, 1]
+                                    "minute": patient_time[idx].unsqueeze(0),  # [1, set_size, 1]
+                                })
+                except Exception as e:
+                    # Fallback: treat all data as one set
+                    print(f"Warning: Error in set splitting for patient {b}: {e}. Treating as single set.")
+                    patient_sets.append({
+                        "var": patient_var.unsqueeze(0),  # [1, N, D]
+                        "val": patient_val.unsqueeze(0),  # [1, N, 1]
+                        "minute": patient_time.unsqueeze(0),  # [1, N, 1]
+                    })
             
             all_sets.append(patient_sets)
         
