@@ -186,6 +186,7 @@ def main():
         max_beta=config.max_beta,
         beta_warmup_steps=config.beta_warmup_steps,
         kl_annealing=config.kl_annealing,
+        skip_pretrained_on_resume=args.resume_from_checkpoint is not None,  # 如果从checkpoint恢复，跳过预训练加载
     )
     
     # Apply torch.compile if requested

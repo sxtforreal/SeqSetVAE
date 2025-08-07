@@ -124,6 +124,7 @@ class SeqSetVAE(pl.LightningModule):
         max_beta: float = 0.1,
         beta_warmup_steps: int = 5000,
         kl_annealing: bool = True,
+        skip_pretrained_on_resume: bool = False,  # 新增参数：是否在恢复时跳过预训练加载
     ):
 
         super().__init__()
@@ -139,7 +140,10 @@ class SeqSetVAE(pl.LightningModule):
             beta,
             lr,
         )
-        if pretrained_ckpt is not None:
+        
+        # 只有在不是从checkpoint恢复时才加载预训练的setvae权重
+        if pretrained_ckpt is not None and not skip_pretrained_on_resume:
+            print(f"🔄 Loading pretrained SetVAE weights from: {pretrained_ckpt}")
             ckpt = torch.load(pretrained_ckpt, map_location='cpu')
             state_dict = ckpt.get("state_dict", ckpt)
             setvae_state = {
@@ -149,6 +153,10 @@ class SeqSetVAE(pl.LightningModule):
             }
             self.setvae.load_state_dict(setvae_state, strict=False)
             del ckpt, state_dict, setvae_state
+        elif pretrained_ckpt is not None and skip_pretrained_on_resume:
+            print(f"⏭️  Skipping pretrained SetVAE loading (resuming from checkpoint)")
+        elif pretrained_ckpt is None:
+            print(f"ℹ️  No pretrained checkpoint provided, using random initialization")
 
         # Freeze X% pretrained parameters
         set_params = list(self.setvae.parameters())
