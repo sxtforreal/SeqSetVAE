@@ -5,79 +5,58 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 from model import SeqSetVAE
 from dataset import SeqSetVAEDataModule
-from posterior_collapse_detector import PosteriorCollapseDetector
+from posterior_collapse_detector import PosteriorMetricsMonitor
 import config
 import os
 import argparse
 from datetime import datetime
 
-def setup_collapse_detector(args):
-    """Set up posterior collapse detector"""
+def setup_metrics_monitor(args):
+    """Set up posterior metrics monitor"""
     
-    # Adjust detection parameters based on data size
+    # Adjust monitoring parameters based on data size
     if args.fast_detection:
-        # Fast detection mode - more frequent checks, more sensitive thresholds
-        detector = PosteriorCollapseDetector(
-            kl_threshold=0.005,          # Stricter KL threshold
-            var_threshold=0.05,          # Stricter variance threshold
-            active_units_threshold=0.15, # Stricter active units threshold
-            
-            window_size=50,              # Smaller window, faster response
-            check_frequency=20,          # Check every 20 steps
-            
-            early_stop_patience=100,     # Faster early stopping
-            auto_save_on_collapse=True,
+        # Fast monitoring mode - more frequent updates
+        monitor = PosteriorMetricsMonitor(
+            update_frequency=20,          # Update every 20 steps
+            plot_frequency=200,           # Save plot every 200 steps
+            window_size=100,              # History window size
             
             log_dir=args.log_dir,
-            plot_frequency=200,          # More frequent plotting
             verbose=True,
         )
     else:
-        # Standard detection mode
-        detector = PosteriorCollapseDetector(
-            kl_threshold=0.01,
-            var_threshold=0.1,
-            active_units_threshold=0.1,
-            
-            window_size=100,
-            check_frequency=50,
-            
-            early_stop_patience=200,
-            auto_save_on_collapse=True,
+        # Standard monitoring mode
+        monitor = PosteriorMetricsMonitor(
+            update_frequency=50,          # Update every 50 steps
+            plot_frequency=500,           # Save plot every 500 steps
+            window_size=100,              # History window size
             
             log_dir=args.log_dir,
-            plot_frequency=500,
             verbose=True,
         )
     
-    print(f"🔍 Collapse detector setup complete:")
-    print(f"  - Detection mode: {'Fast' if args.fast_detection else 'Standard'}")
-    print(f"  - KL threshold: {detector.kl_threshold}")
-    print(f"  - Check frequency: every {detector.check_frequency} steps")
-    print(f"  - Log directory: {detector.log_dir}")
+    print(f"📊 Posterior metrics monitor setup complete:")
+    print(f"  - Monitoring mode: {'Fast' if args.fast_detection else 'Standard'}")
+    print(f"  - Update frequency: every {monitor.update_frequency} steps")
+    print(f"  - Plot frequency: every {monitor.plot_frequency} steps")
+    print(f"  - Log directory: {monitor.log_dir}")
     
-    return detector
+    return monitor
 
 class CollapseAwareEarlyStopping(EarlyStopping):
-    """Early stopping callback integrated with collapse detection"""
+    """Early stopping callback integrated with metrics monitoring"""
     
-    def __init__(self, collapse_detector, *args, **kwargs):
+    def __init__(self, metrics_monitor, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.collapse_detector = collapse_detector
+        self.metrics_monitor = metrics_monitor
         
     def _should_stop_early(self, trainer, pl_module):
-        # Force early stopping if persistent collapse is detected
-        if (self.collapse_detector.collapse_detected and 
-            self.collapse_detector.collapse_consecutive_steps >= 50):
-            
-            print(f"\n🛑 Forced early stopping due to persistent posterior collapse!")
-            return True
-            
-        # Otherwise use standard early stopping logic
+        # Use standard early stopping logic only
         return super()._should_stop_early(trainer, pl_module)
 
 def main():
-    parser = argparse.ArgumentParser(description='Train SeqSetVAE with posterior collapse detection')
+    parser = argparse.ArgumentParser(description='Train SeqSetVAE with posterior metrics monitoring')
     
     # Basic training parameters
     parser.add_argument('--max_epochs', type=int, default=config.max_epochs, 
@@ -93,14 +72,14 @@ def main():
     parser.add_argument('--use_dynamic_padding', action='store_true', default=True,
                        help='Use dynamic padding for batch training')
     
-    # Collapse detection parameters
+    # Metrics monitoring parameters
     parser.add_argument('--fast_detection', action='store_true',
-                       help='Enable fast detection mode (more frequent checks, more sensitive thresholds)')
+                       help='Enable fast monitoring mode (more frequent updates)')
+    parser.add_argument('--disable_metrics_monitoring', action='store_true',
+                       help='Disable posterior metrics monitoring')
     parser.add_argument('--log_dir', type=str, 
                        default=None,  # Will be set to match main log directory
-                       help='Collapse detection log directory (default: same as main logs)')
-    parser.add_argument('--disable_collapse_detection', action='store_true',
-                       help='Disable posterior collapse detection')
+                       help='Metrics monitoring log directory (default: same as main logs)')
     
     # Data path parameters
     parser.add_argument('--data_dir', type=str, 
@@ -120,40 +99,42 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting SeqSetVAE training with posterior collapse detection")
+    print("🚀 Starting SeqSetVAE training with posterior metrics monitoring")
     print("=" * 60)
     
-    # Set random seed
-    seed_everything(0, workers=True)
+    # Set random seed for reproducibility
+    seed_everything(config.seed, workers=True)
     
-    # Prepare data
-    print("📊 Preparing data...")
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
+    
+    # Create data module
+    print("📊 Creating data module...")
     data_module = SeqSetVAEDataModule(
-        args.data_dir, 
-        args.params_map_path, 
-        args.label_path,
+        saved_dir=args.data_dir,
+        params_map_path=args.params_map_path,
+        label_path=args.label_path,
         batch_size=args.batch_size,
         max_sequence_length=args.max_sequence_length,
-        use_dynamic_padding=args.use_dynamic_padding
+        use_dynamic_padding=args.use_dynamic_padding,
     )
-    data_module.setup()
-    print(f"  - Training data: {len(data_module.train_dataset)}")
-    print(f"  - Validation data: {len(data_module.val_dataset)}")
-    print(f"  - Test data: {len(data_module.test_dataset)}")
+    
+    # Print data configuration
     print(f"  - Batch size: {args.batch_size}")
     print(f"  - Max sequence length: {args.max_sequence_length or 'No limit'}")
     print(f"  - Dynamic padding: {args.use_dynamic_padding}")
     
-    # Set up logger
+    # Set up logging
     logger = TensorBoardLogger(
-        save_dir=os.path.join(args.output_dir, "logs"),
-        name=f"{config.name}_with_collapse_detection_batch{args.batch_size}",
+        save_dir=args.output_dir,
+        name=f"{config.name}_with_metrics_monitoring_batch{args.batch_size}",
+        version=None,  # Auto-increment version
     )
     
-    # If log_dir not specified, use the same directory as main logs
+    # Set up metrics monitoring log directory
     if args.log_dir is None:
-        # Create a subdirectory for collapse logs within the main log directory
-        args.log_dir = os.path.join(logger.log_dir, "collapse_detection")
+        args.log_dir = os.path.join(logger.log_dir, "posterior_metrics")
     
     # Create model
     print("🧠 Creating model...")
@@ -183,36 +164,34 @@ def main():
     # Set up callbacks
     callbacks = []
     
-    # Model checkpoint
+    # Model checkpointing
     checkpoint = ModelCheckpoint(
         dirpath=os.path.join(args.output_dir, "checkpoints"),
-        filename=f"best_{config.name}_collapse_aware_batch{args.batch_size}",
-        save_weights_only=True,
-        save_last=True,  # Save last checkpoint
-        every_n_train_steps=config.ckpt_every_n_steps,
+        filename=f"best_{config.name}_metrics_monitoring_batch{args.batch_size}",
         monitor="val_auc",
         mode="max",
-        save_top_k=3,  # Save top 3 best models
-        enable_version_counter=True,
+        save_top_k=3,
+        save_last=True,
+        verbose=True,
     )
     callbacks.append(checkpoint)
     
-    # Set up collapse detector
-    if not args.disable_collapse_detection:
-        collapse_detector = setup_collapse_detector(args)
-        callbacks.append(collapse_detector)
+    # Set up metrics monitor
+    if not args.disable_metrics_monitoring:
+        metrics_monitor = setup_metrics_monitor(args)
+        callbacks.append(metrics_monitor)
         
-        # Early stopping integrated with collapse detection
+        # Early stopping integrated with metrics monitoring
         early_stopping = CollapseAwareEarlyStopping(
-            collapse_detector=collapse_detector,
+            metrics_monitor=metrics_monitor, # Pass the monitor itself
             monitor="val_auc",
             mode="max", 
-            patience=5,  # Increase patience since we have collapse detection
+            patience=5,  # Increase patience since we have metrics monitoring
             verbose=True,
             strict=True,
         )
     else:
-        print("⚠️  Posterior collapse detection disabled")
+        print("⚠️  Posterior metrics monitoring disabled")
         early_stopping = EarlyStopping(
             monitor="val_auc",
             mode="max",
@@ -255,7 +234,7 @@ def main():
     print(f"  - Precision: {config.precision}")
     print(f"  - Learning rate: {config.lr}")
     print(f"  - Beta value: {config.beta}")
-    print(f"  - Collapse detection: {'Enabled' if not args.disable_collapse_detection else 'Disabled'}")
+    print(f"  - Metrics monitoring: {'Enabled' if not args.disable_metrics_monitoring else 'Disabled'}")
     
     # Start training
     print("\n🎯 Starting training...")
@@ -267,21 +246,19 @@ def main():
         # Training completion summary
         print("\n✅ Training completed!")
         
-        if not args.disable_collapse_detection:
-            print("\n📊 Collapse detection summary:")
-            detector = None
+        if not args.disable_metrics_monitoring:
+            print("\n📊 Posterior metrics monitoring summary:")
+            monitor = None
             for callback in trainer.callbacks:
-                if isinstance(callback, PosteriorCollapseDetector):
-                    detector = callback
+                if isinstance(callback, PosteriorMetricsMonitor):
+                    monitor = callback
                     break
                     
-            if detector:
-                print(f"  - Total checks: {detector.collapse_stats['total_checks']}")
-                print(f"  - Warning count: {detector.collapse_stats['warnings_issued']}")
-                print(f"  - Collapse detected: {'Yes' if detector.collapse_detected else 'No'}")
-                if detector.collapse_step:
-                    print(f"  - Collapse occurrence step: {detector.collapse_step}")
-                print(f"  - Detailed log: {detector.log_file}")
+            if monitor:
+                print(f"  - Total steps monitored: {len(monitor.steps_history)}")
+                print(f"  - Update frequency: every {monitor.update_frequency} steps")
+                print(f"  - Plot frequency: every {monitor.plot_frequency} steps")
+                print(f"  - Log directory: {monitor.log_dir}")
         
         # Save final model
         final_model_path = os.path.join(args.output_dir, "checkpoints", f"final_{config.name}_batch{args.batch_size}.ckpt")
