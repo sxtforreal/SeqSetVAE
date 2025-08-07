@@ -50,9 +50,42 @@ python train_optimized.py \
     --max_sequence_length 1000 \
     --precision 16-mixed \
     --fast_detection
+
+### 2. 从checkpoint继续训练
+
+```bash
+# 从上次训练的checkpoint继续训练
+python train_optimized.py \
+    --batch_size 4 \
+    --num_workers 8 \
+    --pin_memory \
+    --gradient_accumulation_steps 2 \
+    --max_sequence_length 1000 \
+    --precision 16-mixed \
+    --fast_detection \
+    --resume_from_checkpoint /path/to/checkpoint.ckpt
+
+# 从最新的checkpoint继续训练（通常保存在outputs/checkpoints/目录下）
+python train_optimized.py \
+    --resume_from_checkpoint /home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/checkpoints/last.ckpt \
+    --batch_size 4 \
+    --fast_detection
 ```
 
-### 2. 带监控的训练
+**Checkpoint文件说明：**
+- `last.ckpt` - 最后一个epoch的checkpoint
+- `best_*.ckpt` - 最佳性能的checkpoint（基于验证AUC）
+- `final_*.ckpt` - 训练完成后的最终模型
+- `interrupted_*.ckpt` - 训练中断时保存的模型
+- `error_*.ckpt` - 训练出错时保存的模型
+
+**注意事项：**
+1. 确保checkpoint文件路径正确且文件存在
+2. 继续训练时会保持原有的训练状态（epoch、优化器状态等）
+3. 可以修改训练参数（如batch_size、learning_rate等）
+4. 建议使用相同的模型配置参数以确保兼容性
+
+### 3. 带监控的训练
 
 ```bash
 # 带后验指标监控的训练
@@ -61,7 +94,7 @@ python train_optimized.py \
     --fast_detection
 ```
 
-### 3. 性能测试
+### 4. 性能测试
 
 ```bash
 # 查看详细的优化指南
