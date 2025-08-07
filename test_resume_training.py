@@ -77,6 +77,12 @@ def test_resume_training():
             print("Error:", result.stderr)
             return False
             
+        # 测试新的skip_pretrained_on_resume功能
+        if "Skipping pretrained SetVAE loading (resuming from checkpoint)" in result.stdout:
+            print("✅ skip_pretrained_on_resume functionality working")
+        else:
+            print("⚠️  skip_pretrained_on_resume functionality not detected in output")
+            
     except subprocess.TimeoutExpired:
         print("⏰ Test timed out (this is normal for a quick test)")
     except Exception as e:
