@@ -26,7 +26,7 @@ class PosteriorCollapseDetector(Callback):
         check_frequency: int = 50,           # Check every N training steps
         early_stop_patience: int = 200,      # Stop after N consecutive collapse detections
         auto_save_on_collapse: bool = True,  # Auto-save model when collapse detected
-        log_dir: str = "./collapse_logs",    # Directory for logging
+        log_dir: str = "./collapse_logs",    # Directory for logging (默认与主日志同目录)
         verbose: bool = True,                # Enable detailed logging
     ):
         # Initialize monitoring variables and setup logging
@@ -149,7 +149,7 @@ python train_with_collapse_detection.py \
     --fast_detection \              # Enable fast detection mode
     --max_epochs 10 \               # Maximum training epochs
     --devices 1 \                   # Number of GPUs to use
-    --log_dir ./collapse_logs \     # Collapse detection log directory
+    --log_dir ./collapse_logs \     # Collapse detection log directory (默认: 与主日志相同目录)
     --data_dir /path/to/data \      # Training data directory
     --output_dir ./outputs          # Model output directory
 ```

@@ -33,7 +33,8 @@
 python train_with_collapse_detection.py --fast_detection
 
 # 可选：启动实时监控面板
-python collapse_visualizer.py --log_dir ./collapse_logs_YYYYMMDD_HHMMSS
+# 注意：collapse logs现在默认保存在主日志目录下的collapse_detection子目录中
+python collapse_visualizer.py --log_dir ./outputs/logs/SeqSetVAE_with_collapse_detection/version_X/collapse_detection
 ```
 
 ### 文件功能详解

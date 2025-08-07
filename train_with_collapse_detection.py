@@ -89,8 +89,8 @@ def main():
     parser.add_argument('--fast_detection', action='store_true',
                        help='Enable fast detection mode (more frequent checks, more sensitive thresholds)')
     parser.add_argument('--log_dir', type=str, 
-                       default=f"./collapse_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                       help='Collapse detection log directory')
+                       default=None,  # Will be set to match main log directory
+                       help='Collapse detection log directory (default: same as main logs)')
     parser.add_argument('--disable_collapse_detection', action='store_true',
                        help='Disable posterior collapse detection')
     
@@ -131,6 +131,11 @@ def main():
         save_dir=os.path.join(args.output_dir, "logs"),
         name=f"{config.name}_with_collapse_detection",
     )
+    
+    # If log_dir not specified, use the same directory as main logs
+    if args.log_dir is None:
+        # Create a subdirectory for collapse logs within the main log directory
+        args.log_dir = os.path.join(logger.log_dir, "collapse_detection")
     
     # Create model
     print("🧠 Creating model...")
