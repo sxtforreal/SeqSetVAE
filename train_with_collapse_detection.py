@@ -85,6 +85,14 @@ def main():
     parser.add_argument('--devices', type=int, default=config.devices,
                        help='Number of GPUs to use')
     
+    # Batch training parameters
+    parser.add_argument('--batch_size', type=int, default=1,
+                       help='Batch size for training (1 for single-patient, >1 for multi-patient)')
+    parser.add_argument('--max_sequence_length', type=int, default=None,
+                       help='Maximum sequence length to truncate (None for no limit)')
+    parser.add_argument('--use_dynamic_padding', action='store_true', default=True,
+                       help='Use dynamic padding for batch training')
+    
     # Collapse detection parameters
     parser.add_argument('--fast_detection', action='store_true',
                        help='Enable fast detection mode (more frequent checks, more sensitive thresholds)')
@@ -120,16 +128,26 @@ def main():
     
     # Prepare data
     print("📊 Preparing data...")
-    data_module = SeqSetVAEDataModule(args.data_dir, args.params_map_path, args.label_path)
+    data_module = SeqSetVAEDataModule(
+        args.data_dir, 
+        args.params_map_path, 
+        args.label_path,
+        batch_size=args.batch_size,
+        max_sequence_length=args.max_sequence_length,
+        use_dynamic_padding=args.use_dynamic_padding
+    )
     data_module.setup()
     print(f"  - Training data: {len(data_module.train_dataset)}")
     print(f"  - Validation data: {len(data_module.val_dataset)}")
     print(f"  - Test data: {len(data_module.test_dataset)}")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Max sequence length: {args.max_sequence_length or 'No limit'}")
+    print(f"  - Dynamic padding: {args.use_dynamic_padding}")
     
     # Set up logger
     logger = TensorBoardLogger(
         save_dir=os.path.join(args.output_dir, "logs"),
-        name=f"{config.name}_with_collapse_detection",
+        name=f"{config.name}_with_collapse_detection_batch{args.batch_size}",
     )
     
     # If log_dir not specified, use the same directory as main logs
@@ -168,7 +186,7 @@ def main():
     # Model checkpoint
     checkpoint = ModelCheckpoint(
         dirpath=os.path.join(args.output_dir, "checkpoints"),
-        filename=f"best_{config.name}_collapse_aware",
+        filename=f"best_{config.name}_collapse_aware_batch{args.batch_size}",
         save_weights_only=True,
         save_last=True,  # Save last checkpoint
         every_n_train_steps=config.ckpt_every_n_steps,
@@ -233,6 +251,7 @@ def main():
     print("\n📋 Training configuration:")
     print(f"  - Max epochs: {args.max_epochs}")
     print(f"  - Number of devices: {args.devices}")
+    print(f"  - Batch size: {args.batch_size}")
     print(f"  - Precision: {config.precision}")
     print(f"  - Learning rate: {config.lr}")
     print(f"  - Beta value: {config.beta}")
@@ -265,7 +284,7 @@ def main():
                 print(f"  - Detailed log: {detector.log_file}")
         
         # Save final model
-        final_model_path = os.path.join(args.output_dir, "checkpoints", f"final_{config.name}.ckpt")
+        final_model_path = os.path.join(args.output_dir, "checkpoints", f"final_{config.name}_batch{args.batch_size}.ckpt")
         trainer.save_checkpoint(final_model_path)
         print(f"💾 Final model saved: {final_model_path}")
         
@@ -273,7 +292,7 @@ def main():
         print("\n⏹️  Training interrupted by user")
         
         # Save model when interrupted
-        interrupt_model_path = os.path.join(args.output_dir, "checkpoints", f"interrupted_{config.name}.ckpt")
+        interrupt_model_path = os.path.join(args.output_dir, "checkpoints", f"interrupted_{config.name}_batch{args.batch_size}.ckpt")
         trainer.save_checkpoint(interrupt_model_path)
         print(f"💾 Interrupted model saved: {interrupt_model_path}")
         
@@ -281,7 +300,7 @@ def main():
         print(f"\n❌ Error occurred during training: {e}")
         
         # Save model when error occurs
-        error_model_path = os.path.join(args.output_dir, "checkpoints", f"error_{config.name}.ckpt")
+        error_model_path = os.path.join(args.output_dir, "checkpoints", f"error_{config.name}_batch{args.batch_size}.ckpt")
         try:
             trainer.save_checkpoint(error_model_path)
             print(f"💾 Error model saved: {error_model_path}")
