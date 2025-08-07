@@ -154,7 +154,7 @@ class SeqSetVAE(pl.LightningModule):
         max_beta: float = 0.1,
         beta_warmup_steps: int = 5000,
         kl_annealing: bool = True,
-        skip_pretrained_on_resume: bool = False,  # 新增参数：是否在恢复时跳过预训练加载
+        skip_pretrained_on_resume: bool = False,  # New parameter: whether to skip pretrained loading when resuming
     ):
 
         super().__init__()
@@ -171,7 +171,7 @@ class SeqSetVAE(pl.LightningModule):
             lr,
         )
         
-        # 只有在不是从checkpoint恢复时才加载预训练的setvae权重
+        # Only load pretrained setvae weights when not resuming from checkpoint
         if pretrained_ckpt is not None and not skip_pretrained_on_resume:
             print(f"🔄 Loading pretrained SetVAE weights from: {pretrained_ckpt}")
             

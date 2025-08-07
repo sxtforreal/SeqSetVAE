@@ -14,24 +14,24 @@ import torch
 
 def get_adaptive_training_config(args):
     """
-    根据设备配置自适应调整训练参数
+    Adaptively adjust training parameters based on device configuration
     """
-    # 获取设备配置
+    # Get device configuration
     device_config = config.device_config
     
-    # 根据设备类型调整参数
+    # Adjust parameters based on device type
     if device_config['cuda_available']:
-        # GPU训练配置
+        # GPU training configuration
         if device_config['devices'] > 1:
-            # 多GPU训练
+            # Multi-GPU training
             strategy = DDPStrategy(find_unused_parameters=False)
             effective_batch_size = args.batch_size * args.gradient_accumulation_steps * device_config['devices']
         else:
-            # 单GPU训练
+            # Single GPU training
             strategy = "auto"
             effective_batch_size = args.batch_size * args.gradient_accumulation_steps
             
-        # 根据GPU内存调整worker数量
+        # Adjust worker count based on GPU memory
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
         if gpu_memory >= 16:
             num_workers = min(args.num_workers, 12)
@@ -44,19 +44,19 @@ def get_adaptive_training_config(args):
         compile_model = args.compile_model and hasattr(torch, 'compile')
         
     else:
-        # CPU训练配置
+        # CPU training configuration
         strategy = "auto"
         effective_batch_size = args.batch_size * args.gradient_accumulation_steps
         
-        # CPU训练时减少worker数量避免过载
+        # Reduce worker count for CPU training to avoid overload
         import multiprocessing
         cpu_count = multiprocessing.cpu_count()
         num_workers = min(args.num_workers, max(1, cpu_count // 2))
         
-        pin_memory = False  # CPU训练不需要pin_memory
-        compile_model = False  # CPU训练时禁用compile
+        pin_memory = False  # CPU training doesn't need pin_memory
+        compile_model = False  # Disable compile for CPU training
         
-        # CPU训练时强制使用32位精度
+        # Force 32-bit precision for CPU training
         if args.precision != "32":
             print("⚠️  CPU training detected, switching to 32-bit precision")
             args.precision = "32"
@@ -229,7 +229,7 @@ def main():
         use_dynamic_padding=args.use_dynamic_padding,
     )
     
-    # 获取自适应训练配置
+    # Get adaptive training configuration
     adaptive_config = get_adaptive_training_config(args)
     
     # Override data loader settings with adaptive configuration
@@ -277,10 +277,10 @@ def main():
         max_beta=config.max_beta,
         beta_warmup_steps=config.beta_warmup_steps,
         kl_annealing=config.kl_annealing,
-        skip_pretrained_on_resume=args.resume_from_checkpoint is not None,  # 如果从checkpoint恢复，跳过预训练加载
+        skip_pretrained_on_resume=args.resume_from_checkpoint is not None,  # Skip pretrained loading if resuming from checkpoint
     )
     
-    # 获取自适应训练配置
+    # Get adaptive training configuration
     adaptive_config = get_adaptive_training_config(args)
     
     # Apply torch.compile if requested and supported
@@ -333,12 +333,12 @@ def main():
     print("⚡ Setting up adaptive trainer...")
     trainer = pl.Trainer(
         accelerator=config.accelerator,
-        devices=config.devices,  # 使用自适应配置的设备数量
+        devices=config.devices,  # Use adaptive configuration device count
         strategy=adaptive_config['strategy'],
         logger=logger,
         max_epochs=args.max_epochs,
         min_epochs=1,
-        precision=config.precision,  # 使用自适应配置的精度
+        precision=config.precision,  # Use adaptive configuration precision
         callbacks=callbacks,
         profiler=None,  # Disable profiler for better performance
         log_every_n_steps=config.log_every_n_steps,
