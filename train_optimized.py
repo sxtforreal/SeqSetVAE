@@ -212,14 +212,14 @@ def main():
     # Set up callbacks
     callbacks = []
     
-    # Model checkpointing
+    # Model checkpointing - only save the best checkpoint
     checkpoint = ModelCheckpoint(
         dirpath=os.path.join(experiment_output_dir, "checkpoints"),
         filename=f"best_{config.name}_optimized_batch{args.batch_size}",
         monitor="val_auc",
         mode="max",
-        save_top_k=2,  # Reduced from 3 to 2
-        save_last=True,
+        save_top_k=1,  # Only save the best checkpoint
+        save_last=False,  # Don't save the last checkpoint to save space
         verbose=True,
     )
     callbacks.append(checkpoint)
