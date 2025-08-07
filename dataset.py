@@ -499,8 +499,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         params_map_path: str,
         label_path: str,
         batch_size: int = 1,
-        max_sequence_length: int = None,  # 新增：最大序列长度限制
-        use_dynamic_padding: bool = True,  # 新增：是否使用动态padding
+        max_sequence_length: int = None,  # New: Maximum sequence length limit
+        use_dynamic_padding: bool = True,  # New: Whether to use dynamic padding
     ):
         super().__init__()
         self.saved_dir = saved_dir
@@ -563,22 +563,22 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         if self.batch_size == 1:
             collate_fn = self._collate_fn
         else:
-            # 使用改进的动态collate函数
+            # Use improved dynamic collate function
             collate_fn = lambda batch: self._dynamic_collate_fn(batch)
             
         return DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=shuffle,
-            num_workers=4 if self.batch_size > 1 else 2,  # 增加worker数量以支持并行
+            num_workers=4 if self.batch_size > 1 else 2,  # Increase worker count for parallel processing
             collate_fn=collate_fn,
             pin_memory=True,
-            drop_last=False,  # 不丢弃最后一个不完整的batch
+            drop_last=False,  # Don't drop the last incomplete batch
         )
 
     def _dynamic_collate_fn(self, batch: List[Tuple[pd.DataFrame, str]]) -> Dict[str, Any]:
         """
-        改进的动态collate函数，支持批量训练和动态padding。
+        Improved dynamic collate function that supports batch training and dynamic padding.
         
         Args:
             batch: List of (DataFrame, patient_id) tuples
@@ -588,20 +588,20 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         """
         batch_size = len(batch)
         
-        # 收集所有数据并计算最大长度
+        # Collect all data and calculate maximum length
         all_vars, all_vals, all_minutes, all_set_ids, all_labels = [], [], [], [], []
         max_events = 0
         
         for df, tsid in batch:
-            # 限制序列长度（如果设置了最大长度）
+            # Limit sequence length (if maximum length is set)
             if self.max_sequence_length and len(df) > self.max_sequence_length:
                 df = df.head(self.max_sequence_length)
             
-            # 处理变量嵌入
+            # Process variable embeddings
             var_tensors = [self.cached_embs[v] for v in df["variable"]]
             var_tsr = torch.stack(var_tensors) if var_tensors else torch.empty(0, next(iter(self.cached_embs.values())).shape[0])
             
-            # 标准化医疗值
+            # Normalize medical values
             raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
             norm_vals = torch.zeros_like(raw_vals)
             for i, ev in enumerate(df["variable"].to_numpy()):
@@ -611,10 +611,10 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
                 else:
                     norm_vals[i] = raw_vals[i]
             
-            # 处理时间信息
+            # Process time information
             minute_tsr = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(-1, 1)
             
-            # 处理set IDs
+            # Process set IDs
             if "set_index" in df.columns:
                 setids = torch.tensor(df["set_index"].to_numpy(dtype=np.int64)).view(-1, 1)
             else:
@@ -622,20 +622,20 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
                     (df["minute"].diff().fillna(0) != 0).cumsum().to_numpy(dtype=np.int64)
                 ).view(-1, 1)
             
-            # 查找结果标签
+            # Look up outcome label
             label_val = self.label_map.get(int(float(tsid)), 0)
             
-            # 收集所有处理的数据
+            # Collect all processed data
             all_vars.append(var_tsr)
             all_vals.append(norm_vals)
             all_minutes.append(minute_tsr)
             all_set_ids.append(setids)
             all_labels.append(label_val)
             
-            # 跟踪最大序列长度
+            # Track maximum sequence length
             max_events = max(max_events, len(df))
         
-        # 处理空batch的情况
+        # Handle empty batch case
         if max_events == 0:
             embed_dim = next(iter(self.cached_embs.values())).shape[0]
             return {
@@ -647,16 +647,16 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
                 "padding_mask": torch.ones(batch_size, 1, dtype=torch.bool)
             }
         
-        # 创建padded tensors
+        # Create padded tensors
         embed_dim = all_vars[0].shape[1] if len(all_vars[0]) > 0 else next(iter(self.cached_embs.values())).shape[0]
         
         padded_vars = torch.zeros(batch_size, max_events, embed_dim)
         padded_vals = torch.zeros(batch_size, max_events, 1)
         padded_minutes = torch.zeros(batch_size, max_events, 1)
         padded_set_ids = torch.zeros(batch_size, max_events, 1, dtype=torch.long)
-        padding_mask = torch.ones(batch_size, max_events, dtype=torch.bool)  # True表示padding位置
+        padding_mask = torch.ones(batch_size, max_events, dtype=torch.bool)  # True indicates padding positions
         
-        # 填充实际数据并创建padding mask
+        # Fill in actual data and create padding mask
         for i, (var_tsr, val_tsr, min_tsr, set_tsr) in enumerate(zip(all_vars, all_vals, all_minutes, all_set_ids)):
             seq_len = len(var_tsr)
             if seq_len > 0:
@@ -664,7 +664,7 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
                 padded_vals[i, :seq_len] = val_tsr
                 padded_minutes[i, :seq_len] = min_tsr
                 padded_set_ids[i, :seq_len] = set_tsr
-                padding_mask[i, :seq_len] = False  # False表示真实数据
+                padding_mask[i, :seq_len] = False  # False indicates real data
         
         return {
             "var": padded_vars,
@@ -708,7 +708,7 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         assert len(batch) == 1, "batch size must be 1 (one patient)"
         df, tsid = batch[0]
 
-        # 限制序列长度（如果设置了最大长度）
+        # Limit sequence length (if maximum length is set)
         if self.max_sequence_length and len(df) > self.max_sequence_length:
             df = df.head(self.max_sequence_length)
 

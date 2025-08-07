@@ -69,7 +69,11 @@ def plot_loss_curves(metrics_df, save_dir):
     
     # 1. Total Loss
     ax = axes[0, 0]
-    if 'train_loss' in metrics_df:
+    if 'train_loss_step' in metrics_df:
+        ax.plot(metrics_df['train_loss_step']['steps'], 
+                metrics_df['train_loss_step']['values'], 
+                label='Train Loss', alpha=0.8)
+    elif 'train_loss' in metrics_df:
         ax.plot(metrics_df['train_loss']['steps'], 
                 metrics_df['train_loss']['values'], 
                 label='Train Loss', alpha=0.8)
@@ -85,7 +89,11 @@ def plot_loss_curves(metrics_df, save_dir):
     
     # 2. KL Loss
     ax = axes[0, 1]
-    if 'train_kl' in metrics_df:
+    if 'train_kl_step' in metrics_df:
+        ax.plot(metrics_df['train_kl_step']['steps'], 
+                metrics_df['train_kl_step']['values'], 
+                label='Train KL', alpha=0.8)
+    elif 'train_kl' in metrics_df:
         ax.plot(metrics_df['train_kl']['steps'], 
                 metrics_df['train_kl']['values'], 
                 label='Train KL', alpha=0.8)
@@ -102,7 +110,11 @@ def plot_loss_curves(metrics_df, save_dir):
     
     # 3. Reconstruction Loss
     ax = axes[1, 0]
-    if 'train_recon' in metrics_df:
+    if 'train_recon_step' in metrics_df:
+        ax.plot(metrics_df['train_recon_step']['steps'], 
+                metrics_df['train_recon_step']['values'], 
+                label='Train Recon', alpha=0.8)
+    elif 'train_recon' in metrics_df:
         ax.plot(metrics_df['train_recon']['steps'], 
                 metrics_df['train_recon']['values'], 
                 label='Train Recon', alpha=0.8)
@@ -118,7 +130,11 @@ def plot_loss_curves(metrics_df, save_dir):
     
     # 4. Prediction Loss
     ax = axes[1, 1]
-    if 'train_pred' in metrics_df:
+    if 'train_pred_step' in metrics_df:
+        ax.plot(metrics_df['train_pred_step']['steps'], 
+                metrics_df['train_pred_step']['values'], 
+                label='Train Pred', alpha=0.8)
+    elif 'train_pred' in metrics_df:
         ax.plot(metrics_df['train_pred']['steps'], 
                 metrics_df['train_pred']['values'], 
                 label='Train Pred', alpha=0.8)
@@ -180,14 +196,14 @@ def plot_performance_metrics(metrics_df, save_dir):
     
     # 3. Accuracy
     ax = axes[2]
-    if 'val_acc' in metrics_df:
-        ax.plot(metrics_df['val_acc']['steps'], 
-                metrics_df['val_acc']['values'], 
+    if 'val_accuracy' in metrics_df:
+        ax.plot(metrics_df['val_accuracy']['steps'], 
+                metrics_df['val_accuracy']['values'], 
                 label='Val Accuracy', color='orange', linewidth=2)
         # Mark best accuracy
-        best_idx = np.argmax(metrics_df['val_acc']['values'])
-        best_step = metrics_df['val_acc']['steps'].iloc[best_idx]
-        best_acc = metrics_df['val_acc']['values'].iloc[best_idx]
+        best_idx = np.argmax(metrics_df['val_accuracy']['values'])
+        best_step = metrics_df['val_accuracy']['steps'].iloc[best_idx]
+        best_acc = metrics_df['val_accuracy']['values'].iloc[best_idx]
         ax.scatter(best_step, best_acc, color='red', s=100, zorder=5)
         ax.text(best_step, best_acc, f'Best: {best_acc:.4f}', 
                 ha='right', va='bottom')
@@ -207,7 +223,11 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 1. Beta annealing
     ax = axes[0, 0]
-    if 'train_beta' in metrics_df:
+    if 'train_beta_step' in metrics_df:
+        ax.plot(metrics_df['train_beta_step']['steps'], 
+                metrics_df['train_beta_step']['values'], 
+                label='Beta', color='purple', linewidth=2)
+    elif 'train_beta' in metrics_df:
         ax.plot(metrics_df['train_beta']['steps'], 
                 metrics_df['train_beta']['values'], 
                 label='Beta', color='purple', linewidth=2)
@@ -218,11 +238,19 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 2. Loss weights
     ax = axes[0, 1]
-    if 'train_recon_weight' in metrics_df:
+    if 'train_recon_weight_step' in metrics_df:
+        ax.plot(metrics_df['train_recon_weight_step']['steps'], 
+                metrics_df['train_recon_weight_step']['values'], 
+                label='Recon Weight', alpha=0.8)
+    elif 'train_recon_weight' in metrics_df:
         ax.plot(metrics_df['train_recon_weight']['steps'], 
                 metrics_df['train_recon_weight']['values'], 
                 label='Recon Weight', alpha=0.8)
-    if 'train_pred_weight' in metrics_df:
+    if 'train_pred_weight_step' in metrics_df:
+        ax.plot(metrics_df['train_pred_weight_step']['steps'], 
+                metrics_df['train_pred_weight_step']['values'], 
+                label='Pred Weight', alpha=0.8)
+    elif 'train_pred_weight' in metrics_df:
         ax.plot(metrics_df['train_pred_weight']['steps'], 
                 metrics_df['train_pred_weight']['values'], 
                 label='Pred Weight', alpha=0.8)
@@ -234,7 +262,16 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 3. KL vs Reconstruction trade-off
     ax = axes[1, 0]
-    if 'train_kl' in metrics_df and 'train_recon' in metrics_df:
+    if 'train_kl_step' in metrics_df and 'train_recon_step' in metrics_df:
+        # Sample points to avoid overcrowding
+        sample_idx = np.linspace(0, len(metrics_df['train_kl_step'])-1, 100, dtype=int)
+        kl_values = metrics_df['train_kl_step']['values'].iloc[sample_idx]
+        recon_values = metrics_df['train_recon_step']['values'].iloc[sample_idx]
+        
+        scatter = ax.scatter(recon_values, kl_values, 
+                           c=sample_idx, cmap='viridis', alpha=0.6)
+        plt.colorbar(scatter, ax=ax, label='Training Progress')
+    elif 'train_kl' in metrics_df and 'train_recon' in metrics_df:
         # Sample points to avoid overcrowding
         sample_idx = np.linspace(0, len(metrics_df['train_kl'])-1, 100, dtype=int)
         kl_values = metrics_df['train_kl']['values'].iloc[sample_idx]
@@ -251,7 +288,24 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 4. Loss composition over time
     ax = axes[1, 1]
-    if all(k in metrics_df for k in ['train_kl', 'train_recon', 'train_pred']):
+    if all(k in metrics_df for k in ['train_kl_step', 'train_recon_step', 'train_pred_step']):
+        steps = metrics_df['train_kl_step']['steps']
+        kl = metrics_df['train_kl_step']['values']
+        recon = metrics_df['train_recon_step']['values']
+        pred = metrics_df['train_pred_step']['values']
+        
+        # Normalize by total
+        total = kl + recon + pred + 1e-8
+        kl_norm = kl / total
+        recon_norm = recon / total
+        pred_norm = pred / total
+        
+        ax.fill_between(steps, 0, kl_norm, alpha=0.7, label='KL')
+        ax.fill_between(steps, kl_norm, kl_norm + recon_norm, 
+                       alpha=0.7, label='Recon')
+        ax.fill_between(steps, kl_norm + recon_norm, 1, 
+                       alpha=0.7, label='Pred')
+    elif all(k in metrics_df for k in ['train_kl', 'train_recon', 'train_pred']):
         steps = metrics_df['train_kl']['steps']
         kl = metrics_df['train_kl']['values']
         recon = metrics_df['train_recon']['values']
@@ -286,9 +340,10 @@ def analyze_collapse_indicators(metrics_df, save_dir):
     print("\n=== Collapse Analysis ===")
     
     # Check final KL divergence
-    if 'train_kl' in metrics_df:
-        final_kl = metrics_df['train_kl']['values'].iloc[-1]
-        avg_kl_last_100 = metrics_df['train_kl']['values'].iloc[-100:].mean()
+    kl_metric = 'train_kl_step' if 'train_kl_step' in metrics_df else 'train_kl'
+    if kl_metric in metrics_df:
+        final_kl = metrics_df[kl_metric]['values'].iloc[-1]
+        avg_kl_last_100 = metrics_df[kl_metric]['values'].iloc[-100:].mean()
         print(f"Final KL divergence: {final_kl:.6f}")
         print(f"Average KL (last 100 steps): {avg_kl_last_100:.6f}")
         
@@ -317,12 +372,12 @@ def analyze_collapse_indicators(metrics_df, save_dir):
     with open(os.path.join(save_dir, 'collapse_analysis.txt'), 'w') as f:
         f.write("=== Collapse Analysis Summary ===\n\n")
         
-        if 'train_kl' in metrics_df:
+        if kl_metric in metrics_df:
             f.write(f"Final KL divergence: {final_kl:.6f}\n")
             f.write(f"Average KL (last 100 steps): {avg_kl_last_100:.6f}\n")
             
             # KL trend
-            kl_values = metrics_df['train_kl']['values']
+            kl_values = metrics_df[kl_metric]['values']
             kl_start = kl_values.iloc[:100].mean()
             kl_end = kl_values.iloc[-100:].mean()
             f.write(f"KL trend: {kl_start:.6f} -> {kl_end:.6f} ")
