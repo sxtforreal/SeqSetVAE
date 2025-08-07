@@ -46,8 +46,8 @@ class Config:
 
 
 def load_model(checkpoint_path, config):
-    """Load model from checkpoint"""
-    print(f"Loading model from {checkpoint_path}")
+    """Load model from checkpoint - only loads weights since only weights are saved"""
+    print(f"Loading model weights from {checkpoint_path}")
     
     model = SeqSetVAE(
         input_dim=config.input_dim,
@@ -72,13 +72,34 @@ def load_model(checkpoint_path, config):
         kl_annealing=config.kl_annealing,
     )
     
-    # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location=torch.device("cpu"))
-    state_dict = ckpt.get("state_dict", ckpt)
+    # Import the utility function from model.py
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from model import load_checkpoint_weights
+    
+    # Load checkpoint weights using utility function
+    state_dict = load_checkpoint_weights(checkpoint_path, device='cpu')
     
     # Load state dict
-    model.load_state_dict(state_dict, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    if missing_keys:
+        print(f"⚠️  Missing keys: {len(missing_keys)} parameters not loaded")
+        if len(missing_keys) <= 5:  # Show first few missing keys
+            for key in missing_keys[:5]:
+                print(f"   - {key}")
+    else:
+        print("✅ All model parameters loaded successfully")
+    
+    if unexpected_keys:
+        print(f"⚠️  Unexpected keys: {len(unexpected_keys)} extra parameters ignored")
+        if len(unexpected_keys) <= 5:  # Show first few unexpected keys
+            for key in unexpected_keys[:5]:
+                print(f"   - {key}")
+    
     model.eval()
+    print(f"🎯 Model loaded and set to evaluation mode")
     
     return model
 
