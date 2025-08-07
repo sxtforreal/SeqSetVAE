@@ -12,8 +12,11 @@ import argparse
 from datetime import datetime
 import torch
 
-def setup_metrics_monitor(args):
+def setup_metrics_monitor(args, experiment_output_dir):
     """Set up posterior metrics monitor with optimized settings"""
+    
+    # Set up metrics monitoring log directory based on config.name
+    posterior_metrics_dir = os.path.join(experiment_output_dir, "posterior_metrics")
     
     # Optimized monitoring parameters for better performance
     if args.fast_detection:
@@ -23,7 +26,7 @@ def setup_metrics_monitor(args):
             plot_frequency=1000,          # Reduced from 200 to 1000
             window_size=50,               # Reduced from 100 to 50
             
-            log_dir=args.log_dir,
+            log_dir=posterior_metrics_dir,
             verbose=False,                # Disable verbose output for better performance
         )
     else:
@@ -33,7 +36,7 @@ def setup_metrics_monitor(args):
             plot_frequency=2000,          # Reduced from 500 to 2000
             window_size=50,               # Reduced from 100 to 50
             
-            log_dir=args.log_dir,
+            log_dir=posterior_metrics_dir,
             verbose=False,                # Disable verbose output for better performance
         )
     
@@ -126,9 +129,21 @@ def main():
     # Set random seed for reproducibility
     seed_everything(config.seed, workers=True)
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
+    # Create output directory structure based on config.name
+    experiment_output_dir = os.path.join(args.output_dir, config.name)
+    os.makedirs(experiment_output_dir, exist_ok=True)
+    os.makedirs(os.path.join(experiment_output_dir, "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(experiment_output_dir, "logs"), exist_ok=True)
+    os.makedirs(os.path.join(experiment_output_dir, "posterior_metrics"), exist_ok=True)
+    os.makedirs(os.path.join(experiment_output_dir, "visualizations"), exist_ok=True)
+    os.makedirs(os.path.join(experiment_output_dir, "analysis"), exist_ok=True)
+    
+    print(f"📁 Output directory structure created: {experiment_output_dir}")
+    print(f"  - Checkpoints: {os.path.join(experiment_output_dir, 'checkpoints')}")
+    print(f"  - Logs: {os.path.join(experiment_output_dir, 'logs')}")
+    print(f"  - Posterior metrics: {os.path.join(experiment_output_dir, 'posterior_metrics')}")
+    print(f"  - Visualizations: {os.path.join(experiment_output_dir, 'visualizations')}")
+    print(f"  - Analysis: {os.path.join(experiment_output_dir, 'analysis')}")
     
     # Create data module with optimized settings
     print("📊 Creating optimized data module...")
@@ -154,14 +169,14 @@ def main():
     
     # Set up logging
     logger = TensorBoardLogger(
-        save_dir=args.output_dir,
+        save_dir=experiment_output_dir,
         name=f"{config.name}_optimized_batch{args.batch_size}",
         version=None,
     )
     
     # Set up metrics monitoring log directory
     if args.log_dir is None:
-        args.log_dir = os.path.join(logger.log_dir, "posterior_metrics")
+        args.log_dir = os.path.join(experiment_output_dir, "posterior_metrics")
     
     # Create model
     print("🧠 Creating model...")
@@ -199,7 +214,7 @@ def main():
     
     # Model checkpointing
     checkpoint = ModelCheckpoint(
-        dirpath=os.path.join(args.output_dir, "checkpoints"),
+        dirpath=os.path.join(experiment_output_dir, "checkpoints"),
         filename=f"best_{config.name}_optimized_batch{args.batch_size}",
         monitor="val_auc",
         mode="max",
@@ -211,7 +226,7 @@ def main():
     
     # Set up metrics monitor (optional)
     if not args.disable_metrics_monitoring:
-        metrics_monitor = setup_metrics_monitor(args)
+        metrics_monitor = setup_metrics_monitor(args, experiment_output_dir)
         callbacks.append(metrics_monitor)
         
         # Early stopping
@@ -305,7 +320,7 @@ def main():
                 print(f"  - Log directory: {monitor.log_dir}")
         
         # Save final model
-        final_model_path = os.path.join(args.output_dir, "checkpoints", f"final_{config.name}_optimized_batch{args.batch_size}.ckpt")
+        final_model_path = os.path.join(experiment_output_dir, "checkpoints", f"final_{config.name}_optimized_batch{args.batch_size}.ckpt")
         trainer.save_checkpoint(final_model_path)
         print(f"💾 Final model saved: {final_model_path}")
         
@@ -313,7 +328,7 @@ def main():
         print("\n⏹️  Training interrupted by user")
         
         # Save model when interrupted
-        interrupt_model_path = os.path.join(args.output_dir, "checkpoints", f"interrupted_{config.name}_optimized_batch{args.batch_size}.ckpt")
+        interrupt_model_path = os.path.join(experiment_output_dir, "checkpoints", f"interrupted_{config.name}_optimized_batch{args.batch_size}.ckpt")
         trainer.save_checkpoint(interrupt_model_path)
         print(f"💾 Interrupted model saved: {interrupt_model_path}")
         
@@ -321,7 +336,7 @@ def main():
         print(f"\n❌ Error occurred during training: {e}")
         
         # Save model when error occurs
-        error_model_path = os.path.join(args.output_dir, "checkpoints", f"error_{config.name}_optimized_batch{args.batch_size}.ckpt")
+        error_model_path = os.path.join(experiment_output_dir, "checkpoints", f"error_{config.name}_optimized_batch{args.batch_size}.ckpt")
         try:
             trainer.save_checkpoint(error_model_path)
             print(f"💾 Error model saved: {error_model_path}")

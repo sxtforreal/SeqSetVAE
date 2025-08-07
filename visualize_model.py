@@ -422,12 +422,44 @@ def main():
     parser.add_argument('--label_path', type=str,
                        default="/home/sunx/data/aiiih/data/mimic/processed/oc.csv",
                        help='Label file path')
-    parser.add_argument('--save_dir', type=str, default='./visualizations',
-                       help='Directory to save visualizations')
+    parser.add_argument('--save_dir', type=str, default=None,
+                       help='Directory to save visualizations (default: auto-detect from checkpoint)')
+    parser.add_argument('--config_name', type=str, default=None,
+                       help='Config name for output directory (default: auto-detect from checkpoint)')
     parser.add_argument('--sample_idx', type=int, default=0,
                        help='Index of the sample to visualize (default: 0)')
     
     args = parser.parse_args()
+    
+    # Auto-detect config.name and save_dir if not provided
+    if args.config_name is None or args.save_dir is None:
+        # Try to extract config.name from checkpoint path
+        checkpoint_parts = args.checkpoint.split(os.sep)
+        config_name = None
+        
+        # Look for config.name in the checkpoint path
+        for i, part in enumerate(checkpoint_parts):
+            if part in ['SeqSetVAE-v2', 'SeqSetVAE-v1', 'SeqSetVAE']:  # Common config names
+                config_name = part
+                break
+        
+        if config_name is None:
+            # Default config name
+            config_name = "SeqSetVAE-v2"
+        
+        if args.config_name is None:
+            args.config_name = config_name
+        
+        if args.save_dir is None:
+            # Create save_dir based on config.name
+            base_output_dir = os.path.dirname(args.checkpoint) if os.path.dirname(args.checkpoint) else "."
+            args.save_dir = os.path.join(base_output_dir, args.config_name, "visualizations")
+    
+    # Create save directory
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    print(f"📁 Visualizations will be saved to: {args.save_dir}")
+    print(f"🔍 Using config name: {args.config_name}")
     
     # Load configuration
     config = Config()
