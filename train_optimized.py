@@ -63,6 +63,10 @@ def main():
     parser.add_argument('--devices', type=int, default=config.devices,
                        help='Number of GPUs to use')
     
+    # Checkpoint resume parameter
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                       help='Path to checkpoint file to resume training from')
+    
     # Batch training parameters
     parser.add_argument('--batch_size', type=int, default=4,  # Increased default batch size
                        help='Batch size for training (1 for single-patient, >1 for multi-patient)')
@@ -112,6 +116,12 @@ def main():
     
     print("🚀 Starting optimized SeqSetVAE training")
     print("=" * 60)
+    
+    # Check if resuming from checkpoint
+    if args.resume_from_checkpoint:
+        if not os.path.exists(args.resume_from_checkpoint):
+            raise FileNotFoundError(f"Checkpoint file not found: {args.resume_from_checkpoint}")
+        print(f"🔄 Resuming training from checkpoint: {args.resume_from_checkpoint}")
     
     # Set random seed for reproducibility
     seed_everything(config.seed, workers=True)
@@ -262,13 +272,19 @@ def main():
     print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
     print(f"  - Model compilation: {'Enabled' if args.compile_model else 'Disabled'}")
     print(f"  - Metrics monitoring: {'Enabled' if not args.disable_metrics_monitoring else 'Disabled'}")
+    if args.resume_from_checkpoint:
+        print(f"  - Resuming from checkpoint: {args.resume_from_checkpoint}")
     
     # Start training
     print("\n🎯 Starting optimized training...")
     print("=" * 60)
     
     try:
-        trainer.fit(model, data_module)
+        # Start training with or without checkpoint resume
+        if args.resume_from_checkpoint:
+            trainer.fit(model, data_module, ckpt_path=args.resume_from_checkpoint)
+        else:
+            trainer.fit(model, data_module)
         
         # Training completion summary
         print("\n✅ Training completed!")
