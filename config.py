@@ -3,7 +3,7 @@ import os
 # Lazy initialization of device configuration
 _device_config = None
 
-def get_optimal_device_config():
+def get_optimal_device_config(verbose: bool = False):
     """
     Intelligently detect and return optimal device configuration
     Adaptive selection: use GPU if available, otherwise use CPU
@@ -20,7 +20,8 @@ def get_optimal_device_config():
             gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown"
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if gpu_count > 0 else 0
             
-            print(f"🚀 GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
+            if verbose:
+                print(f"🚀 GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
             
             # Adjust configuration based on GPU memory
             if gpu_memory >= 16:  # 16GB+ GPU
@@ -39,16 +40,18 @@ def get_optimal_device_config():
             accelerator = "gpu"
             device = torch.device("cuda")
             
-            print(f"   - Using {devices} GPU(s)")
-            print(f"   - Precision: {precision}")
-            print(f"   - Recommended batch size: {batch_size_recommendation}")
+            if verbose:
+                print(f"   - Using {devices} GPU(s)")
+                print(f"   - Precision: {precision}")
+                print(f"   - Recommended batch size: {batch_size_recommendation}")
             
         else:
             # CPU configuration
             import multiprocessing
             cpu_count = multiprocessing.cpu_count()
             
-            print(f"💻 CPU detected: {cpu_count} cores")
+            if verbose:
+                print(f"💻 CPU detected: {cpu_count} cores")
             
             devices = 1
             accelerator = "cpu"
@@ -56,9 +59,10 @@ def get_optimal_device_config():
             device = torch.device("cpu")
             batch_size_recommendation = 1
             
-            print(f"   - Using CPU training")
-            print(f"   - Precision: {precision}")
-            print(f"   - Recommended batch size: {batch_size_recommendation}")
+            if verbose:
+                print(f"   - Using CPU training")
+                print(f"   - Precision: {precision}")
+                print(f"   - Recommended batch size: {batch_size_recommendation}")
         
         return {
             'device': device,
@@ -71,7 +75,8 @@ def get_optimal_device_config():
         
     except ImportError:
         # If torch is not available, return default CPU configuration
-        print("⚠️  PyTorch not available, using default CPU configuration")
+        if verbose:
+            print("⚠️  PyTorch not available, using default CPU configuration")
         return {
             'device': 'cpu',
             'accelerator': 'cpu',
@@ -85,7 +90,7 @@ def get_device_config():
     """Get device configuration with lazy initialization"""
     global _device_config
     if _device_config is None:
-        _device_config = get_optimal_device_config()
+        _device_config = get_optimal_device_config(verbose=False)
     return _device_config
 
 # Device configuration attributes
@@ -148,3 +153,8 @@ use_focal_loss = True
 # alpha for positive class in binary classification (set None to disable balancing)
 focal_alpha = 0.25
 focal_gamma = 2.0
+
+if __name__ == "__main__":
+    cfg = get_optimal_device_config(verbose=True)
+    print("\nDevice configuration summary:")
+    print(cfg)
