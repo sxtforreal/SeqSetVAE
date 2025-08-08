@@ -789,16 +789,37 @@ class SeqSetVAE(pl.LightningModule):
 
         # Log more useful metrics
         current_beta = self.get_current_beta()
-        self.log_dict(
-            {
+        # Compute latent statistics if available
+        mean_variance = None
+        active_units_ratio = None
+        if hasattr(self, '_last_z_list') and self._last_z_list:
+            variances = []
+            active_ratios = []
+            for z_sample, mu, logvar in self._last_z_list:
+                var = torch.exp(logvar)
+                variances.append(var.mean())
+                active = (var > 0.01).float().mean()
+                active_ratios.append(active)
+            if variances:
+                mean_variance = torch.stack(variances).mean()
+            if active_ratios:
+                active_units_ratio = torch.stack(active_ratios).mean()
+        log_payload = {
                 f"{stage}_loss": total_loss,
                 f"{stage}_recon": recon_loss,
                 f"{stage}_kl": kl_loss,
                 f"{stage}_pred": pred_loss,
+                f"{stage}_class_loss": pred_loss,
                 f"{stage}_beta": current_beta,
                 f"{stage}_recon_weight": recon_weight,
                 f"{stage}_pred_weight": pred_weight,
-            },
+            }
+        if mean_variance is not None:
+            log_payload[f"{stage}_variance"] = mean_variance
+        if active_units_ratio is not None:
+            log_payload[f"{stage}_active_units"] = active_units_ratio
+        self.log_dict(
+            log_payload,
             prog_bar=True,
             on_step=(stage == "train"),
             on_epoch=True,
@@ -809,6 +830,8 @@ class SeqSetVAE(pl.LightningModule):
             self.logged_metrics = {
                 'train_kl': kl_loss,
                 'train_recon': recon_loss,
+                'train_variance': mean_variance if mean_variance is not None else torch.tensor(0.0, device=kl_loss.device),
+                'train_active_units': active_units_ratio if active_units_ratio is not None else torch.tensor(0.0, device=kl_loss.device),
             }
             self.current_step += 1
             
@@ -840,6 +863,17 @@ class SeqSetVAE(pl.LightningModule):
         self.val_auc.reset()
         self.val_auprc.reset()
         self.val_acc.reset()
+
+    def on_after_backward(self):
+        # Log global gradient norm after backward
+        total_norm = None
+        parameters = [p for p in self.parameters() if p.grad is not None]
+        if parameters:
+            device = parameters[0].grad.device
+            norms = [torch.norm(p.grad.detach(), 2) for p in parameters]
+            if norms:
+                total_norm = torch.norm(torch.stack(norms), 2)
+                self.log('grad_norm', total_norm, on_step=True, prog_bar=False)
 
     def configure_optimizers(self):
         # Set different learning rates for different parts

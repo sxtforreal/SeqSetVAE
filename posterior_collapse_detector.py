@@ -199,12 +199,23 @@ class PosteriorMetricsMonitor(pl.Callback):
             'reconstruction_collapse_detected': self.reconstruction_collapse_detected
         }
         
+        # Prepare nested metrics structure for realtime visualizer
+        nested_metrics = {
+            'step': step,
+            'metrics': {
+                'kl_divergence': float(kl_divergence),
+                'reconstruction_loss': float(reconstruction_loss),
+            }
+        }
+        
         if additional_metrics:
             metrics_data.update(additional_metrics)
+            # add into nested structure too
+            for k, v in additional_metrics.items():
+                nested_metrics['metrics'][k] = v
         
-        # Save to file
+        # Save to history file (JSON array)
         metrics_file = os.path.join(self.log_dir, 'metrics_history.json')
-        
         # Load existing data or create new
         if os.path.exists(metrics_file):
             try:
@@ -214,15 +225,20 @@ class PosteriorMetricsMonitor(pl.Callback):
                 history = []
         else:
             history = []
-        
         history.append(metrics_data)
-        
-        # Keep only recent history to avoid large files
+        # Keep recent history
         if len(history) > 1000:
             history = history[-1000:]
-        
         with open(metrics_file, 'w') as f:
             json.dump(history, f, indent=2)
+        
+        # Additionally, write per-step JSON for realtime visualizer compatibility
+        step_file = os.path.join(self.log_dir, f'metrics_step_{step}.json')
+        try:
+            with open(step_file, 'w') as f:
+                json.dump(nested_metrics, f)
+        except Exception:
+            pass
     
     def get_collapse_status(self) -> Dict[str, Any]:
         """
@@ -268,20 +284,62 @@ class PosteriorMetricsMonitor(pl.Callback):
     # PyTorch Lightning callback methods
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         """Called at the end of each training batch."""
-        # Extract KL divergence and reconstruction loss from outputs
-        if outputs is not None and isinstance(outputs, dict):
-            kl_loss = outputs.get('kl_loss', 0.0)
-            recon_loss = outputs.get('recon_loss', 0.0)
-            
-            # Convert to float if they're tensors
+        # Prefer reading from pl_module.logged_metrics since outputs may be a scalar
+        kl_loss = None
+        recon_loss = None
+        if hasattr(pl_module, 'logged_metrics') and isinstance(pl_module.logged_metrics, dict):
+            kl_loss = pl_module.logged_metrics.get('train_kl', None)
+            recon_loss = pl_module.logged_metrics.get('train_recon', None)
             if torch.is_tensor(kl_loss):
                 kl_loss = kl_loss.item()
             if torch.is_tensor(recon_loss):
                 recon_loss = recon_loss.item()
-            
-            # Update monitoring
-            self.update(trainer.global_step, kl_loss, recon_loss)
-    
+        
+        # Fallback to outputs dict if available
+        if (kl_loss is None or recon_loss is None) and outputs is not None and isinstance(outputs, dict):
+            kl_loss = outputs.get('kl_loss', kl_loss)
+            recon_loss = outputs.get('recon_loss', recon_loss)
+            if torch.is_tensor(kl_loss):
+                kl_loss = kl_loss.item()
+            if torch.is_tensor(recon_loss):
+                recon_loss = recon_loss.item()
+        
+        # Default to zeros if still missing
+        kl_loss = float(kl_loss) if kl_loss is not None else 0.0
+        recon_loss = float(recon_loss) if recon_loss is not None else 0.0
+        
+        # Compute additional latent statistics from the model if available
+        variance_value = None
+        active_ratio_value = None
+        try:
+            z_list = None
+            if hasattr(pl_module, '_last_z_list') and pl_module._last_z_list:
+                z_list = pl_module._last_z_list
+            elif hasattr(pl_module, 'setvae') and hasattr(pl_module.setvae, '_last_z_list'):
+                z_list = pl_module.setvae._last_z_list
+            if z_list:
+                variances = []
+                actives = []
+                for z_sample, mu, logvar in z_list:
+                    var = torch.exp(logvar)
+                    variances.append(var.mean().item())
+                    actives.append((var > 0.01).float().mean().item())
+                if variances:
+                    variance_value = float(np.mean(variances))
+                if actives:
+                    active_ratio_value = float(np.mean(actives))
+        except Exception:
+            pass
+        
+        additional = {}
+        if variance_value is not None:
+            additional['variance'] = variance_value
+        if active_ratio_value is not None:
+            additional['active_ratio'] = active_ratio_value
+        
+        # Update monitoring and save
+        self.update(trainer.global_step, kl_loss, recon_loss, additional)
+
     def on_train_epoch_end(self, trainer, pl_module):
         """Called at the end of each training epoch."""
         # Generate plots at epoch end
