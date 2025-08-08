@@ -345,7 +345,7 @@ def main():
         gradient_clip_val=config.gradient_clip_val,
         gradient_clip_algorithm="norm",
         val_check_interval=0.1,  # Reduced validation frequency
-        limit_val_batches=0.1,   # Reduced validation batches
+        limit_val_batches=0.3,   # Use 30% of validation batches to reduce NaN risk
         accumulate_grad_batches=args.gradient_accumulation_steps,  # Use gradient accumulation
         detect_anomaly=False,    # Turn off anomaly detection
         enable_checkpointing=True,

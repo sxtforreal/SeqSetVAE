@@ -16,7 +16,7 @@ from matplotlib.patches import Rectangle
 import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
-import umap
+# import umap  # optional
 import argparse
 import os
 import json
@@ -330,127 +330,128 @@ def load_model(checkpoint_path, config):
 
 
 def collect_single_sample_representations(model, dataloader, sample_idx=0):
-    """Collect latent representations for a single sample"""
+    """Collect latent representations for a single patient sample using current model API.
+    Expects dataloader batches to be dicts with keys: 'var', 'val', 'minute', 'set_id', 'label' (optional), 'padding_mask' (optional).
+    """
     print(f"Collecting representations for sample {sample_idx}")
-    
     model.eval()
     device = next(model.parameters()).device
-    
-    # Get the specific sample
-    batch = None
+
+    # Helper to move a tensor dict to device
+    def to_device(batch_dict):
+        out = {}
+        for k, v in batch_dict.items():
+            if torch.is_tensor(v):
+                out[k] = v.to(device)
+            else:
+                out[k] = v
+        return out
+
+    # Locate the target sample (with batch_size=1, index==i)
+    target_batch = None
     for i, batch_data in enumerate(dataloader):
-        if i == sample_idx // dataloader.batch_size:
-            batch = batch_data
+        if i == sample_idx:
+            target_batch = batch_data
             break
-    
-    if batch is None:
+
+    if target_batch is None:
         raise ValueError(f"Sample {sample_idx} not found in dataloader")
-    
-    var, val, labels = batch
-    var = var.to(device)
-    val = val.to(device)
-    
-    # Get sample within batch
-    sample_in_batch = sample_idx % dataloader.batch_size
-    var_sample = var[sample_in_batch:sample_in_batch+1]
-    val_sample = val[sample_in_batch:sample_in_batch+1]
-    
+
+    batch_on_device = to_device(target_batch)
+
     with torch.no_grad():
-        # Forward pass
-        recon, z_list, z_means, z_logvars, classification_output = model(var_sample, val_sample)
-        
-        # Extract latent representations
-        latent_repr = {
-            'z_means': [z_mean.cpu().numpy() for z_mean in z_means],
-            'z_logvars': [z_logvar.cpu().numpy() for z_logvar in z_logvars],
-            'z_list': [z.cpu().numpy() for z in z_list],
-            'recon': recon.cpu().numpy(),
-            'original': val_sample.cpu().numpy(),
-            'classification': classification_output.cpu().numpy()
-        }
-    
-    return latent_repr
+        # Forward pass (SeqSetVAE.forward accepts a dict batch)
+        _ = model(batch_on_device)
+        # Retrieve latent variables collected during forward
+        z_source = None
+        if hasattr(model, '_last_z_list') and model._last_z_list:
+            z_source = model._last_z_list
+        elif hasattr(model, 'setvae') and hasattr(model.setvae, '_last_z_list'):
+            z_source = model.setvae._last_z_list
+        if not z_source:
+            raise RuntimeError("Latent variables not found on model after forward pass")
+
+        # z_source is a list of tuples: (z_sample, mu, logvar) per level
+        z_samples = [z_sample.detach().cpu().numpy() for (z_sample, mu, logvar) in z_source]
+        mus = [mu.detach().cpu().numpy() for (z_sample, mu, logvar) in z_source]
+        logvars = [logvar.detach().cpu().numpy() for (z_sample, mu, logvar) in z_source]
+
+    results = {
+        'z_samples': z_samples,
+        'mus': mus,
+        'logvars': logvars,
+    }
+    return results
 
 
-def analyze_single_sample_posterior_collapse(z_means, z_logvars, threshold=0.01):
-    """Analyze posterior collapse for a single sample"""
+def analyze_single_sample_posterior_collapse(mus, logvars, threshold=0.01):
+    """Analyze posterior collapse indicators using mu/logvar from latent levels."""
     print("Analyzing posterior collapse indicators...")
-    
     collapse_analysis = {}
-    
-    for level, (z_mean, z_logvar) in enumerate(zip(z_means, z_logvars)):
-        # Calculate KL divergence (simplified)
-        kl_div = 0.5 * np.sum(z_mean**2 + np.exp(z_logvar) - z_logvar - 1, axis=-1)
-        mean_kl = np.mean(kl_div)
-        
-        # Calculate variance
-        variance = np.exp(z_logvar)
-        mean_variance = np.mean(variance)
-        
-        # Calculate active units ratio
+
+    for level, (mu, logvar) in enumerate(zip(mus, logvars)):
+        # Shapes are [B, 1, D]; use the first (and only) element
+        mu_ = mu[0]
+        logvar_ = logvar[0]
+        # KL divergence to N(0, I) per dimension, averaged
+        kl_div = 0.5 * np.sum(mu_**2 + np.exp(logvar_) - logvar_ - 1, axis=-1)
+        mean_kl = float(np.mean(kl_div))
+
+        variance = np.exp(logvar_)
+        mean_variance = float(np.mean(variance))
         active_units = np.sum(variance > threshold, axis=-1)
-        active_ratio = np.mean(active_units) / variance.shape[-1]
-        
+        active_ratio = float(np.mean(active_units) / variance.shape[-1])
+
         collapse_analysis[f'level_{level}'] = {
             'kl_divergence': mean_kl,
             'variance': mean_variance,
             'active_ratio': active_ratio,
             'collapse_risk': 'high' if mean_kl < threshold or active_ratio < 0.1 else 'low'
         }
-    
+
     return collapse_analysis
 
 
 def plot_single_sample_visualizations(results, save_dir, sample_idx=0):
-    """Create comprehensive visualizations for a single sample"""
+    """Create visualizations for a single sample using latent mus/logvars only."""
     print(f"Creating visualizations for sample {sample_idx}")
-    
     os.makedirs(save_dir, exist_ok=True)
-    
-    # Extract data
-    z_means = results['z_means']
-    z_logvars = results['z_logvars']
-    z_list = results['z_list']
-    recon = results['recon']
-    original = results['original']
-    collapse_analysis = analyze_single_sample_posterior_collapse(z_means, z_logvars)
-    
-    # Create comprehensive figure
-    fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
-    
-    # 1. Latent space visualization (t-SNE)
+
+    mus = results['mus']
+    logvars = results['logvars']
+    collapse_analysis = analyze_single_sample_posterior_collapse(mus, logvars)
+
+    # Figure layout (3 rows x 2 cols)
+    fig = plt.figure(figsize=(18, 14))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+
+    # 1. Latent space visualization (t-SNE on mu)
     ax1 = fig.add_subplot(gs[0, 0])
-    for level, z_mean in enumerate(z_means):
-        if z_mean.shape[-1] > 2:
-            # Use t-SNE for dimensionality reduction
+    for level, mu in enumerate(mus):
+        mu_ = mu[0]
+        if mu_.shape[-1] > 2:
             tsne = TSNE(n_components=2, random_state=42)
-            z_2d = tsne.fit_transform(z_mean[0])
+            mu_2d = tsne.fit_transform(mu_)
         else:
-            z_2d = z_mean[0]
-        
-        ax1.scatter(z_2d[:, 0], z_2d[:, 1], alpha=0.7, label=f'Level {level}')
-    
-    ax1.set_title('Latent Space Visualization (t-SNE)')
+            mu_2d = mu_
+        ax1.scatter(mu_2d[:, 0], mu_2d[:, 1], alpha=0.7, label=f'Level {level}')
+    ax1.set_title('Latent Means (t-SNE)')
     ax1.set_xlabel('t-SNE 1')
     ax1.set_ylabel('t-SNE 2')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    
-    # 2. Posterior collapse analysis
+
+    # 2. Posterior collapse indicators
     ax2 = fig.add_subplot(gs[0, 1])
     levels = list(collapse_analysis.keys())
     kl_values = [collapse_analysis[level]['kl_divergence'] for level in levels]
     var_values = [collapse_analysis[level]['variance'] for level in levels]
     active_values = [collapse_analysis[level]['active_ratio'] for level in levels]
-    
     x = np.arange(len(levels))
     width = 0.25
-    
     ax2.bar(x - width, kl_values, width, label='KL Divergence', alpha=0.8)
     ax2.bar(x, var_values, width, label='Variance', alpha=0.8)
     ax2.bar(x + width, active_values, width, label='Active Ratio', alpha=0.8)
-    
     ax2.set_title('Posterior Collapse Indicators')
     ax2.set_xlabel('Latent Level')
     ax2.set_ylabel('Value')
@@ -458,112 +459,43 @@ def plot_single_sample_visualizations(results, save_dir, sample_idx=0):
     ax2.set_xticklabels([f'L{i}' for i in range(len(levels))])
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-    
-    # 3. Reconstruction quality
-    ax3 = fig.add_subplot(gs[0, 2])
-    original_flat = original[0].flatten()
-    recon_flat = recon[0].flatten()
-    
-    ax3.scatter(original_flat, recon_flat, alpha=0.6)
-    ax3.plot([original_flat.min(), original_flat.max()], 
-             [original_flat.min(), original_flat.max()], 'r--', alpha=0.8)
-    ax3.set_title('Reconstruction Quality')
-    ax3.set_xlabel('Original Values')
-    ax3.set_ylabel('Reconstructed Values')
+
+    # 3. Latent variable distributions (mu)
+    ax3 = fig.add_subplot(gs[1, :])
+    for level, mu in enumerate(mus):
+        ax3.hist(mu[0].flatten(), bins=50, alpha=0.6, label=f'Level {level}', density=True)
+    ax3.set_title('Latent Mean Distributions')
+    ax3.set_xlabel('Value')
+    ax3.set_ylabel('Density')
+    ax3.legend()
     ax3.grid(True, alpha=0.3)
-    
-    # 4. Latent variable distributions
-    ax4 = fig.add_subplot(gs[1, :])
-    for level, z_mean in enumerate(z_means):
-        ax4.hist(z_mean[0].flatten(), bins=50, alpha=0.7, 
-                label=f'Level {level}', density=True)
-    
-    ax4.set_title('Latent Variable Distributions')
-    ax4.set_xlabel('Latent Variable Value')
-    ax4.set_ylabel('Density')
+
+    # 4. Variance profile per level
+    ax4 = fig.add_subplot(gs[2, 0])
+    for level, logvar in enumerate(logvars):
+        variance = np.exp(logvar[0])
+        ax4.plot(variance.mean(axis=0), alpha=0.8, label=f'Level {level}')
+    ax4.set_title('Latent Variance Profile (mean per dim)')
+    ax4.set_xlabel('Latent Dimension')
+    ax4.set_ylabel('Variance')
     ax4.legend()
     ax4.grid(True, alpha=0.3)
-    
-    # 5. Variance analysis
-    ax5 = fig.add_subplot(gs[2, 0])
-    for level, z_logvar in enumerate(z_logvars):
-        variance = np.exp(z_logvar[0])
-        ax5.plot(variance.mean(axis=0), alpha=0.7, label=f'Level {level}')
-    
-    ax5.set_title('Latent Variable Variance')
-    ax5.set_xlabel('Latent Dimension')
-    ax5.set_ylabel('Variance')
-    ax5.legend()
-    ax5.grid(True, alpha=0.3)
-    
-    # 6. Correlation matrix
-    ax6 = fig.add_subplot(gs[2, 1])
-    if len(z_means) > 0:
-        z_combined = np.concatenate([z_mean[0] for z_mean in z_means], axis=1)
-        corr_matrix = np.corrcoef(z_combined.T)
-        im = ax6.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
-        ax6.set_title('Latent Variable Correlations')
-        plt.colorbar(im, ax=ax6)
-    
-    # 7. Training dynamics summary
-    ax7 = fig.add_subplot(gs[2, 2])
-    collapse_risks = [collapse_analysis[level]['collapse_risk'] for level in levels]
-    risk_counts = {'high': collapse_risks.count('high'), 'low': collapse_risks.count('low')}
-    
-    colors = ['red' if risk == 'high' else 'green' for risk in collapse_risks]
-    ax7.bar(range(len(levels)), [1]*len(levels), color=colors, alpha=0.7)
-    ax7.set_title('Collapse Risk Assessment')
-    ax7.set_xlabel('Latent Level')
-    ax7.set_ylabel('Risk Level')
-    ax7.set_xticks(range(len(levels)))
-    ax7.set_xticklabels([f'L{i}' for i in range(len(levels))])
-    ax7.set_ylim(0, 1.2)
-    
-    # Add text annotations
-    for i, risk in enumerate(collapse_risks):
-        ax7.text(i, 0.5, risk.upper(), ha='center', va='center', 
-                fontweight='bold', color='white')
-    
-    # 8. Detailed metrics table
-    ax8 = fig.add_subplot(gs[3, :])
-    ax8.axis('off')
-    
-    # Create detailed metrics table
-    table_data = []
-    for level in levels:
-        analysis = collapse_analysis[level]
-        table_data.append([
-            level,
-            f"{analysis['kl_divergence']:.6f}",
-            f"{analysis['variance']:.6f}",
-            f"{analysis['active_ratio']:.3f}",
-            analysis['collapse_risk']
-        ])
-    
-    table = ax8.table(cellText=table_data,
-                     colLabels=['Level', 'KL Divergence', 'Variance', 'Active Ratio', 'Risk'],
-                     cellLoc='center',
-                     loc='center')
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 2)
-    
-    # Color code the risk column
-    for i, row in enumerate(table_data):
-        if row[4] == 'high':
-            table[(i+1, 4)].set_facecolor('red')
-        else:
-            table[(i+1, 4)].set_facecolor('green')
-    
-    plt.suptitle(f'Comprehensive Model Analysis - Sample {sample_idx}', fontsize=16, fontweight='bold')
-    
-    # Save the comprehensive visualization
+
+    # 5. Correlation matrix of concatenated mus
+    ax5 = fig.add_subplot(gs[2, 1])
+    if len(mus) > 0:
+        mu_combined = np.concatenate([m[0] for m in mus], axis=1)
+        corr_matrix = np.corrcoef(mu_combined.T)
+        im = ax5.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+        ax5.set_title('Latent Mean Correlations')
+        plt.colorbar(im, ax=ax5)
+
+    # Save
     save_path = os.path.join(save_dir, f'comprehensive_analysis_sample_{sample_idx}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"✅ Comprehensive visualization saved to: {save_path}")
-    
     plt.show()
-    
+
     return collapse_analysis
 
 
@@ -580,7 +512,11 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--data_dir', type=str, required=True,
-                       help='Path to data directory')
+                       help='Path to data directory (patient_ehr folder)')
+    parser.add_argument('--params_map_path', type=str, required=True,
+                       help='Path to stats.csv for value normalization')
+    parser.add_argument('--label_path', type=str, required=True,
+                       help='Path to oc.csv with labels')
     parser.add_argument('--save_dir', type=str, default='./visualizations',
                        help='Directory to save visualizations')
     parser.add_argument('--sample_idx', type=int, default=0,
@@ -602,10 +538,13 @@ def main():
         
         # Load data
         data_module = SeqSetVAEDataModule(
-            data_dir=args.data_dir,
-            batch_size=1,  # Use batch size 1 for single sample analysis
-            num_workers=0
+            saved_dir=args.data_dir,
+            params_map_path=args.params_map_path,
+            label_path=args.label_path,
+            batch_size=1
         )
+        data_module.num_workers = 0
+        data_module.pin_memory = False
         data_module.setup()
         
         # Collect representations
