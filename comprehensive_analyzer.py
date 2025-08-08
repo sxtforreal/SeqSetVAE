@@ -502,8 +502,14 @@ def plot_loss_curves(metrics_df, save_dir):
     
     # 4. Classification Loss (optional)
     ax = axes[1, 1]
-    class_train_tag = _find_first_tag_containing(metrics_df, ['train', 'class']) or _find_first_tag_containing(metrics_df, ['train', 'ce'])
-    class_val_tag = _find_first_tag_containing(metrics_df, ['val', 'class']) or _find_first_tag_containing(metrics_df, ['val', 'ce'])
+    class_train_tag = (_find_first_tag_containing(metrics_df, ['train', 'class']) or
+                       _find_first_tag_containing(metrics_df, ['train', 'ce']) or
+                       _find_first_tag_containing(metrics_df, ['train', 'pred']) or
+                       _find_first_tag_containing(metrics_df, ['train', 'cross']))
+    class_val_tag = (_find_first_tag_containing(metrics_df, ['val', 'class']) or
+                     _find_first_tag_containing(metrics_df, ['val', 'ce']) or
+                     _find_first_tag_containing(metrics_df, ['val', 'pred']) or
+                     _find_first_tag_containing(metrics_df, ['val', 'cross']))
     if class_train_tag:
         ax.plot(metrics_df[class_train_tag]['steps'], 
                 metrics_df[class_train_tag]['values'], 
