@@ -3,6 +3,7 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
+from lightning.pytorch.callbacks import LearningRateMonitor
 from model import SeqSetVAE
 from dataset import SeqSetVAEDataModule
 from posterior_collapse_detector import PosteriorMetricsMonitor
@@ -284,6 +285,8 @@ def main():
     
     # Set up callbacks
     callbacks = []
+    # Log learning rate at each step to enable performance metrics plotting
+    callbacks.append(LearningRateMonitor(logging_interval='step'))
     
     # Model checkpointing - save both best and last checkpoints
     checkpoint = ModelCheckpoint(

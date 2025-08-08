@@ -26,6 +26,7 @@ from collections import deque
 import logging
 from datetime import datetime
 import json
+import re
 
 warnings.filterwarnings('ignore')
 
@@ -340,6 +341,27 @@ class PosteriorMetricsMonitor(Callback):
         print(f"✅ Final analysis saved to: {final_plot_path}")
 
 
+def _find_first_tag_containing(metrics_df: Dict[str, pd.DataFrame], substrings: List[str]) -> Optional[str]:
+    """Return the first tag whose lowercase name contains all provided substrings."""
+    substrings = [s.lower() for s in substrings]
+    for tag in metrics_df.keys():
+        tl = tag.lower()
+        if all(s in tl for s in substrings):
+            return tag
+    return None
+
+
+def _find_all_tags_containing(metrics_df: Dict[str, pd.DataFrame], substrings_any: List[str]) -> List[str]:
+    """Return all tags whose lowercase name contains ANY of provided substrings."""
+    substrings_any = [s.lower() for s in substrings_any]
+    matches = []
+    for tag in metrics_df.keys():
+        tl = tag.lower()
+        if any(s in tl for s in substrings_any):
+            matches.append(tag)
+    return matches
+
+
 def load_tensorboard_logs(log_dir):
     """Load all metrics from TensorBoard event files"""
     print(f"Loading TensorBoard logs from: {log_dir}")
@@ -401,10 +423,19 @@ def plot_loss_curves(metrics_df, save_dir):
         ax.plot(metrics_df['train_loss']['steps'], 
                 metrics_df['train_loss']['values'], 
                 label='Train Loss', alpha=0.8)
+    # Try alternative common names
+    else:
+        alt_train_loss = _find_first_tag_containing(metrics_df, ['train', 'loss'])
+        if alt_train_loss:
+            ax.plot(metrics_df[alt_train_loss]['steps'], metrics_df[alt_train_loss]['values'], label=alt_train_loss, alpha=0.8)
     if 'val_loss' in metrics_df:
         ax.plot(metrics_df['val_loss']['steps'], 
                 metrics_df['val_loss']['values'], 
                 label='Val Loss', alpha=0.8)
+    else:
+        alt_val_loss = _find_first_tag_containing(metrics_df, ['val', 'loss'])
+        if alt_val_loss:
+            ax.plot(metrics_df[alt_val_loss]['steps'], metrics_df[alt_val_loss]['values'], label=alt_val_loss, alpha=0.8)
     ax.set_xlabel('Steps')
     ax.set_ylabel('Loss')
     ax.set_title('Total Loss')
@@ -421,10 +452,18 @@ def plot_loss_curves(metrics_df, save_dir):
         ax.plot(metrics_df['train_kl']['steps'], 
                 metrics_df['train_kl']['values'], 
                 label='Train KL', alpha=0.8)
+    else:
+        alt_train_kl = _find_first_tag_containing(metrics_df, ['train', 'kl'])
+        if alt_train_kl:
+            ax.plot(metrics_df[alt_train_kl]['steps'], metrics_df[alt_train_kl]['values'], label=alt_train_kl, alpha=0.8)
     if 'val_kl' in metrics_df:
         ax.plot(metrics_df['val_kl']['steps'], 
                 metrics_df['val_kl']['values'], 
                 label='Val KL', alpha=0.8)
+    else:
+        alt_val_kl = _find_first_tag_containing(metrics_df, ['val', 'kl'])
+        if alt_val_kl:
+            ax.plot(metrics_df[alt_val_kl]['steps'], metrics_df[alt_val_kl]['values'], label=alt_val_kl, alpha=0.8)
     ax.set_xlabel('Steps')
     ax.set_ylabel('KL Loss')
     ax.set_title('KL Divergence Loss')
@@ -433,30 +472,46 @@ def plot_loss_curves(metrics_df, save_dir):
     
     # 3. Reconstruction Loss
     ax = axes[1, 0]
+    recon_train_tag = None
     if 'train_recon_loss' in metrics_df:
-        ax.plot(metrics_df['train_recon_loss']['steps'], 
-                metrics_df['train_recon_loss']['values'], 
-                label='Train Recon', alpha=0.8)
+        recon_train_tag = 'train_recon_loss'
+    elif 'train_recon' in metrics_df:
+        recon_train_tag = 'train_recon'
+    else:
+        recon_train_tag = _find_first_tag_containing(metrics_df, ['train', 'recon'])
+    if recon_train_tag:
+        ax.plot(metrics_df[recon_train_tag]['steps'], 
+                metrics_df[recon_train_tag]['values'], 
+                label=f'Train Recon ({recon_train_tag})', alpha=0.8)
+    recon_val_tag = None
     if 'val_recon_loss' in metrics_df:
-        ax.plot(metrics_df['val_recon_loss']['steps'], 
-                metrics_df['val_recon_loss']['values'], 
-                label='Val Recon', alpha=0.8)
+        recon_val_tag = 'val_recon_loss'
+    elif 'val_recon' in metrics_df:
+        recon_val_tag = 'val_recon'
+    else:
+        recon_val_tag = _find_first_tag_containing(metrics_df, ['val', 'recon'])
+    if recon_val_tag:
+        ax.plot(metrics_df[recon_val_tag]['steps'], 
+                metrics_df[recon_val_tag]['values'], 
+                label=f'Val Recon ({recon_val_tag})', alpha=0.8)
     ax.set_xlabel('Steps')
     ax.set_ylabel('Reconstruction Loss')
     ax.set_title('Reconstruction Loss')
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # 4. Classification Loss
+    # 4. Classification Loss (optional)
     ax = axes[1, 1]
-    if 'train_class_loss' in metrics_df:
-        ax.plot(metrics_df['train_class_loss']['steps'], 
-                metrics_df['train_class_loss']['values'], 
-                label='Train Class', alpha=0.8)
-    if 'val_class_loss' in metrics_df:
-        ax.plot(metrics_df['val_class_loss']['steps'], 
-                metrics_df['val_class_loss']['values'], 
-                label='Val Class', alpha=0.8)
+    class_train_tag = _find_first_tag_containing(metrics_df, ['train', 'class']) or _find_first_tag_containing(metrics_df, ['train', 'ce'])
+    class_val_tag = _find_first_tag_containing(metrics_df, ['val', 'class']) or _find_first_tag_containing(metrics_df, ['val', 'ce'])
+    if class_train_tag:
+        ax.plot(metrics_df[class_train_tag]['steps'], 
+                metrics_df[class_train_tag]['values'], 
+                label=f'Train ({class_train_tag})', alpha=0.8)
+    if class_val_tag:
+        ax.plot(metrics_df[class_val_tag]['steps'], 
+                metrics_df[class_val_tag]['values'], 
+                label=f'Val ({class_val_tag})', alpha=0.8)
     ax.set_xlabel('Steps')
     ax.set_ylabel('Classification Loss')
     ax.set_title('Classification Loss')
@@ -476,23 +531,29 @@ def plot_performance_metrics(metrics_df, save_dir):
     
     # 1. Learning Rate
     ax = axes[0, 0]
-    if 'lr' in metrics_df:
-        ax.plot(metrics_df['lr']['steps'], metrics_df['lr']['values'], 'purple', linewidth=2)
+    lr_tags = _find_all_tags_containing(metrics_df, ['lr'])
+    # Prefer simple 'lr' if exists, otherwise plot the first few lr-related tags
+    if lr_tags:
+        for tag in lr_tags[:3]:
+            ax.plot(metrics_df[tag]['steps'], metrics_df[tag]['values'], linewidth=2, label=tag)
         ax.set_xlabel('Steps')
         ax.set_ylabel('Learning Rate')
         ax.set_title('Learning Rate Schedule')
+        ax.legend()
         ax.grid(True, alpha=0.3)
     
     # 2. Accuracy
     ax = axes[0, 1]
-    if 'train_acc' in metrics_df:
-        ax.plot(metrics_df['train_acc']['steps'], 
-                metrics_df['train_acc']['values'], 
-                label='Train Acc', alpha=0.8)
-    if 'val_acc' in metrics_df:
-        ax.plot(metrics_df['val_acc']['steps'], 
-                metrics_df['val_acc']['values'], 
-                label='Val Acc', alpha=0.8)
+    train_acc_tag = _find_first_tag_containing(metrics_df, ['train', 'acc'])
+    val_acc_tag = _find_first_tag_containing(metrics_df, ['val', 'acc'])
+    if train_acc_tag:
+        ax.plot(metrics_df[train_acc_tag]['steps'], 
+                metrics_df[train_acc_tag]['values'], 
+                label=f'Train ({train_acc_tag})', alpha=0.8)
+    if val_acc_tag:
+        ax.plot(metrics_df[val_acc_tag]['steps'], 
+                metrics_df[val_acc_tag]['values'], 
+                label=f'Val ({val_acc_tag})', alpha=0.8)
     ax.set_xlabel('Steps')
     ax.set_ylabel('Accuracy')
     ax.set_title('Classification Accuracy')
@@ -501,20 +562,24 @@ def plot_performance_metrics(metrics_df, save_dir):
     
     # 3. Gradient Norm
     ax = axes[1, 0]
-    if 'grad_norm' in metrics_df:
-        ax.plot(metrics_df['grad_norm']['steps'], metrics_df['grad_norm']['values'], 'red', linewidth=2)
+    grad_tag = _find_first_tag_containing(metrics_df, ['grad', 'norm'])
+    if grad_tag:
+        ax.plot(metrics_df[grad_tag]['steps'], metrics_df[grad_tag]['values'], 'red', linewidth=2, label=grad_tag)
         ax.set_xlabel('Steps')
         ax.set_ylabel('Gradient Norm')
         ax.set_title('Gradient Norm')
+        ax.legend()
         ax.grid(True, alpha=0.3)
     
     # 4. Beta Value (if using KL annealing)
     ax = axes[1, 1]
-    if 'beta' in metrics_df:
-        ax.plot(metrics_df['beta']['steps'], metrics_df['beta']['values'], 'green', linewidth=2)
+    beta_tag = _find_first_tag_containing(metrics_df, ['beta'])
+    if beta_tag:
+        ax.plot(metrics_df[beta_tag]['steps'], metrics_df[beta_tag]['values'], 'green', linewidth=2, label=beta_tag)
         ax.set_xlabel('Steps')
         ax.set_ylabel('Beta')
         ax.set_title('KL Annealing Beta')
+        ax.legend()
         ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -530,14 +595,23 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 1. Loss components ratio
     ax = axes[0, 0]
-    if all(key in metrics_df for key in ['train_kl', 'train_recon_loss']):
-        kl_values = metrics_df['train_kl']['values']
-        recon_values = metrics_df['train_recon_loss']['values']
-        steps = metrics_df['train_kl']['steps']
+    train_kl_tag = 'train_kl' if 'train_kl' in metrics_df else _find_first_tag_containing(metrics_df, ['train', 'kl'])
+    train_recon_tag = None
+    if 'train_recon_loss' in metrics_df:
+        train_recon_tag = 'train_recon_loss'
+    elif 'train_recon' in metrics_df:
+        train_recon_tag = 'train_recon'
+    else:
+        train_recon_tag = _find_first_tag_containing(metrics_df, ['train', 'recon'])
+    if train_kl_tag and train_recon_tag:
+        kl_values = metrics_df[train_kl_tag]['values']
+        recon_values = metrics_df[train_recon_tag]['values']
+        steps = metrics_df[train_kl_tag]['steps']
         
-        # Calculate ratio
-        ratio = np.array(kl_values) / (np.array(kl_values) + np.array(recon_values) + 1e-8)
-        ax.plot(steps, ratio, 'blue', linewidth=2)
+        # Align lengths if necessary
+        n = min(len(kl_values), len(recon_values))
+        ratio = np.array(kl_values[:n]) / (np.array(recon_values[:n]) + np.array(kl_values[:n]) + 1e-8)
+        ax.plot(steps[:n], ratio, 'blue', linewidth=2)
         ax.set_xlabel('Steps')
         ax.set_ylabel('KL / (KL + Recon)')
         ax.set_title('KL vs Reconstruction Loss Ratio')
@@ -545,10 +619,11 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 2. Loss correlation
     ax = axes[0, 1]
-    if all(key in metrics_df for key in ['train_kl', 'train_recon_loss']):
-        kl_values = metrics_df['train_kl']['values']
-        recon_values = metrics_df['train_recon_loss']['values']
-        ax.scatter(kl_values, recon_values, alpha=0.6)
+    if train_kl_tag and train_recon_tag:
+        kl_values = metrics_df[train_kl_tag]['values']
+        recon_values = metrics_df[train_recon_tag]['values']
+        n = min(len(kl_values), len(recon_values))
+        ax.scatter(kl_values[:n], recon_values[:n], alpha=0.6)
         ax.set_xlabel('KL Loss')
         ax.set_ylabel('Reconstruction Loss')
         ax.set_title('KL vs Reconstruction Loss Correlation')
@@ -556,12 +631,13 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 3. Training stability
     ax = axes[1, 0]
-    if 'train_loss' in metrics_df:
-        loss_values = metrics_df['train_loss']['values']
-        steps = metrics_df['train_loss']['steps']
+    train_loss_tag = 'train_loss' if 'train_loss' in metrics_df else _find_first_tag_containing(metrics_df, ['train', 'loss'])
+    if train_loss_tag:
+        loss_values = metrics_df[train_loss_tag]['values']
+        steps = metrics_df[train_loss_tag]['steps']
         
         # Calculate moving average
-        window = min(50, len(loss_values) // 10)
+        window = max(2, min(50, max(2, len(loss_values) // 10)))
         if window > 1:
             moving_avg = pd.Series(loss_values).rolling(window=window).mean()
             ax.plot(steps, loss_values, alpha=0.5, label='Raw Loss')
@@ -577,19 +653,20 @@ def plot_training_dynamics(metrics_df, save_dir):
     
     # 4. Convergence analysis
     ax = axes[1, 1]
-    if 'train_loss' in metrics_df:
-        loss_values = metrics_df['train_loss']['values']
-        steps = metrics_df['train_loss']['steps']
+    if train_loss_tag:
+        loss_values = metrics_df[train_loss_tag]['values']
+        steps = metrics_df[train_loss_tag]['steps']
         
         # Calculate relative improvement
         if len(loss_values) > 10:
             baseline = np.mean(loss_values[:10])
-            relative_improvement = (baseline - np.array(loss_values)) / baseline
-            ax.plot(steps, relative_improvement, 'green', linewidth=2)
-            ax.set_xlabel('Steps')
-            ax.set_ylabel('Relative Improvement')
-            ax.set_title('Convergence Analysis')
-            ax.grid(True, alpha=0.3)
+            if baseline != 0:
+                relative_improvement = (baseline - np.array(loss_values)) / baseline
+                ax.plot(steps, relative_improvement, 'green', linewidth=2)
+                ax.set_xlabel('Steps')
+                ax.set_ylabel('Relative Improvement')
+                ax.set_title('Convergence Analysis')
+                ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     save_path = os.path.join(save_dir, 'training_dynamics.png')
@@ -606,14 +683,13 @@ def analyze_collapse_indicators(metrics_df, save_dir):
     
     # 1. KL divergence analysis
     ax = axes[0, 0]
-    kl_metrics = [key for key in metrics_df.keys() if 'kl' in key.lower()]
+    kl_metrics = [key for key in metrics_df.keys() if 'kl' in key.lower() and 'train' in key.lower()]
     
-    for metric in kl_metrics:
-        if 'train' in metric:
+    if kl_metrics:
+        for metric in kl_metrics:
             ax.plot(metrics_df[metric]['steps'], 
                    metrics_df[metric]['values'], 
                    label=metric, alpha=0.8)
-    
     ax.axhline(y=0.01, color='red', linestyle='--', alpha=0.7, label='Collapse Threshold')
     ax.set_xlabel('Steps')
     ax.set_ylabel('KL Divergence')
@@ -621,16 +697,14 @@ def analyze_collapse_indicators(metrics_df, save_dir):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # 2. Variance analysis (if available)
+    # 2. Variance analysis (fallback to reconstruction if variance not logged)
     ax = axes[0, 1]
     var_metrics = [key for key in metrics_df.keys() if 'var' in key.lower()]
-    
-    for metric in var_metrics:
-        ax.plot(metrics_df[metric]['steps'], 
-               metrics_df[metric]['values'], 
-               label=metric, alpha=0.8)
-    
     if var_metrics:
+        for metric in var_metrics:
+            ax.plot(metrics_df[metric]['steps'], 
+                   metrics_df[metric]['values'], 
+                   label=metric, alpha=0.8)
         ax.axhline(y=0.1, color='red', linestyle='--', alpha=0.7, label='Collapse Threshold')
         ax.set_xlabel('Steps')
         ax.set_ylabel('Variance')
@@ -638,20 +712,28 @@ def analyze_collapse_indicators(metrics_df, save_dir):
         ax.legend()
         ax.grid(True, alpha=0.3)
     else:
-        ax.text(0.5, 0.5, 'No variance metrics found', 
-                transform=ax.transAxes, ha='center', va='center')
-        ax.set_title('Variance Analysis (No Data)')
+        # Fallback: plot reconstruction loss as an indicator
+        recon_tag = _find_first_tag_containing(metrics_df, ['train', 'recon']) or _find_first_tag_containing(metrics_df, ['recon'])
+        if recon_tag:
+            ax.plot(metrics_df[recon_tag]['steps'], metrics_df[recon_tag]['values'], label=recon_tag, alpha=0.8)
+            ax.set_xlabel('Steps')
+            ax.set_ylabel('Reconstruction Loss')
+            ax.set_title('Reconstruction Loss (fallback)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'No variance or reconstruction metrics found', 
+                    transform=ax.transAxes, ha='center', va='center')
+            ax.set_title('Variance/Reconstruction (No Data)')
     
-    # 3. Active units analysis (if available)
+    # 3. Active units analysis (fallback to KL/Recon ratio if not logged)
     ax = axes[1, 0]
     active_metrics = [key for key in metrics_df.keys() if 'active' in key.lower()]
-    
-    for metric in active_metrics:
-        ax.plot(metrics_df[metric]['steps'], 
-               metrics_df[metric]['values'], 
-               label=metric, alpha=0.8)
-    
     if active_metrics:
+        for metric in active_metrics:
+            ax.plot(metrics_df[metric]['steps'], 
+                   metrics_df[metric]['values'], 
+                   label=metric, alpha=0.8)
         ax.axhline(y=0.1, color='red', linestyle='--', alpha=0.7, label='Collapse Threshold')
         ax.set_xlabel('Steps')
         ax.set_ylabel('Active Units Ratio')
@@ -659,9 +741,25 @@ def analyze_collapse_indicators(metrics_df, save_dir):
         ax.legend()
         ax.grid(True, alpha=0.3)
     else:
-        ax.text(0.5, 0.5, 'No active units metrics found', 
-                transform=ax.transAxes, ha='center', va='center')
-        ax.set_title('Active Units Analysis (No Data)')
+        # Fallback: KL/(KL+Recon) ratio
+        train_kl_tag = 'train_kl' if 'train_kl' in metrics_df else _find_first_tag_containing(metrics_df, ['train', 'kl'])
+        recon_tag = _find_first_tag_containing(metrics_df, ['train', 'recon']) or _find_first_tag_containing(metrics_df, ['recon'])
+        if train_kl_tag and recon_tag:
+            kl_values = metrics_df[train_kl_tag]['values']
+            recon_values = metrics_df[recon_tag]['values']
+            n = min(len(kl_values), len(recon_values))
+            ratio = np.array(kl_values[:n]) / (np.array(kl_values[:n]) + np.array(recon_values[:n]) + 1e-8)
+            steps = metrics_df[train_kl_tag]['steps']
+            ax.plot(steps[:n], ratio, 'blue', linewidth=2, label='KL/(KL+Recon)')
+            ax.set_xlabel('Steps')
+            ax.set_ylabel('Ratio')
+            ax.set_title('KL vs Recon Ratio (fallback)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'No active units or ratio metrics found', 
+                    transform=ax.transAxes, ha='center', va='center')
+            ax.set_title('Active Units/Ratio (No Data)')
     
     # 4. Collapse risk summary
     ax = axes[1, 1]
@@ -671,20 +769,14 @@ def analyze_collapse_indicators(metrics_df, save_dir):
     collapse_indicators = []
     
     for metric in kl_metrics:
-        if 'train' in metric:
-            values = metrics_df[metric]['values']
-            low_kl_count = sum(1 for v in values if v < 0.01)
-            collapse_indicators.append(f"{metric}: {low_kl_count}/{len(values)} steps with low KL")
+        values = metrics_df[metric]['values']
+        low_kl_count = sum(1 for v in values if v < 0.01)
+        collapse_indicators.append(f"{metric}: {low_kl_count}/{len(values)} steps with low KL")
     
     for metric in var_metrics:
         values = metrics_df[metric]['values']
         low_var_count = sum(1 for v in values if v < 0.1)
         collapse_indicators.append(f"{metric}: {low_var_count}/{len(values)} steps with low variance")
-    
-    for metric in active_metrics:
-        values = metrics_df[metric]['values']
-        low_active_count = sum(1 for v in values if v < 0.1)
-        collapse_indicators.append(f"{metric}: {low_active_count}/{len(values)} steps with low active ratio")
     
     summary_text = "Posterior Collapse Risk Assessment:\n\n"
     if collapse_indicators:
