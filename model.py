@@ -12,6 +12,7 @@ from modules import (
     AttentiveBottleneckLayer,
     recon_loss as chamfer_recon_loss,
 )
+from losses import FocalLoss
 
 
 def load_checkpoint_weights(checkpoint_path, device='cpu'):
@@ -155,6 +156,9 @@ class SeqSetVAE(pl.LightningModule):
         beta_warmup_steps: int = 5000,
         kl_annealing: bool = True,
         skip_pretrained_on_resume: bool = False,  # New parameter: whether to skip pretrained loading when resuming
+        use_focal_loss: bool = False,
+        focal_gamma: float = 2.0,
+        focal_alpha = None,
     ):
 
         super().__init__()
@@ -265,6 +269,12 @@ class SeqSetVAE(pl.LightningModule):
         self.beta_warmup_steps = beta_warmup_steps
         self.kl_annealing = kl_annealing
         self.current_step = 0
+        self.use_focal_loss = use_focal_loss
+        self.focal_loss_fn = (
+            FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean")
+            if use_focal_loss
+            else None
+        )
         
         self.save_hyperparameters(ignore=["setvae"])
 
@@ -763,7 +773,10 @@ class SeqSetVAE(pl.LightningModule):
             kl_loss = total_kl_loss / valid_patients
         
         # Improved loss calculation
-        pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)  # Add label smoothing
+        if self.use_focal_loss and self.focal_loss_fn is not None:
+            pred_loss = self.focal_loss_fn(logits, label)
+        else:
+            pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
         
         # Dynamic weight adjustment
         if stage == "train":
