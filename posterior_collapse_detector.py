@@ -70,6 +70,35 @@ class PosteriorMetricsMonitor(pl.Callback):
         self.fig.suptitle('Posterior Collapse Monitoring', fontsize=14)
         
         self.step_count = 0
+
+    def _get_logged_value(self, trainer, pl_module, base_key: str):
+        """Fetch metric with multiple fallbacks to match Lightning naming.
+        Tries callback_metrics first (authoritative), then model.logged_metrics, then outputs dict.
+        Accepts keys: base, base+'_step', base+'_epoch'. Returns float or None.
+        """
+        # 1) Trainer callback metrics
+        if hasattr(trainer, 'callback_metrics') and isinstance(trainer.callback_metrics, dict):
+            for k in (base_key, f"{base_key}_step", f"{base_key}_epoch"):
+                if k in trainer.callback_metrics:
+                    v = trainer.callback_metrics[k]
+                    if torch.is_tensor(v):
+                        return float(v.detach().cpu().item())
+                    try:
+                        return float(v)
+                    except Exception:
+                        pass
+        # 2) Module logged metrics (custom or Lightning)
+        if hasattr(pl_module, 'logged_metrics') and isinstance(pl_module.logged_metrics, dict):
+            for k in (base_key, f"{base_key}_step", f"{base_key}_epoch"):
+                if k in pl_module.logged_metrics:
+                    v = pl_module.logged_metrics[k]
+                    if torch.is_tensor(v):
+                        return float(v.detach().cpu().item())
+                    try:
+                        return float(v)
+                    except Exception:
+                        pass
+        return None
         
     def update(self, step: int, kl_divergence: float, reconstruction_loss: float, 
                additional_metrics: Optional[Dict[str, Any]] = None):
@@ -284,29 +313,22 @@ class PosteriorMetricsMonitor(pl.Callback):
     # PyTorch Lightning callback methods
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         """Called at the end of each training batch."""
-        # Prefer reading from pl_module.logged_metrics since outputs may be a scalar
-        kl_loss = None
-        recon_loss = None
-        if hasattr(pl_module, 'logged_metrics') and isinstance(pl_module.logged_metrics, dict):
-            kl_loss = pl_module.logged_metrics.get('train_kl', None)
-            recon_loss = pl_module.logged_metrics.get('train_recon', None)
-            if torch.is_tensor(kl_loss):
-                kl_loss = kl_loss.item()
-            if torch.is_tensor(recon_loss):
-                recon_loss = recon_loss.item()
+        # Fetch metrics from trainer/module, aligning with Lightning's naming
+        kl_loss = self._get_logged_value(trainer, pl_module, 'train_kl')
+        recon_loss = self._get_logged_value(trainer, pl_module, 'train_recon')
         
-        # Fallback to outputs dict if available
+        # Fallback: try outputs dict if available
         if (kl_loss is None or recon_loss is None) and outputs is not None and isinstance(outputs, dict):
-            kl_loss = outputs.get('kl_loss', kl_loss)
-            recon_loss = outputs.get('recon_loss', recon_loss)
-            if torch.is_tensor(kl_loss):
-                kl_loss = kl_loss.item()
-            if torch.is_tensor(recon_loss):
-                recon_loss = recon_loss.item()
+            v = outputs.get('kl_loss', None)
+            if v is not None:
+                kl_loss = float(v.detach().cpu().item() if torch.is_tensor(v) else v)
+            v = outputs.get('recon_loss', None)
+            if v is not None:
+                recon_loss = float(v.detach().cpu().item() if torch.is_tensor(v) else v)
         
-        # Default to zeros if still missing
-        kl_loss = float(kl_loss) if kl_loss is not None else 0.0
-        recon_loss = float(recon_loss) if recon_loss is not None else 0.0
+        # If still missing, skip update to avoid plotting zeros that cause confusion
+        if kl_loss is None or recon_loss is None:
+            return
         
         # Compute additional latent statistics from the model if available
         variance_value = None
@@ -338,7 +360,7 @@ class PosteriorMetricsMonitor(pl.Callback):
             additional['active_ratio'] = active_ratio_value
         
         # Update monitoring and save
-        self.update(trainer.global_step, kl_loss, recon_loss, additional)
+        self.update(trainer.global_step, float(kl_loss), float(recon_loss), additional)
 
     def on_train_epoch_end(self, trainer, pl_module):
         """Called at the end of each training epoch."""
