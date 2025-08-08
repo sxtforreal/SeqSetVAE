@@ -532,62 +532,101 @@ def plot_loss_curves(metrics_df, save_dir):
 
 
 def plot_performance_metrics(metrics_df, save_dir):
-    """Plot performance metrics"""
+    """Plot validation performance metrics and loss components share"""
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # 1. Learning Rate
+
+    # 1. Val Accuracy
     ax = axes[0, 0]
-    lr_tags = _find_all_tags_containing(metrics_df, ['lr'])
-    # Prefer simple 'lr' if exists, otherwise plot the first few lr-related tags
-    if lr_tags:
-        for tag in lr_tags[:3]:
-            ax.plot(metrics_df[tag]['steps'], metrics_df[tag]['values'], linewidth=2, label=tag)
-        ax.set_xlabel('Steps')
-        ax.set_ylabel('Learning Rate')
-        ax.set_title('Learning Rate Schedule')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    
-    # 2. Accuracy
-    ax = axes[0, 1]
-    train_acc_tag = _find_first_tag_containing(metrics_df, ['train', 'acc'])
     val_acc_tag = _find_first_tag_containing(metrics_df, ['val', 'acc'])
-    if train_acc_tag:
-        ax.plot(metrics_df[train_acc_tag]['steps'], 
-                metrics_df[train_acc_tag]['values'], 
-                label=f'Train ({train_acc_tag})', alpha=0.8)
     if val_acc_tag:
-        ax.plot(metrics_df[val_acc_tag]['steps'], 
-                metrics_df[val_acc_tag]['values'], 
-                label=f'Val ({val_acc_tag})', alpha=0.8)
+        ax.plot(metrics_df[val_acc_tag]['steps'], metrics_df[val_acc_tag]['values'], label=f'{val_acc_tag}', alpha=0.9, linewidth=2)
     ax.set_xlabel('Steps')
     ax.set_ylabel('Accuracy')
-    ax.set_title('Classification Accuracy')
+    ax.set_title('Validation Accuracy')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
-    # 3. Gradient Norm
+
+    # 2. Val AUC
+    ax = axes[0, 1]
+    val_auc_tag = _find_first_tag_containing(metrics_df, ['val', 'auc'])
+    if val_auc_tag:
+        ax.plot(metrics_df[val_auc_tag]['steps'], metrics_df[val_auc_tag]['values'], label=f'{val_auc_tag}', alpha=0.9, linewidth=2)
+    ax.set_xlabel('Steps')
+    ax.set_ylabel('AUC')
+    ax.set_title('Validation AUC')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 3. Val AUPRC
     ax = axes[1, 0]
-    grad_tag = _find_first_tag_containing(metrics_df, ['grad', 'norm'])
-    if grad_tag:
-        ax.plot(metrics_df[grad_tag]['steps'], metrics_df[grad_tag]['values'], 'red', linewidth=2, label=grad_tag)
-        ax.set_xlabel('Steps')
-        ax.set_ylabel('Gradient Norm')
-        ax.set_title('Gradient Norm')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    
-    # 4. Beta Value (if using KL annealing)
+    val_auprc_tag = (_find_first_tag_containing(metrics_df, ['val', 'auprc']) or
+                      _find_first_tag_containing(metrics_df, ['val', 'apr']) or
+                      _find_first_tag_containing(metrics_df, ['val', 'average', 'precision']))
+    if val_auprc_tag:
+        ax.plot(metrics_df[val_auprc_tag]['steps'], metrics_df[val_auprc_tag]['values'], label=f'{val_auprc_tag}', alpha=0.9, linewidth=2)
+    ax.set_xlabel('Steps')
+    ax.set_ylabel('AUPRC')
+    ax.set_title('Validation AUPRC')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 4. Loss components share in total loss (validation)
     ax = axes[1, 1]
-    beta_tag = _find_first_tag_containing(metrics_df, ['beta'])
-    if beta_tag:
-        ax.plot(metrics_df[beta_tag]['steps'], metrics_df[beta_tag]['values'], 'green', linewidth=2, label=beta_tag)
-        ax.set_xlabel('Steps')
-        ax.set_ylabel('Beta')
-        ax.set_title('KL Annealing Beta')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    
+    # Prefer explicit tags; provide fallbacks
+    val_loss_tag = 'val_loss' if 'val_loss' in metrics_df else _find_first_tag_containing(metrics_df, ['val', 'loss'])
+    val_recon_tag = None
+    if 'val_recon_loss' in metrics_df:
+        val_recon_tag = 'val_recon_loss'
+    elif 'val_recon' in metrics_df:
+        val_recon_tag = 'val_recon'
+    else:
+        val_recon_tag = _find_first_tag_containing(metrics_df, ['val', 'recon'])
+    val_kl_tag = 'val_kl' if 'val_kl' in metrics_df else _find_first_tag_containing(metrics_df, ['val', 'kl'])
+    # Classification component may be logged as val_class_loss or val_pred
+    val_cls_tag = None
+    if 'val_class_loss' in metrics_df:
+        val_cls_tag = 'val_class_loss'
+    elif 'val_pred' in metrics_df:
+        val_cls_tag = 'val_pred'
+    else:
+        val_cls_tag = (_find_first_tag_containing(metrics_df, ['val', 'class']) or
+                       _find_first_tag_containing(metrics_df, ['val', 'pred']))
+
+    if val_loss_tag and val_recon_tag and val_kl_tag and val_cls_tag:
+        # Align by common steps
+        def to_map(tag):
+            df = metrics_df[tag]
+            return {int(s): float(v) for s, v in zip(df['steps'], df['values'])}
+        loss_map = to_map(val_loss_tag)
+        recon_map = to_map(val_recon_tag)
+        kl_map = to_map(val_kl_tag)
+        cls_map = to_map(val_cls_tag)
+        common_steps = sorted(set(loss_map.keys()) & set(recon_map.keys()) & set(kl_map.keys()) & set(cls_map.keys()))
+        if len(common_steps) >= 1:
+            recon_share = []
+            kl_share = []
+            cls_share = []
+            for s in common_steps:
+                total = loss_map[s]
+                # Avoid division by zero
+                denom = total if abs(total) > 1e-8 else (recon_map[s] + kl_map[s] + cls_map[s] + 1e-8)
+                recon_share.append(recon_map[s] / denom)
+                kl_share.append(kl_map[s] / denom)
+                cls_share.append(cls_map[s] / denom)
+            ax.stackplot(common_steps, recon_share, kl_share, cls_share, labels=['Recon', 'KL', 'Class'], alpha=0.8)
+            ax.set_xlabel('Steps')
+            ax.set_ylabel('Share of Total Loss')
+            ax.set_title('Validation Loss Composition (Share)')
+            ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'Insufficient overlapping steps for loss components',
+                    transform=ax.transAxes, ha='center', va='center')
+            ax.set_title('Validation Loss Composition (No Data)')
+    else:
+        ax.text(0.5, 0.5, 'Missing val loss component tags', transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Validation Loss Composition (No Data)')
+
     plt.tight_layout()
     save_path = os.path.join(save_dir, 'performance_metrics.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -596,11 +635,47 @@ def plot_performance_metrics(metrics_df, save_dir):
 
 
 def plot_training_dynamics(metrics_df, save_dir):
-    """Plot training dynamics analysis"""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # 1. Loss components ratio
+    """Plot training dynamics analysis including LR, grad norm, KL beta"""
+    fig, axes = plt.subplots(2, 3, figsize=(22, 12))
+
+    # 1. Learning Rate
     ax = axes[0, 0]
+    lr_tags = _find_all_tags_containing(metrics_df, ['lr'])
+    if lr_tags:
+        for tag in lr_tags[:3]:
+            ax.plot(metrics_df[tag]['steps'], metrics_df[tag]['values'], linewidth=2, label=tag)
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Learning Rate')
+        ax.set_title('Learning Rate Schedule')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    # 2. Gradient Norm
+    ax = axes[0, 1]
+    grad_tag = _find_first_tag_containing(metrics_df, ['grad', 'norm'])
+    if grad_tag:
+        ax.plot(metrics_df[grad_tag]['steps'], metrics_df[grad_tag]['values'], 'red', linewidth=2, label=grad_tag)
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Gradient Norm')
+        ax.set_title('Gradient Norm')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    # 3. KL Annealing Beta
+    ax = axes[0, 2]
+    beta_tag = (_find_first_tag_containing(metrics_df, ['val', 'beta']) or
+                _find_first_tag_containing(metrics_df, ['train', 'beta']) or
+                _find_first_tag_containing(metrics_df, ['beta']))
+    if beta_tag:
+        ax.plot(metrics_df[beta_tag]['steps'], metrics_df[beta_tag]['values'], 'green', linewidth=2, label=beta_tag)
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Beta')
+        ax.set_title('KL Annealing Beta')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    # 4. KL vs Reconstruction Loss Ratio (Train)
+    ax = axes[1, 0]
     train_kl_tag = 'train_kl' if 'train_kl' in metrics_df else _find_first_tag_containing(metrics_df, ['train', 'kl'])
     train_recon_tag = None
     if 'train_recon_loss' in metrics_df:
@@ -613,8 +688,6 @@ def plot_training_dynamics(metrics_df, save_dir):
         kl_values = metrics_df[train_kl_tag]['values']
         recon_values = metrics_df[train_recon_tag]['values']
         steps = metrics_df[train_kl_tag]['steps']
-        
-        # Align lengths if necessary
         n = min(len(kl_values), len(recon_values))
         ratio = np.array(kl_values[:n]) / (np.array(recon_values[:n]) + np.array(kl_values[:n]) + 1e-8)
         ax.plot(steps[:n], ratio, 'blue', linewidth=2)
@@ -622,27 +695,13 @@ def plot_training_dynamics(metrics_df, save_dir):
         ax.set_ylabel('KL / (KL + Recon)')
         ax.set_title('KL vs Reconstruction Loss Ratio')
         ax.grid(True, alpha=0.3)
-    
-    # 2. Loss correlation
-    ax = axes[0, 1]
-    if train_kl_tag and train_recon_tag:
-        kl_values = metrics_df[train_kl_tag]['values']
-        recon_values = metrics_df[train_recon_tag]['values']
-        n = min(len(kl_values), len(recon_values))
-        ax.scatter(kl_values[:n], recon_values[:n], alpha=0.6)
-        ax.set_xlabel('KL Loss')
-        ax.set_ylabel('Reconstruction Loss')
-        ax.set_title('KL vs Reconstruction Loss Correlation')
-        ax.grid(True, alpha=0.3)
-    
-    # 3. Training stability
-    ax = axes[1, 0]
+
+    # 5. Training stability (Train Loss moving avg)
+    ax = axes[1, 1]
     train_loss_tag = 'train_loss' if 'train_loss' in metrics_df else _find_first_tag_containing(metrics_df, ['train', 'loss'])
     if train_loss_tag:
         loss_values = metrics_df[train_loss_tag]['values']
         steps = metrics_df[train_loss_tag]['steps']
-        
-        # Calculate moving average
         window = max(2, min(50, max(2, len(loss_values) // 10)))
         if window > 1:
             moving_avg = pd.Series(loss_values).rolling(window=window).mean()
@@ -651,19 +710,16 @@ def plot_training_dynamics(metrics_df, save_dir):
             ax.legend()
         else:
             ax.plot(steps, loss_values, 'blue', linewidth=2)
-        
         ax.set_xlabel('Steps')
         ax.set_ylabel('Loss')
         ax.set_title('Training Stability')
         ax.grid(True, alpha=0.3)
-    
-    # 4. Convergence analysis
-    ax = axes[1, 1]
+
+    # 6. Convergence analysis
+    ax = axes[1, 2]
     if train_loss_tag:
         loss_values = metrics_df[train_loss_tag]['values']
         steps = metrics_df[train_loss_tag]['steps']
-        
-        # Calculate relative improvement
         if len(loss_values) > 10:
             baseline = np.mean(loss_values[:10])
             if baseline != 0:
@@ -673,7 +729,7 @@ def plot_training_dynamics(metrics_df, save_dir):
                 ax.set_ylabel('Relative Improvement')
                 ax.set_title('Convergence Analysis')
                 ax.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     save_path = os.path.join(save_dir, 'training_dynamics.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
