@@ -123,9 +123,21 @@ m = 16  # Number of inducing points in ISAB (Induced Set Attention Block)
 beta = 0.1  # KL divergence weight (reduced from 0.5 to prevent posterior collapse)
 lr = 1e-4  # Learning rate for optimizer
 num_classes = 2  # Number of output classes for classification (binary classification)
+
+# Enhanced model architecture parameters (for enhanced mode)
 ff_dim = 256  # Feed-forward network dimension in transformer
 transformer_heads = 2  # Number of attention heads in transformer encoder
 transformer_layers = 2  # Number of transformer encoder layers
+
+# Enhanced mode overrides (when --enhanced_mode is used)
+enhanced_ff_dim = 512  # Enhanced feed-forward network dimension
+enhanced_transformer_heads = 8  # Enhanced number of attention heads
+enhanced_transformer_layers = 4  # Enhanced number of transformer layers
+enhanced_cls_head_layers = [256, 128, 64]  # Enhanced classification head layers
+enhanced_cls_dropout = 0.2  # Enhanced classification dropout
+enhanced_transformer_dropout = 0.15  # Enhanced transformer dropout
+enhanced_post_norm = True  # Enable post-transformer normalization
+enhanced_feature_fusion = True  # Enable multi-scale feature fusion
 
 # Model Checkpoint and Pretrained Weights
 pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/checkpoints/best_SetVAE.ckpt"
@@ -134,12 +146,32 @@ pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs
 w = 2.0  # Classification loss weight (increased from 1.0 to emphasize classification)
 free_bits = 0.05  # Free bits for KL divergence (reduced from 0.1 to prevent collapse)
 
+# Enhanced mode loss weights (when --enhanced_mode is used)
+enhanced_w = 3.0  # Enhanced classification loss weight
+enhanced_free_bits = 0.03  # Enhanced KL divergence weight
+enhanced_focal_alpha = 0.35  # Enhanced focal loss alpha
+enhanced_focal_gamma = 3.0  # Enhanced focal loss gamma
+
 # Training Regularization and Optimization
 warmup_beta = True  # Enable beta warmup for KL annealing
 max_beta = 0.05  # Maximum value of beta during warmup (reduced from 0.1)
 beta_warmup_steps = 8000  # Number of steps for beta warmup (increased from 5000)
 kl_annealing = True  # Enable KL annealing schedule
 gradient_clip_val = 0.3  # Gradient clipping value (reduced from 0.5 to prevent exploding gradients)
+
+# Enhanced mode training parameters
+enhanced_gradient_clip_val = 0.2  # Enhanced gradient clipping
+enhanced_weight_decay = 0.03  # Enhanced weight decay
+enhanced_lr = 5e-5  # Enhanced learning rate
+enhanced_scheduler_patience = 150  # Enhanced scheduler patience
+enhanced_scheduler_factor = 0.6  # Enhanced scheduler factor
+enhanced_scheduler_min_lr = 1e-6  # Enhanced scheduler min learning rate
+enhanced_early_stopping_patience = 8  # Enhanced early stopping patience
+enhanced_early_stopping_min_delta = 0.0005  # Enhanced early stopping min delta
+enhanced_val_check_interval = 0.15  # Enhanced validation interval
+enhanced_limit_val_batches = 0.6  # Enhanced validation batches
+enhanced_save_top_k = 5  # Enhanced checkpoint saving
+enhanced_monitor_metric = "val_auc"  # Enhanced monitoring metric
 
 # Logging Configuration
 name = "SeqSetVAE-v3"  # Experiment name for logging
