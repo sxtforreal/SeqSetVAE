@@ -397,7 +397,7 @@ def main():
                     break
                     
             if monitor:
-                print(f"  - Total steps monitored: {len(monitor.steps_history)}")
+                print(f"  - Total steps monitored: {len(monitor.steps)}")
                 print(f"  - Update frequency: every {monitor.update_frequency} steps")
                 print(f"  - Plot frequency: every {monitor.plot_frequency} steps")
                 print(f"  - Log directory: {monitor.log_dir}")
