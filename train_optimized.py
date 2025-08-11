@@ -160,19 +160,27 @@ def main():
     parser.add_argument("--fast_detection", action="store_true", help="Enable fast detection mode")
     parser.add_argument("--compile_model", action="store_true", help="Enable model compilation")
     parser.add_argument("--auc_mode", action="store_true", help="Enable AUC/AUPRC optimization mode")
+    parser.add_argument("--enhanced_mode", action="store_true", help="Enable enhanced model architecture mode")
     
     args = parser.parse_args()
     
     # Create experiment output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    mode_suffix = "_auc_optimized" if args.auc_mode else "_optimized"
+    if args.enhanced_mode:
+        mode_suffix = "_enhanced"
+    elif args.auc_mode:
+        mode_suffix = "_auc_optimized"
+    else:
+        mode_suffix = "_optimized"
     experiment_name = f"{config.name}{mode_suffix}_{timestamp}"
     experiment_output_dir = os.path.join("outputs", experiment_name)
     os.makedirs(experiment_output_dir, exist_ok=True)
     
     print(f"🚀 Starting {experiment_name} training...")
     print(f"📁 Output directory: {experiment_output_dir}")
-    if args.auc_mode:
+    if args.enhanced_mode:
+        print("🚀 Enhanced model architecture mode enabled!")
+    elif args.auc_mode:
         print("🎯 AUC/AUPRC optimization mode enabled!")
     
     # Get adaptive training configuration
@@ -187,7 +195,28 @@ def main():
     )
     
     # Get configuration parameters
-    if args.auc_mode:
+    if args.enhanced_mode:
+        # Enhanced mode: use enhanced architecture and training config
+        model_w = config.enhanced_w
+        model_free_bits = config.enhanced_free_bits
+        model_max_beta = config.max_beta  # Keep from base config
+        model_beta_warmup_steps = config.beta_warmup_steps  # Keep from base config
+        model_gradient_clip_val = config.enhanced_gradient_clip_val
+        model_focal_alpha = config.enhanced_focal_alpha
+        model_focal_gamma = config.enhanced_focal_gamma
+        model_lr = config.enhanced_lr
+        model_weight_decay = config.enhanced_weight_decay
+        val_check_interval = config.enhanced_val_check_interval
+        limit_val_batches = config.enhanced_limit_val_batches
+        early_stopping_patience = config.enhanced_early_stopping_patience
+        early_stopping_min_delta = config.enhanced_early_stopping_min_delta
+        save_top_k = config.enhanced_save_top_k
+        monitor_metric = config.enhanced_monitor_metric
+        scheduler_patience = config.enhanced_scheduler_patience
+        scheduler_factor = config.enhanced_scheduler_factor
+        scheduler_min_lr = config.enhanced_scheduler_min_lr
+        print("✅ Enhanced configuration loaded successfully")
+    elif args.auc_mode:
         auc_config = get_auc_optimized_config()
         # Override config parameters for AUC optimization
         model_w = auc_config['w']
@@ -229,8 +258,23 @@ def main():
         scheduler_factor = 0.7
         scheduler_min_lr = config.lr * 0.01
     
-    # Set up model
+    # Set up model with configuration based on mode
     print("🧠 Setting up model...")
+    
+    # Choose configuration based on mode
+    if args.enhanced_mode:
+        # Enhanced mode: use enhanced architecture parameters
+        model_ff_dim = config.enhanced_ff_dim
+        model_transformer_heads = config.enhanced_transformer_heads
+        model_transformer_layers = config.enhanced_transformer_layers
+        print("🚀 Using enhanced model architecture")
+    else:
+        # Standard/AUC mode: use standard architecture parameters
+        model_ff_dim = config.ff_dim
+        model_transformer_heads = config.transformer_heads
+        model_transformer_layers = config.transformer_layers
+        print("📊 Using standard model architecture")
+    
     model = SeqSetVAE(
         input_dim=config.input_dim,
         reduced_dim=config.reduced_dim,
@@ -241,9 +285,9 @@ def main():
         beta=config.beta,
         lr=model_lr,
         num_classes=config.num_classes,
-        ff_dim=config.ff_dim,
-        transformer_heads=config.transformer_heads,
-        transformer_layers=config.transformer_layers,
+        ff_dim=model_ff_dim,
+        transformer_heads=model_transformer_heads,
+        transformer_layers=model_transformer_layers,
         pretrained_ckpt=config.pretrained_ckpt,
         w=model_w,
         free_bits=model_free_bits,
@@ -329,7 +373,7 @@ def main():
     
     # Print training configuration
     print("\n📋 Training configuration:")
-    print(f"  - Mode: {'AUC/AUPRC Optimized' if args.auc_mode else 'Standard Optimized'}")
+    print(f"  - Mode: {'Enhanced Architecture' if args.enhanced_mode else 'AUC Optimized' if args.auc_mode else 'Standard Optimized'}")
     print(f"  - Max epochs: {config.max_epochs}")
     print(f"  - Accelerator: {config.accelerator}")
     print(f"  - Number of devices: {config.devices}")
@@ -353,6 +397,13 @@ def main():
     print(f"  - Model compilation: {'Enabled' if adaptive_config['compile_model'] else 'Disabled'}")
     print(f"  - Strategy: {adaptive_config['strategy']}")
     print(f"  - Metrics monitoring: {'Enabled' if not args.disable_metrics_monitoring else 'Disabled'}")
+    
+    # Print architecture information
+    if args.enhanced_mode:
+        print(f"  - Architecture: Enhanced (FF: {config.enhanced_ff_dim}, Heads: {config.enhanced_transformer_heads}, Layers: {config.enhanced_transformer_layers})")
+    else:
+        print(f"  - Architecture: Standard (FF: {config.ff_dim}, Heads: {config.transformer_heads}, Layers: {config.transformer_layers})")
+    
     if args.resume_from_checkpoint:
         print(f"  - Resuming from checkpoint: {args.resume_from_checkpoint}")
     
