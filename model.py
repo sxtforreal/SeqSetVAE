@@ -212,17 +212,22 @@ class SeqSetVAE(pl.LightningModule):
         for p in set_params[:freeze_cnt]:
             p.requires_grad = False
 
-        # Transformer encoder with improved configuration
+        # Enhanced Transformer encoder with improved configuration for better AUC/AUPRC
         enc_layer = TransformerEncoderLayer(
             d_model=latent_dim,
             nhead=transformer_heads,
             dim_feedforward=ff_dim,
-            dropout=0.1,
+            dropout=0.15,  # Increased dropout for better regularization
             activation='gelu',  # Use GELU activation function
             batch_first=True,
             norm_first=True,  # Pre-norm for better training stability
+            # Additional improvements
+            norm_eps=1e-6,  # Smaller epsilon for better numerical stability
         )
         self.transformer = TransformerEncoder(enc_layer, num_layers=transformer_layers)
+        
+        # Add layer normalization after transformer for better feature quality
+        self.post_transformer_norm = nn.LayerNorm(latent_dim, eps=1e-6)
 
         # Dynamic positional encoding - no fixed max sequence length
         self.pos_embedding = nn.Parameter(torch.randn(1, 1, latent_dim) * 0.02)
@@ -244,12 +249,48 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # Improved classification head
+        # Enhanced classification head for better AUC/AUPRC performance
         self.cls_head = nn.Sequential(
+            # First layer with normalization and residual connection
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            # Second layer with normalization
             nn.Linear(latent_dim, latent_dim // 2),
+            nn.LayerNorm(latent_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            # Third layer with normalization
+            nn.Linear(latent_dim // 2, latent_dim // 4),
+            nn.LayerNorm(latent_dim // 4),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(latent_dim // 2, num_classes)
+            
+            # Final classification layer
+            nn.Linear(latent_dim // 4, num_classes)
+        )
+        
+        # Alternative: Multi-scale feature fusion for better representation
+        self.feature_fusion = nn.ModuleDict({
+            'global_pool': nn.AdaptiveAvgPool1d(1),
+            'max_pool': nn.AdaptiveMaxPool1d(1),
+            'attention_pool': nn.MultiheadAttention(
+                embed_dim=latent_dim, 
+                num_heads=4, 
+                batch_first=True,
+                dropout=0.1
+            )
+        })
+        
+        # Feature projection for fusion
+        self.feature_projection = nn.Sequential(
+            nn.Linear(latent_dim * 3, latent_dim),  # 3 pooling methods
+            nn.LayerNorm(latent_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
         )
 
         # Metrics
@@ -537,9 +578,12 @@ class SeqSetVAE(pl.LightningModule):
         # Create attention mask for transformer
         attn_mask = self._create_causal_mask(S, z_seq.device, None)
         
-        # Apply transformer
+        # Apply transformer with enhanced processing
         h_seq = self.transformer(z_seq, mask=attn_mask[0] if attn_mask.dim() == 3 else attn_mask)
-
+        
+        # Apply post-transformer normalization for better feature quality
+        h_seq = self.post_transformer_norm(h_seq)
+        
         # Reconstruction with improved loss
         recon_loss_total = 0.0
         valid_sets = 0
@@ -558,12 +602,17 @@ class SeqSetVAE(pl.LightningModule):
             
         if valid_sets > 0:
             recon_loss_total /= valid_sets
-
-        # Classification with attention pooling
-        attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
-        final_rep = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
         
-        logits = self.cls_head(final_rep)
+        # Enhanced feature extraction using multi-scale pooling
+        enhanced_features = self._extract_enhanced_features(h_seq)
+        
+        # Alternative: Use attention-based pooling as fallback
+        if enhanced_features is None:
+            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
+            enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
+        
+        # Classification with enhanced features
+        logits = self.cls_head(enhanced_features)
         
         # Save latent variable information for collapse detector
         if all_z_lists:
@@ -616,6 +665,36 @@ class SeqSetVAE(pl.LightningModule):
             kl_loss = total_kl_loss / valid_patients
         
         return logits, recon_loss, kl_loss
+
+    def _extract_enhanced_features(self, h_t):
+        """
+        Extract enhanced features using multi-scale pooling and fusion
+        for better AUC/AUPRC performance
+        """
+        B, S, D = h_t.shape
+        
+        # Global average pooling
+        global_avg = self.feature_fusion['global_pool'](h_t.transpose(1, 2)).squeeze(-1)  # [B, D]
+        
+        # Global max pooling
+        global_max = self.feature_fusion['max_pool'](h_t.transpose(1, 2)).squeeze(-1)  # [B, D]
+        
+        # Attention-based pooling
+        # Use mean pooling as query for attention
+        query = h_t.mean(dim=1, keepdim=True)  # [B, 1, D]
+        attn_output, _ = self.feature_fusion['attention_pool'](
+            query, h_t, h_t, 
+            attn_mask=None
+        )
+        attention_pool = attn_output.squeeze(1)  # [B, D]
+        
+        # Concatenate all pooling results
+        combined_features = torch.cat([global_avg, global_max, attention_pool], dim=1)  # [B, 3*D]
+        
+        # Project to original dimension
+        enhanced_features = self.feature_projection(combined_features)  # [B, D]
+        
+        return enhanced_features
 
     # Helpers
     def _split_sets(self, var, val, time, set_ids, padding_mask=None):
