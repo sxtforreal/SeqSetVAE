@@ -996,7 +996,7 @@ class SeqSetVAE(pl.LightningModule):
         from torch.optim.lr_scheduler import ReduceLROnPlateau
         scheduler = ReduceLROnPlateau(
             optimizer, 
-            mode='max',  # Monitor validation AUC (higher is better)
+            mode='min',  # Monitor training loss (lower is better)
             factor=0.7,  # Reduce LR by 30% when plateau
             patience=200,  # Wait 200 steps before reducing LR
             verbose=True,
@@ -1007,8 +1007,8 @@ class SeqSetVAE(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
+                "interval": "epoch",  # Check every epoch instead of every step
                 "frequency": 1,
-                "monitor": "val_auc",  # Monitor AUC for scheduling
+                "monitor": "val_loss",  # Monitor validation loss for scheduling
             },
         }
