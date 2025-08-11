@@ -161,6 +161,9 @@ def main():
     parser.add_argument("--compile_model", action="store_true", help="Enable model compilation")
     parser.add_argument("--auc_mode", action="store_true", help="Enable AUC/AUPRC optimization mode")
     parser.add_argument("--enhanced_mode", action="store_true", help="Enable enhanced model architecture mode")
+    parser.add_argument("--data_dir", type=str, default="/home/sunx/data/aiiih/data/mimic/processed/patient_ehr", help="Data directory path")
+    parser.add_argument("--params_map_path", type=str, default="/home/sunx/data/aiiih/data/mimic/processed/stats.csv", help="Parameter mapping file path")
+    parser.add_argument("--label_path", type=str, default="/home/sunx/data/aiiih/data/mimic/processed/oc.csv", help="Label file path")
     
     args = parser.parse_args()
     
@@ -189,7 +192,12 @@ def main():
     # Set up data module
     print("📊 Setting up data module...")
     data_module = SeqSetVAEDataModule(
+        saved_dir=args.data_dir,
+        params_map_path=args.params_map_path,
+        label_path=args.label_path,
         batch_size=args.batch_size,
+        max_sequence_length=None,  # No limit on sequence length
+        use_dynamic_padding=True,  # Enable dynamic padding
         num_workers=adaptive_config['num_workers'],
         pin_memory=adaptive_config['pin_memory'],
     )
