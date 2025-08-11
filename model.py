@@ -778,12 +778,15 @@ class SeqSetVAE(pl.LightningModule):
         else:
             pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
         
-        # Dynamic weight adjustment
+        # Optimized weight strategy for better AUC/AUPRC
         if stage == "train":
-            # Focus more on reconstruction early in training, more on classification later
-            recon_weight = max(0.5, 1.0 - self.current_step / 10000)
-            pred_weight = min(self.w, self.current_step / 5000)
+            # More stable weight strategy: focus on classification throughout training
+            # Start with balanced weights, gradually increase classification focus
+            progress = min(1.0, self.current_step / 5000)
+            recon_weight = 0.8 * (1.0 - progress) + 0.3 * progress  # Decrease from 0.8 to 0.3
+            pred_weight = self.w * (0.5 + 0.5 * progress)  # Increase from 0.5*w to w
         else:
+            # Validation: use balanced weights for evaluation
             recon_weight = 0.5
             pred_weight = self.w
             
@@ -899,7 +902,7 @@ class SeqSetVAE(pl.LightningModule):
         
         # Use smaller learning rate for pretrained SetVAE
         param_groups = [
-            {'params': setvae_params, 'lr': self.lr * 0.1, 'name': 'setvae'},
+            {'params': setvae_params, 'lr': self.lr * 0.05, 'name': 'setvae'},  # Reduced from 0.1
             {'params': transformer_params, 'lr': self.lr, 'name': 'transformer'},
             {'params': other_params, 'lr': self.lr, 'name': 'others'}
         ]
@@ -909,16 +912,18 @@ class SeqSetVAE(pl.LightningModule):
             lr=self.lr,
             betas=(0.9, 0.999),
             eps=1e-8,
-            weight_decay=0.01,  # Add weight decay
+            weight_decay=0.02,  # Increased weight decay for better regularization
         )
         
-        # Improved learning rate scheduler
-        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-        scheduler = CosineAnnealingWarmRestarts(
+        # Improved learning rate scheduler for better AUC/AUPRC
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+        scheduler = ReduceLROnPlateau(
             optimizer, 
-            T_0=1000,  # Steps for first restart
-            T_mult=2,  # Multiplication factor for restart intervals
-            eta_min=self.lr * 0.01  # Minimum learning rate
+            mode='max',  # Monitor validation AUC (higher is better)
+            factor=0.7,  # Reduce LR by 30% when plateau
+            patience=200,  # Wait 200 steps before reducing LR
+            verbose=True,
+            min_lr=self.lr * 0.001  # Minimum learning rate
         )
         
         return {
@@ -927,6 +932,6 @@ class SeqSetVAE(pl.LightningModule):
                 "scheduler": scheduler,
                 "interval": "step",
                 "frequency": 1,
-                "monitor": "val_auc",
+                "monitor": "val_auc",  # Monitor AUC for scheduling
             },
         }
