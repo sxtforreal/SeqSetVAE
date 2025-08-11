@@ -501,6 +501,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         batch_size: int = 1,
         max_sequence_length: int = None,  # New: Maximum sequence length limit
         use_dynamic_padding: bool = True,  # New: Whether to use dynamic padding
+        num_workers: int = 4,  # Number of data loader workers
+        pin_memory: bool = True,  # Whether to use pin memory
     ):
         super().__init__()
         self.saved_dir = saved_dir
@@ -509,6 +511,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.max_sequence_length = max_sequence_length
         self.use_dynamic_padding = use_dynamic_padding
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
 
         # Load pre-computed embeddings for medical variables
         cached = pd.read_csv(os.path.join(saved_dir, "../cached.csv"))
@@ -567,8 +571,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             collate_fn = lambda batch: self._dynamic_collate_fn(batch)
         
         # Optimized worker count based on batch size and system capabilities
-        num_workers = getattr(self, 'num_workers', 4 if self.batch_size > 1 else 2)
-        pin_memory = getattr(self, 'pin_memory', True)
+        num_workers = self.num_workers
+        pin_memory = self.pin_memory
         
         return DataLoader(
             ds,
