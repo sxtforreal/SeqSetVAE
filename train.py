@@ -121,7 +121,7 @@ def setup_metrics_monitor(args, experiment_output_dir, auc_mode=False):
         verbose = False
     
     monitor = PosteriorMetricsMonitor(
-        experiment_output_dir=experiment_output_dir,
+        log_dir=experiment_output_dir,
         update_frequency=update_frequency,
         plot_frequency=plot_frequency,
         window_size=window_size,
