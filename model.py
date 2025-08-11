@@ -221,8 +221,6 @@ class SeqSetVAE(pl.LightningModule):
             activation='gelu',  # Use GELU activation function
             batch_first=True,
             norm_first=True,  # Pre-norm for better training stability
-            # Additional improvements
-            norm_eps=1e-6,  # Smaller epsilon for better numerical stability
         )
         self.transformer = TransformerEncoder(enc_layer, num_layers=transformer_layers)
         
