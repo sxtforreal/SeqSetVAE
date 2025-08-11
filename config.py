@@ -131,17 +131,15 @@ transformer_layers = 2  # Number of transformer encoder layers
 pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/checkpoints/best_SetVAE.ckpt"
 
 # Loss Function Weights
-w = 1.0  # Classification loss weight (increased from 0.5 to emphasize classification)
-free_bits = 0.1  # Free bits for KL divergence (reduced from 0.2 to prevent collapse)
+w = 2.0  # Classification loss weight (increased from 1.0 to emphasize classification)
+free_bits = 0.05  # Free bits for KL divergence (reduced from 0.1 to prevent collapse)
 
 # Training Regularization and Optimization
 warmup_beta = True  # Enable beta warmup for KL annealing
-max_beta = 0.1  # Maximum value of beta during warmup
-beta_warmup_steps = 5000  # Number of steps for beta warmup
+max_beta = 0.05  # Maximum value of beta during warmup (reduced from 0.1)
+beta_warmup_steps = 8000  # Number of steps for beta warmup (increased from 5000)
 kl_annealing = True  # Enable KL annealing schedule
-gradient_clip_val = (
-    0.5  # Gradient clipping value (reduced to prevent exploding gradients)
-)
+gradient_clip_val = 0.3  # Gradient clipping value (reduced from 0.5 to prevent exploding gradients)
 
 # Logging Configuration
 name = "SeqSetVAE-v3"  # Experiment name for logging
@@ -157,5 +155,5 @@ precision = "16-mixed"  # Mixed precision training (16-bit float + 32-bit float)
 # Focal Loss Hyperparameters
 use_focal_loss = True
 # alpha for positive class in binary classification (set None to disable balancing)
-focal_alpha = 0.25
-focal_gamma = 2.0
+focal_alpha = 0.3  # Increased from 0.25 to better handle class imbalance
+focal_gamma = 2.5  # Increased from 2.0 for better focus on hard examples
