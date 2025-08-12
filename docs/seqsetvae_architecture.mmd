@@ -1,0 +1,62 @@
+flowchart TD
+  subgraph Data[Data Pipeline]
+    A1[Patient parquet\n(events with variable, value, minute, set_index)]
+    A2[cached.csv -> variable embedding]
+    A3[stats.csv -> value z-score]
+    A4[oc.csv -> label]
+    A1 -->|load| B1[SeqSetVAEDataModule]
+    B1 -->|dynamic_collate_fn| B2[var: [B,N,D]]
+    B1 --> B3[val: [B,N,1]]
+    B1 --> B4[minute: [B,N,1]]
+    B1 --> B5[set_id: [B,N,1]]
+    B1 --> B6[label: [B]]
+    B1 --> B7[padding_mask: [B,N]]
+  end
+
+  subgraph PerSet[Per-timestep Set Encoder (SetVAE)]
+    direction LR
+    C1[DimReducer (optional)\nLinear(input_dim->reduced_dim)]
+    C2[Normalize direction\n x = normalize(var_reduced) * val]
+    C3[Embed Linear+LayerNorm+GELU]
+    C4[Encoder Layers x L: ISAB -> agg(mean) -> mu,logvar -> rsample z]
+    C5[Decoder Layers x L: Attentive Bottleneck -> PMA]
+    C6[Recon head Linear -> recon set]
+  end
+
+  subgraph Time[Temporal Fusion]
+    direction LR
+    D1[Stack z_sample over sets -> z_seq [B,S,D]]
+    D2[PE: learned pos_embedding ⊗ sin(idx) + time_encoder(minute)]
+    D3[LayerNorm]
+    D4[TransformerEncoder L layers\n(nhead, ff_dim, dropout, norm_first)]
+    D5[Post-Transformer LayerNorm]
+  end
+
+  subgraph Heads[Heads]
+    direction LR
+    E1[Decoder(_SetDecoder) per t\nfrom h_t -> recon_t]
+    E2[Multi-scale pooling on h_seq\n- AdaptiveAvgPool1d\n- AdaptiveMaxPool1d\n- MHA attention pooling]
+    E3[Concat -> Linear+LN+ReLU+Dropout -> features]
+    E4[Classifier MLP 3 layers -> logits]
+  end
+
+  subgraph Losses[Losses]
+    F1[Recon: Chamfer(dir+mag+vec) + var_term]
+    F2[KL: sum over SetVAE layers\nfree-bits + var/mean reg]
+    F3[Pred: CE or FocalLoss]
+    F4[Beta warmup, dynamic weights]
+  end
+
+  B2 --> C1
+  C1 --> C2 --> C3 --> C4 -->|z_list[-1].z_sample| D1
+  C4 -->|mu,logvar| F2
+  C4 --> C5 --> C6 -->|recon_set| F1
+
+  D1 --> D2 --> D3 --> D4 --> D5 -->|h_seq| E2 --> E3 --> E4
+  D5 -->|h_t| E1 --> F1
+
+  E4 -->|logits| F3
+  F1 -.->|avg over t| G[Total Loss]
+  F2 -.-> G
+  F3 -.-> G
+  F4 -.-> G
