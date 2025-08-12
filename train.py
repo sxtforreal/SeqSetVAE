@@ -155,8 +155,24 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training")
+    # Output root directory
+    parser.add_argument(
+        "--output_root_dir",
+        type=str,
+        default="/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs",
+        help="Root directory to save logs, checkpoints, and outputs"
+    )
     
     args = parser.parse_args()
+    
+    # Normalize and prepare output directories
+    base_output_dir = args.output_root_dir.rstrip("/")
+    checkpoints_root_dir = os.path.join(base_output_dir, "checkpoints")
+    outputs_root_dir = base_output_dir
+    logs_root_dir = os.path.join(base_output_dir, "logs")
+    os.makedirs(checkpoints_root_dir, exist_ok=True)
+    os.makedirs(outputs_root_dir, exist_ok=True)
+    os.makedirs(logs_root_dir, exist_ok=True)
     
     # Set random seed for reproducibility
     if args.seed is not None:
@@ -341,7 +357,7 @@ def main():
     
     # Model checkpoint callback
     checkpoint_callback = ModelCheckpoint(
-        dirpath=f"checkpoints/{checkpoint_name}",
+        dirpath=os.path.join(checkpoints_root_dir, checkpoint_name),
         filename=f"{checkpoint_name}_batch{args.batch_size}",
         save_top_k=save_top_k,
         monitor=monitor_metric,
@@ -366,14 +382,14 @@ def main():
     callbacks.append(lr_monitor)
     
     # Set up posterior metrics monitor
-    experiment_output_dir = f"outputs/{checkpoint_name}"
+    experiment_output_dir = os.path.join(outputs_root_dir, checkpoint_name)
     monitor = setup_metrics_monitor(args, experiment_output_dir, auc_mode=args.auc_mode)
     callbacks.append(monitor)
     
     # Set up logger
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = TensorBoardLogger(
-        save_dir="logs",
+        save_dir=logs_root_dir,
         name=checkpoint_name,
         version=f"batch{args.batch_size}_{timestamp}",
         log_graph=True,
@@ -402,6 +418,7 @@ def main():
         enable_model_summary=True,
         enable_checkpointing=True,
         use_distributed_sampler=True if args.devices > 1 else False,
+        default_root_dir=base_output_dir,
     )
     
     # Compile model if requested and supported
@@ -448,7 +465,7 @@ def main():
         print(f"❌ Error occurred during training: {e}")
         
         # Save error model
-        error_checkpoint_path = f"checkpoints/{checkpoint_name}/error_{checkpoint_name}_batch{args.batch_size}.ckpt"
+        error_checkpoint_path = os.path.join(checkpoints_root_dir, checkpoint_name, f"error_{checkpoint_name}_batch{args.batch_size}.ckpt")
         os.makedirs(os.path.dirname(error_checkpoint_path), exist_ok=True)
         trainer.save_checkpoint(error_checkpoint_path)
         print(f"💾 Error model saved: {error_checkpoint_path}")
