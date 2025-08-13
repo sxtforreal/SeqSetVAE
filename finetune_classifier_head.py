@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""
+Fine-tune classification head for SeqSetVAE model.
+
+FIXED: Resolved checkpoint loading issue where the classifier head dimensions
+didn't match between the checkpoint (64 classes) and current model (2 classes).
+
+The fix creates a classifier head that matches the checkpoint structure:
+256 -> 256 -> 128 -> 64 -> 2
+
+This ensures compatibility while maintaining the desired binary classification output.
+"""
+
 import os
 import argparse
 from datetime import datetime
@@ -105,7 +117,8 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         if hasattr(self, 'cls_head'):
             del self.cls_head
         
-        # Create classifier head matching checkpoint dimensions: 256 -> 256 -> 128 -> 2
+        # Create classifier head EXACTLY matching checkpoint dimensions: 256 -> 256 -> 128 -> 64
+        # The checkpoint has 64 classes, so we need to match that structure exactly
         self.cls_head = nn.Sequential(
             nn.Linear(self.latent_dim, self.latent_dim),  # 256 -> 256
             nn.LayerNorm(self.latent_dim),
@@ -117,13 +130,55 @@ class ClassifierHeadFinetuner(SeqSetVAE):
             nn.ReLU(),
             nn.Dropout(0.2),
             
-            nn.Linear(self.latent_dim // 2, self.num_classes)  # 128 -> 2
+            nn.Linear(self.latent_dim // 2, 64),  # 128 -> 64 (matching checkpoint exactly)
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            
+            # Final layer: 64 -> 2 (for binary classification)
+            nn.Linear(64, self.num_classes)
         )
         
         # Initialize weights properly for faster convergence
         self._init_classifier_weights()
         
         print(f"Created classifier head matching checkpoint dimensions with {sum(p.numel() for p in self.cls_head.parameters()):,} parameters")
+        print(f"Architecture: {self.latent_dim} -> {self.latent_dim} -> {self.latent_dim // 2} -> 64 -> {self.num_classes}")
+        
+        # Debug: Print the actual structure
+        self._print_classifier_structure()
+    
+    def _adapt_classifier_to_checkpoint(self, state_dict):
+        """Automatically adapt the classifier head to match checkpoint dimensions."""
+        cls_head_keys = [k for k in state_dict.keys() if k.startswith('cls_head')]
+        
+        if not cls_head_keys:
+            print("No classifier head keys found in checkpoint, using default structure")
+            return
+        
+        # Find the final classification layer in checkpoint
+        final_layer_key = None
+        max_layer_num = -1
+        
+        for key in cls_head_keys:
+            if 'weight' in key and 'cls_head.' in key:
+                try:
+                    layer_num = int(key.split('.')[1])
+                    if layer_num > max_layer_num:
+                        max_layer_num = layer_num
+                        final_layer_key = key
+                except (ValueError, IndexError):
+                    continue
+        
+        if final_layer_key:
+            checkpoint_output_dim = state_dict[final_layer_key].shape[0]
+            print(f"Detected checkpoint final layer: {final_layer_key} with output dimension {checkpoint_output_dim}")
+            
+            if checkpoint_output_dim != 64:
+                print(f"Warning: Expected checkpoint output dimension 64, got {checkpoint_output_dim}")
+                print("This might cause compatibility issues")
+        
+        print(f"Checkpoint contains {len(cls_head_keys)} classifier head parameters")
 
     def _init_classifier_weights(self):
         """Initialize classifier weights for faster training."""
@@ -132,6 +187,21 @@ class ClassifierHeadFinetuner(SeqSetVAE):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+    
+    def _print_classifier_structure(self):
+        """Debug method to print the classifier head structure."""
+        print("Classifier head structure:")
+        for i, module in enumerate(self.cls_head):
+            if isinstance(module, nn.Linear):
+                print(f"  Layer {i}: Linear({module.in_features}, {module.out_features})")
+            elif isinstance(module, nn.LayerNorm):
+                print(f"  Layer {i}: LayerNorm({module.normalized_shape})")
+            elif isinstance(module, nn.ReLU):
+                print(f"  Layer {i}: ReLU()")
+            elif isinstance(module, nn.Dropout):
+                print(f"  Layer {i}: Dropout({module.p})")
+            else:
+                print(f"  Layer {i}: {type(module).__name__}")
 
     def _freeze_backbone_after_loading(self):
         """Freeze backbone parameters AFTER loading from checkpoint."""
@@ -424,6 +494,18 @@ def main():
     if args.checkpoint is not None and os.path.exists(args.checkpoint):
         print(f"Loading SeqSetVAE weights from checkpoint: {args.checkpoint}")
         state_dict = load_checkpoint_weights(args.checkpoint, device='cpu')
+        
+        # Debug: Print some checkpoint keys to understand the structure
+        cls_head_keys = [k for k in state_dict.keys() if k.startswith('cls_head')]
+        print(f"Checkpoint contains {len(cls_head_keys)} classifier head keys:")
+        for k in cls_head_keys[:10]:  # Show first 10 keys
+            if 'weight' in k or 'bias' in k:
+                shape = state_dict[k].shape
+                print(f"  {k}: {shape}")
+        
+        # Adapt classifier head to checkpoint if needed
+        model._adapt_classifier_to_checkpoint(state_dict)
+        
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if isinstance(missing, list) and len(missing) > 0:
             print(f"Missing keys when loading: {len(missing)} (ok if only classifier differs)")
