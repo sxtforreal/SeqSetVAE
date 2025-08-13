@@ -2,7 +2,7 @@
 import os
 import argparse
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -57,6 +57,20 @@ def build_weighted_sampler(train_dataset, label_map):
     return sampler, pos_count, neg_count
 
 
+def compute_class_counts(train_dataset, label_map):
+    """Compute positive and negative counts without building a sampler."""
+    labels: List[int] = []
+    for pid_str in train_dataset.patient_ids:
+        try:
+            pid = int(float(pid_str))
+        except Exception:
+            pid = int(pid_str)
+        labels.append(int(label_map.get(pid, 0)))
+    pos_count = sum(1 for y in labels if y == 1)
+    neg_count = len(labels) - pos_count
+    return max(1, pos_count), max(1, neg_count)
+
+
 class ClassifierHeadFinetuner(SeqSetVAE):
     """Fine-tune only the classification head of SeqSetVAE.
 
@@ -65,7 +79,7 @@ class ClassifierHeadFinetuner(SeqSetVAE):
     - Uses focal loss with alpha derived from class imbalance
     """
 
-    def __init__(self, *args, head_lr: float = 1e-3, class_weights=None, focal_alpha: float | None = None, focal_gamma: float = 2.5, **kwargs):
+    def __init__(self, *args, head_lr: float = 1e-3, class_weights=None, focal_alpha: Optional[float] = None, focal_gamma: float = 2.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.head_lr = head_lr
         self.class_weights = class_weights  # Tensor of size [C] for CE if used
@@ -106,13 +120,88 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         # Ensure modules stay frozen at the start of training
         self._freeze_backbone()
 
+    # Lightweight classification-only forward: skip reconstruction and KL; run frozen backbone in inference_mode
+    def forward(self, batch):
+        var, val, time, set_ids = (
+            batch["var"],
+            batch["val"],
+            batch["minute"],
+            batch["set_id"],
+        )
+        padding_mask = batch.get("padding_mask", None)
+
+        # Split into per-patient sets using parent's utility
+        all_patient_sets = self._split_sets(var, val, time, set_ids, padding_mask)
+
+        all_logits = []
+        valid_patients = 0
+
+        for patient_sets in all_patient_sets:
+            if len(patient_sets) == 0:
+                continue
+
+            S = len(patient_sets)
+            z_prims = []
+            pos_list = []
+
+            # Compute frozen backbone features without building autograd graph
+            with torch.inference_mode():
+                for s_dict in patient_sets:
+                    var_t = s_dict["var"]
+                    val_t = s_dict["val"]
+                    time_t = s_dict["minute"]
+
+                    assert time_t.unique().numel() == 1, "Time is not constant in this set"
+                    minute_val = time_t.unique().float()
+                    pos_list.append(minute_val)
+
+                    if self.setvae.setvae.dim_reducer is not None:
+                        reduced = self.setvae.setvae.dim_reducer(var_t)
+                    else:
+                        reduced = var_t
+
+                    norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+                    reduced_normalized = reduced / (norms + 1e-8)
+                    x = reduced_normalized * val_t
+
+                    z_list, _ = self.setvae.setvae.encode(x)
+                    z_sample, mu, logvar = z_list[-1]
+                    z_prims.append(z_sample.squeeze(1))
+
+                z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
+                pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
+
+                # Positional/time encoding and transformer (frozen)
+                z_seq = self._apply_positional_encoding(z_seq, pos_tensor, None)
+                z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
+
+                attn_mask = self._create_causal_mask(S, z_seq.device, None)
+                h_seq = self.transformer(z_seq, mask=attn_mask[0] if attn_mask.dim() == 3 else attn_mask)
+                h_seq = self.post_transformer_norm(h_seq)
+
+                enhanced_features = self._extract_enhanced_features(h_seq)
+                if enhanced_features is None:
+                    attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
+                    enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
+
+            # Classification head computes with gradients
+            logits = self.cls_head(enhanced_features)
+            all_logits.append(logits)
+            valid_patients += 1
+
+        if valid_patients == 0:
+            batch_size = var.size(0)
+            device = var.device
+            return torch.zeros(batch_size, self.num_classes, device=device)
+
+        return torch.cat(all_logits, dim=0)
+
     def training_step(self, batch, batch_idx):
-        # Only classification loss for head fine-tuning
-        logits, _, _ = self.forward(batch)
+        # Classification-only forward for head fine-tuning
+        logits = self.forward(batch)
         labels = batch["label"]
 
         if getattr(config, 'use_focal_loss', True):
-            # Focal loss with alpha derived from imbalance
             from losses import FocalLoss
             alpha = self.focal_alpha if self.focal_alpha is not None else getattr(config, 'focal_alpha', 0.35)
             focal = FocalLoss(alpha=alpha, gamma=self.focal_gamma, reduction="mean")
@@ -125,7 +214,7 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        logits, _, _ = self.forward(batch)
+        logits = self.forward(batch)
         labels = batch["label"]
 
         if getattr(config, 'use_focal_loss', True):
@@ -200,8 +289,8 @@ def main():
     )
     data_module.setup()
 
-    # Build weighted sampler for training (class imbalance handling)
-    sampler, pos_count, neg_count = build_weighted_sampler(data_module.train_dataset, data_module.label_map)
+    # Report class distribution (still used to derive focal alpha)
+    pos_count, neg_count = compute_class_counts(data_module.train_dataset, data_module.label_map)
     total = pos_count + neg_count
     pos_ratio = pos_count / total
     print(f"Class distribution (train): pos={pos_count}, neg={neg_count} (pos_ratio={pos_ratio:.4f})")
@@ -212,11 +301,11 @@ def main():
     else:
         collate_fn = lambda batch: data_module._dynamic_collate_fn(batch)  # noqa: E731
 
-    # Custom loaders: use sampler for training, standard for val/test
+    # Training loader: simplified to standard random shuffling
     train_loader = DataLoader(
         data_module.train_dataset,
         batch_size=args.batch_size,
-        sampler=sampler,
+        shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
@@ -305,7 +394,7 @@ def main():
         callbacks=callbacks,
         logger=logger,
         gradient_clip_val=0.1,
-        val_check_interval=0.15,
+        val_check_interval=0.2,
         log_every_n_steps=50,
         enable_progress_bar=True,
         enable_checkpointing=True,
