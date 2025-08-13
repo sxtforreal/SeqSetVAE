@@ -77,6 +77,7 @@ class ClassifierHeadFinetuner(SeqSetVAE):
     - Freezes encoder (SetVAE), transformer, decoder, and pooling/projection modules
     - Optimizes only `cls_head` parameters
     - Uses focal loss with alpha derived from class imbalance
+    - Creates classifier head matching checkpoint dimensions for compatibility
     """
 
     def __init__(self, *args, head_lr: float = 5e-4, class_weights=None, focal_alpha: Optional[float] = None, focal_gamma: float = 2.5, **kwargs):
@@ -99,24 +100,30 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         # Freezing will be done after checkpoint loading in on_train_start()
 
     def _create_lightweight_classifier(self):
-        """Create a lightweight 2-layer classifier head for speed."""
+        """Create a classifier head that matches the checkpoint dimensions."""
         # Remove existing classifier head if any
         if hasattr(self, 'cls_head'):
             del self.cls_head
         
-        # Create lightweight 2-layer classifier: 256 -> 128 -> 2
+        # Create classifier head matching checkpoint dimensions: 256 -> 256 -> 128 -> 2
         self.cls_head = nn.Sequential(
+            nn.Linear(self.latent_dim, self.latent_dim),  # 256 -> 256
+            nn.LayerNorm(self.latent_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
             nn.Linear(self.latent_dim, self.latent_dim // 2),  # 256 -> 128
-            nn.BatchNorm1d(self.latent_dim // 2),  # Use BatchNorm for stability
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
+            nn.LayerNorm(self.latent_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
             nn.Linear(self.latent_dim // 2, self.num_classes)  # 128 -> 2
         )
         
         # Initialize weights properly for faster convergence
         self._init_classifier_weights()
         
-        print(f"Created lightweight classifier head with {sum(p.numel() for p in self.cls_head.parameters()):,} parameters")
+        print(f"Created classifier head matching checkpoint dimensions with {sum(p.numel() for p in self.cls_head.parameters()):,} parameters")
 
     def _init_classifier_weights(self):
         """Initialize classifier weights for faster training."""
@@ -485,7 +492,7 @@ def main():
 
     print(f"Starting optimized classifier-head finetuning...")
     print(f"Backbone: Will be loaded from checkpoint and frozen")
-    print(f"Classifier: Lightweight 2-layer network for speed")
+    print(f"Classifier: 3-layer network matching checkpoint dimensions")
     print(f"Head learning rate: {args.head_lr}")
     print(f"Batch size: {args.batch_size} (optimized for speed)")
     print(f"Workers: {args.num_workers} (optimized for speed)")
