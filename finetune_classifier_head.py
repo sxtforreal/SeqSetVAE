@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
@@ -79,12 +79,15 @@ class ClassifierHeadFinetuner(SeqSetVAE):
     - Uses focal loss with alpha derived from class imbalance
     """
 
-    def __init__(self, *args, head_lr: float = 1e-3, class_weights=None, focal_alpha: Optional[float] = None, focal_gamma: float = 2.5, **kwargs):
+    def __init__(self, *args, head_lr: float = 5e-4, class_weights=None, focal_alpha: Optional[float] = None, focal_gamma: float = 2.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.head_lr = head_lr
         self.class_weights = class_weights  # Tensor of size [C] for CE if used
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
+
+        # Create lightweight classifier head for speed
+        self._create_lightweight_classifier()
 
         # Metrics
         task_type = "binary" if config.num_classes == 2 else "multiclass"
@@ -92,17 +95,50 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         self.val_auprc = AveragePrecision(task=task_type, num_classes=config.num_classes)
         self.val_acc = Accuracy(task=task_type, num_classes=config.num_classes)
 
-        # Freeze everything except cls_head immediately
-        self._freeze_backbone()
+        # IMPORTANT: Do NOT freeze parameters here - we'll load from checkpoint first
+        # Freezing will be done after checkpoint loading in on_train_start()
 
-    def _freeze_backbone(self):
-        # Freeze all parameters
+    def _create_lightweight_classifier(self):
+        """Create a lightweight 2-layer classifier head for speed."""
+        # Remove existing classifier head if any
+        if hasattr(self, 'cls_head'):
+            del self.cls_head
+        
+        # Create lightweight 2-layer classifier: 256 -> 128 -> 2
+        self.cls_head = nn.Sequential(
+            nn.Linear(self.latent_dim, self.latent_dim // 2),  # 256 -> 128
+            nn.BatchNorm1d(self.latent_dim // 2),  # Use BatchNorm for stability
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(self.latent_dim // 2, self.num_classes)  # 128 -> 2
+        )
+        
+        # Initialize weights properly for faster convergence
+        self._init_classifier_weights()
+        
+        print(f"Created lightweight classifier head with {sum(p.numel() for p in self.cls_head.parameters()):,} parameters")
+
+    def _init_classifier_weights(self):
+        """Initialize classifier weights for faster training."""
+        for module in self.cls_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def _freeze_backbone_after_loading(self):
+        """Freeze backbone parameters AFTER loading from checkpoint."""
+        print("Freezing backbone parameters...")
+        
+        # Freeze all parameters first
         for p in self.parameters():
             p.requires_grad = False
-        # Unfreeze only classification head
+        
+        # Unfreeze only classifier head parameters
         for p in self.cls_head.parameters():
             p.requires_grad = True
-        # Put frozen modules in eval mode to disable dropout etc.
+        
+        # Put frozen modules in eval mode for speed
         if hasattr(self, 'setvae'):
             self.setvae.eval()
         if hasattr(self, 'transformer'):
@@ -115,10 +151,12 @@ class ClassifierHeadFinetuner(SeqSetVAE):
             self.feature_projection.eval()
         if hasattr(self, 'post_transformer_norm'):
             self.post_transformer_norm.eval()
+        
+        print("Backbone parameters frozen. Only classifier head will be trained.")
 
     def on_train_start(self):
-        # Ensure modules stay frozen at the start of training
-        self._freeze_backbone()
+        # Ensure backbone is frozen after checkpoint loading
+        self._freeze_backbone_after_loading()
 
     # Lightweight classification-only forward: skip reconstruction and KL; run frozen backbone in inference_mode
     def forward(self, batch):
@@ -179,10 +217,8 @@ class ClassifierHeadFinetuner(SeqSetVAE):
                 h_seq = self.transformer(z_seq, mask=attn_mask[0] if attn_mask.dim() == 3 else attn_mask)
                 h_seq = self.post_transformer_norm(h_seq)
 
-                enhanced_features = self._extract_enhanced_features(h_seq)
-                if enhanced_features is None:
-                    attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
-                    enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
+                # Use simplified feature extraction for speed
+                enhanced_features = self._extract_features_fast(h_seq)
 
             # Classification head computes with gradients
             logits = self.cls_head(enhanced_features)
@@ -195,6 +231,22 @@ class ClassifierHeadFinetuner(SeqSetVAE):
             return torch.zeros(batch_size, self.num_classes, device=device)
 
         return torch.cat(all_logits, dim=0)
+
+    def _extract_features_fast(self, h_seq):
+        """Fast feature extraction using simple attention pooling."""
+        B, S, D = h_seq.shape
+        
+        # Simple attention mechanism for speed
+        # Use mean pooling as query for attention
+        query = h_seq.mean(dim=1, keepdim=True)  # [B, 1, D]
+        
+        # Compute attention weights efficiently
+        attention_weights = F.softmax(torch.sum(h_seq * query, dim=-1), dim=1)  # [B, S]
+        
+        # Weighted average pooling
+        pooled_features = torch.sum(h_seq * attention_weights.unsqueeze(-1), dim=1)  # [B, D]
+        
+        return pooled_features
 
     def training_step(self, batch, batch_idx):
         # Classification-only forward for head fine-tuning
@@ -247,11 +299,25 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         self.val_auc.reset(); self.val_auprc.reset(); self.val_acc.reset()
 
     def configure_optimizers(self):
-        optimizer = AdamW(self.cls_head.parameters(), lr=self.head_lr, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
-        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.6, patience=5, verbose=True, min_lr=self.head_lr * 1e-3)
+        # Configure optimizer for fast training
+        optimizer = AdamW(
+            self.cls_head.parameters(),
+            lr=self.head_lr, 
+            weight_decay=0.001,  # Light weight decay for speed
+            betas=(0.9, 0.999), 
+            eps=1e-8
+        )
+        
+        # Use cosine annealing scheduler for faster convergence
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=getattr(config, 'max_epochs', 50),
+            eta_min=self.head_lr * 1e-3
+        )
+        
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_auc", "interval": "epoch"},
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
         }
 
 
@@ -262,12 +328,12 @@ def main():
     parser.add_argument("--data_dir", type=str, default=config.saved_dir if hasattr(config, 'saved_dir') else "/home/sunx/data/aiiih/data/mimic/processed/patient_ehr")
     parser.add_argument("--params_map_path", type=str, default=config.params_map_path if hasattr(config, 'params_map_path') else "/home/sunx/data/aiiih/data/mimic/processed/stats.csv")
     parser.add_argument("--label_path", type=str, default=config.label_path if hasattr(config, 'label_path') else "/home/sunx/data/aiiih/data/mimic/processed/oc.csv")
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=16)  # Increased for speed
+    parser.add_argument("--num_workers", type=int, default=8)  # Increased for speed
 
     # Model / training
     parser.add_argument("--checkpoint", type=str, default=None, help="Optional checkpoint to initialize the whole SeqSetVAE (Lightning ckpt or state_dict)")
-    parser.add_argument("--head_lr", type=float, default=1e-3, help="Learning rate for classification head")
+    parser.add_argument("--head_lr", type=float, default=5e-4, help="Learning rate for classification head")
     parser.add_argument("--max_epochs", type=int, default=30)
     parser.add_argument("--precision", type=str, default="16-mixed")
     parser.add_argument("--devices", type=int, default=None)
@@ -302,7 +368,7 @@ def main():
     else:
         collate_fn = lambda batch: data_module._dynamic_collate_fn(batch)  # noqa: E731
 
-    # Training loader: simplified to standard random shuffling
+    # Training loader: optimized for speed
     train_loader = DataLoader(
         data_module.train_dataset,
         batch_size=args.batch_size,
@@ -310,8 +376,9 @@ def main():
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
-        drop_last=False,
+        drop_last=True,  # Drop last batch for consistent training
         persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=2 if args.num_workers > 0 else None,  # Prefetch for speed
     )
     val_loader = data_module.val_dataloader()
 
@@ -379,7 +446,13 @@ def main():
     )
     callbacks.append(ckpt_cb)
 
-    early_stop = EarlyStopping(monitor="val_auc", mode="max", patience=8, min_delta=1e-4, verbose=True)
+    early_stop = EarlyStopping(
+        monitor="val_auc", 
+        mode="max", 
+        patience=getattr(config, 'early_stopping_patience', 10), 
+        min_delta=getattr(config, 'early_stopping_min_delta', 1e-4), 
+        verbose=True
+    )
     callbacks.append(early_stop)
 
     lr_mon = LearningRateMonitor(logging_interval="epoch")
@@ -399,14 +472,24 @@ def main():
         precision=args.precision,
         callbacks=callbacks,
         logger=logger,
-        gradient_clip_val=0.1,
-        val_check_interval=0.2,
-        log_every_n_steps=50,
+        gradient_clip_val=0.05,  # Reduced for speed
+        val_check_interval=0.5,  # Check validation less frequently for speed
+        log_every_n_steps=50,  # Log less frequently for speed
         enable_progress_bar=True,
         enable_checkpointing=True,
+        # Speed optimizations
+        accumulate_grad_batches=1,  # No gradient accumulation for speed
+        sync_batchnorm=False,  # Disable for speed
+        deterministic=False,  # Disable for speed
     )
 
-    print(f"Starting classifier-head finetuning with head_lr={args.head_lr}, focal_alpha={focal_alpha:.3f}")
+    print(f"Starting optimized classifier-head finetuning...")
+    print(f"Backbone: Will be loaded from checkpoint and frozen")
+    print(f"Classifier: Lightweight 2-layer network for speed")
+    print(f"Head learning rate: {args.head_lr}")
+    print(f"Batch size: {args.batch_size} (optimized for speed)")
+    print(f"Workers: {args.num_workers} (optimized for speed)")
+    print(f"Training will be faster with frozen backbone")
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 
