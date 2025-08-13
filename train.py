@@ -162,17 +162,26 @@ def main():
         default="/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs",
         help="Root directory to save logs, checkpoints, and outputs"
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Alias of --output_root_dir; if provided, overrides output_root_dir"
+    )
     
     args = parser.parse_args()
     
-    # Normalize and prepare output directories
-    base_output_dir = args.output_root_dir.rstrip("/")
-    checkpoints_root_dir = os.path.join(base_output_dir, "checkpoints")
-    outputs_root_dir = base_output_dir
-    logs_root_dir = os.path.join(base_output_dir, "logs")
+    # Normalize and prepare unified output directories: output_dir/config.model_name/{checkpoints,logs,analysis}
+    base_output_dir = (args.output_dir or args.output_root_dir).rstrip("/")
+    model_name = getattr(config, 'model_name', getattr(config, 'name', 'SeqSetVAE'))
+    experiment_root = os.path.join(base_output_dir, model_name)
+    checkpoints_root_dir = os.path.join(experiment_root, 'checkpoints')
+    logs_root_dir = os.path.join(experiment_root, 'logs')
+    analysis_root_dir = os.path.join(experiment_root, 'analysis')
     os.makedirs(checkpoints_root_dir, exist_ok=True)
-    os.makedirs(outputs_root_dir, exist_ok=True)
     os.makedirs(logs_root_dir, exist_ok=True)
+    os.makedirs(analysis_root_dir, exist_ok=True)
+    outputs_root_dir = experiment_root
     
     # Set random seed for reproducibility
     if args.seed is not None:
@@ -319,7 +328,7 @@ def main():
         ff_dim=model_ff_dim,
         transformer_heads=model_transformer_heads,
         transformer_layers=model_transformer_layers,
-        pretrained_ckpt=config.pretrained_ckpt,
+        pretrained_ckpt=None,
         w=model_w,
         free_bits=model_free_bits,
         warmup_beta=config.warmup_beta,
@@ -352,6 +361,11 @@ def main():
         checkpoint_name = "SeqSetVAE_optimized"
         mode_suffix = "_optimized"
     
+    # Ensure subdirectories exist at start
+    os.makedirs(os.path.join(checkpoints_root_dir, checkpoint_name), exist_ok=True)
+    os.makedirs(os.path.join(logs_root_dir, checkpoint_name), exist_ok=True)
+    os.makedirs(os.path.join(analysis_root_dir, checkpoint_name), exist_ok=True)
+
     # Set up callbacks
     callbacks = []
     
@@ -381,16 +395,16 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks.append(lr_monitor)
     
-    # Set up posterior metrics monitor
-    experiment_output_dir = os.path.join(outputs_root_dir, checkpoint_name)
+    # Set up posterior metrics monitor (write to analysis directory)
+    experiment_output_dir = os.path.join(analysis_root_dir, checkpoint_name)
     monitor = setup_metrics_monitor(args, experiment_output_dir, auc_mode=args.auc_mode)
     callbacks.append(monitor)
     
-    # Set up logger
+    # Set up logger (save under unified logs dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = TensorBoardLogger(
-        save_dir=logs_root_dir,
-        name=checkpoint_name,
+        save_dir=os.path.join(logs_root_dir, checkpoint_name),
+        name="",
         version=f"batch{args.batch_size}_{timestamp}",
         log_graph=True,
     )
@@ -418,7 +432,7 @@ def main():
         enable_model_summary=True,
         enable_checkpointing=True,
         use_distributed_sampler=True if args.devices > 1 else False,
-        default_root_dir=base_output_dir,
+        default_root_dir=experiment_root,
     )
     
     # Compile model if requested and supported
