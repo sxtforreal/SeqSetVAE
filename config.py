@@ -124,54 +124,42 @@ beta = 0.1  # KL divergence weight (reduced from 0.5 to prevent posterior collap
 lr = 1e-4  # Learning rate for optimizer
 num_classes = 2  # Number of output classes for classification (binary classification)
 
-# Enhanced model architecture parameters (for enhanced mode)
-ff_dim = 256  # Feed-forward network dimension in transformer
-transformer_heads = 2  # Number of attention heads in transformer encoder
-transformer_layers = 2  # Number of transformer encoder layers
-
-# Enhanced mode overrides (when --enhanced_mode is used)
-enhanced_ff_dim = 512  # Enhanced feed-forward network dimension
-enhanced_transformer_heads = 8  # Enhanced number of attention heads
-enhanced_transformer_layers = 4  # Enhanced number of transformer layers
-enhanced_cls_head_layers = [256, 128, 64]  # Enhanced classification head layers
-enhanced_cls_dropout = 0.2  # Enhanced classification dropout
-enhanced_transformer_dropout = 0.15  # Enhanced transformer dropout
-enhanced_post_norm = True  # Enable post-transformer normalization
-enhanced_feature_fusion = True  # Enable multi-scale feature fusion
+# Model architecture parameters (using enhanced mode by default)
+ff_dim = 512  # Feed-forward network dimension in transformer
+transformer_heads = 8  # Number of attention heads in transformer encoder
+transformer_layers = 4  # Number of transformer encoder layers
+cls_head_layers = [256, 128, 64]  # Classification head layers
+cls_dropout = 0.2  # Classification dropout
+transformer_dropout = 0.15  # Transformer dropout
+post_norm = True  # Enable post-transformer normalization
+feature_fusion = True  # Enable multi-scale feature fusion
 
 # Model Checkpoint and Pretrained Weights
 pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/checkpoints/best_SetVAE.ckpt"
 
 # Loss Function Weights
-w = 2.0  # Classification loss weight (increased from 1.0 to emphasize classification)
-free_bits = 0.05  # Free bits for KL divergence (reduced from 0.1 to prevent collapse)
-
-# Enhanced mode loss weights (when --enhanced_mode is used)
-enhanced_w = 3.0  # Enhanced classification loss weight
-enhanced_free_bits = 0.03  # Enhanced KL divergence weight
-enhanced_focal_alpha = 0.35  # Enhanced focal loss alpha
-enhanced_focal_gamma = 3.0  # Enhanced focal loss gamma
+w = 3.0  # Classification loss weight (enhanced)
+free_bits = 0.03  # Free bits for KL divergence (enhanced)
+focal_alpha = 0.35  # Focal loss alpha (enhanced)
+focal_gamma = 3.0  # Focal loss gamma (enhanced)
 
 # Training Regularization and Optimization
 warmup_beta = True  # Enable beta warmup for KL annealing
 max_beta = 0.05  # Maximum value of beta during warmup (reduced from 0.1)
 beta_warmup_steps = 8000  # Number of steps for beta warmup (increased from 5000)
 kl_annealing = True  # Enable KL annealing schedule
-gradient_clip_val = 0.3  # Gradient clipping value (reduced from 0.5 to prevent exploding gradients)
-
-# Enhanced mode training parameters
-enhanced_gradient_clip_val = 0.2  # Enhanced gradient clipping
-enhanced_weight_decay = 0.03  # Enhanced weight decay
-enhanced_lr = 5e-5  # Enhanced learning rate
-enhanced_scheduler_patience = 150  # Enhanced scheduler patience
-enhanced_scheduler_factor = 0.6  # Enhanced scheduler factor
-enhanced_scheduler_min_lr = 1e-6  # Enhanced scheduler min learning rate
-enhanced_early_stopping_patience = 8  # Enhanced early stopping patience
-enhanced_early_stopping_min_delta = 0.0005  # Enhanced early stopping min delta
-enhanced_val_check_interval = 0.15  # Enhanced validation interval
-enhanced_limit_val_batches = 0.6  # Enhanced validation batches
-enhanced_save_top_k = 5  # Enhanced checkpoint saving
-enhanced_monitor_metric = "val_auc"  # Enhanced monitoring metric
+lr = 5e-5  # Learning rate (enhanced)
+gradient_clip_val = 0.2  # Gradient clipping value (enhanced)
+weight_decay = 0.03  # Weight decay (enhanced)
+scheduler_patience = 150  # Scheduler patience (enhanced)
+scheduler_factor = 0.6  # Scheduler factor (enhanced)
+scheduler_min_lr = 1e-6  # Scheduler min learning rate (enhanced)
+early_stopping_patience = 8  # Early stopping patience (enhanced)
+early_stopping_min_delta = 0.0005  # Early stopping min delta (enhanced)
+val_check_interval = 0.15  # Validation interval (enhanced)
+limit_val_batches = 0.6  # Validation batches (enhanced)
+save_top_k = 5  # Checkpoint saving (enhanced)
+monitor_metric = "val_auc"  # Monitoring metric (enhanced)
 
 # Logging Configuration
 name = "SeqSetVAE-v3"  # Experiment/model name for unified output directories
@@ -188,5 +176,4 @@ precision = "16-mixed"  # Mixed precision training (16-bit float + 32-bit float)
 # Focal Loss Hyperparameters
 use_focal_loss = True
 # alpha for positive class in binary classification (set None to disable balancing)
-focal_alpha = 0.3  # Increased from 0.25 to better handle class imbalance
-focal_gamma = 2.5  # Increased from 2.0 for better focus on hard examples
+# focal_alpha and focal_gamma are already set above in Loss Function Weights section

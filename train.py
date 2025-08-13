@@ -209,12 +209,8 @@ def main():
     print(f" - Random seed: {args.seed}")
     print(f" - Deterministic: {args.deterministic}")
     
-    if args.enhanced_mode:
-        print("🚀 Enhanced model architecture mode enabled!")
-    elif args.auc_mode:
-        print("🎯 AUC/AUPRC optimization mode enabled!")
-    else:
-        print("📊 Standard training mode enabled!")
+    # All parameters now use enhanced values by default
+    print("🚀 Enhanced model architecture mode enabled by default!")
     
     # Get adaptive training configuration
     adaptive_config = get_adaptive_training_config(args)
@@ -232,88 +228,35 @@ def main():
         pin_memory=adaptive_config['pin_memory'],
     )
     
-    # Get configuration parameters
-    if args.enhanced_mode:
-        # Enhanced mode: use enhanced architecture and training config
-        model_w = config.enhanced_w
-        model_free_bits = config.enhanced_free_bits
-        model_max_beta = config.max_beta  # Keep from base config
-        model_beta_warmup_steps = config.beta_warmup_steps  # Keep from base config
-        model_gradient_clip_val = config.enhanced_gradient_clip_val
-        model_focal_alpha = config.enhanced_focal_alpha
-        model_focal_gamma = config.enhanced_focal_gamma
-        model_lr = config.enhanced_lr
-        model_weight_decay = config.enhanced_weight_decay
-        val_check_interval = config.enhanced_val_check_interval
-        limit_val_batches = config.enhanced_limit_val_batches
-        early_stopping_patience = config.enhanced_early_stopping_patience
-        early_stopping_min_delta = config.enhanced_early_stopping_min_delta
-        save_top_k = config.enhanced_save_top_k
-        monitor_metric = config.enhanced_monitor_metric
-        scheduler_patience = config.enhanced_scheduler_patience
-        scheduler_factor = config.enhanced_scheduler_factor
-        scheduler_min_lr = config.enhanced_scheduler_min_lr
-        print("✅ Enhanced configuration loaded successfully")
-    elif args.auc_mode:
-        auc_config = get_auc_optimized_config()
-        # Override config parameters for AUC optimization
-        model_w = auc_config['w']
-        model_free_bits = auc_config['free_bits']
-        model_max_beta = auc_config['max_beta']
-        model_beta_warmup_steps = auc_config['beta_warmup_steps']
-        model_gradient_clip_val = auc_config['gradient_clip_val']
-        model_focal_alpha = auc_config['focal_alpha']
-        model_focal_gamma = auc_config['focal_gamma']
-        model_lr = auc_config['lr']
-        model_weight_decay = auc_config['weight_decay']
-        val_check_interval = auc_config['val_check_interval']
-        limit_val_batches = auc_config['limit_val_batches']
-        early_stopping_patience = auc_config['early_stopping_patience']
-        early_stopping_min_delta = auc_config['early_stopping_min_delta']
-        save_top_k = auc_config['save_top_k']
-        monitor_metric = auc_config['monitor_metric']
-        scheduler_patience = auc_config['scheduler_patience']
-        scheduler_factor = auc_config['scheduler_factor']
-        scheduler_min_lr = auc_config['scheduler_min_lr']
-        print("✅ AUC optimization configuration loaded successfully")
-    else:
-        # Use standard config parameters
-        model_w = config.w
-        model_free_bits = config.free_bits
-        model_max_beta = config.max_beta
-        model_beta_warmup_steps = config.beta_warmup_steps
-        model_gradient_clip_val = config.gradient_clip_val
-        model_focal_alpha = config.focal_alpha
-        model_focal_gamma = config.focal_gamma
-        model_lr = config.lr
-        model_weight_decay = 0.01  # Default weight decay
-        val_check_interval = 0.1
-        limit_val_batches = 0.3
-        early_stopping_patience = 3
-        early_stopping_min_delta = 0.001
-        save_top_k = 3
-        monitor_metric = "val_loss"
-        scheduler_patience = 100
-        scheduler_factor = 0.7
-        scheduler_min_lr = config.lr * 0.01
-        print("✅ Standard configuration loaded successfully")
+    # Get configuration parameters (all parameters now use enhanced values by default)
+    model_w = config.w
+    model_free_bits = config.free_bits
+    model_max_beta = config.max_beta
+    model_beta_warmup_steps = config.beta_warmup_steps
+    model_gradient_clip_val = config.gradient_clip_val
+    model_focal_alpha = config.focal_alpha
+    model_focal_gamma = config.focal_gamma
+    model_lr = config.lr
+    model_weight_decay = config.weight_decay
+    val_check_interval = config.val_check_interval
+    limit_val_batches = config.limit_val_batches
+    early_stopping_patience = config.early_stopping_patience
+    early_stopping_min_delta = config.early_stopping_min_delta
+    save_top_k = config.save_top_k
+    monitor_metric = config.monitor_metric
+    scheduler_patience = config.scheduler_patience
+    scheduler_factor = config.scheduler_factor
+    scheduler_min_lr = config.scheduler_min_lr
+    print("✅ Enhanced configuration loaded successfully (default)")
     
     # Set up model with configuration based on mode
     print("🧠 Setting up model...")
     
-    # Choose configuration based on mode
-    if args.enhanced_mode:
-        # Enhanced mode: use enhanced architecture parameters
-        model_ff_dim = config.enhanced_ff_dim
-        model_transformer_heads = config.enhanced_transformer_heads
-        model_transformer_layers = config.enhanced_transformer_layers
-        print("🚀 Using enhanced model architecture")
-    else:
-        # Standard/AUC mode: use standard architecture parameters
-        model_ff_dim = config.ff_dim
-        model_transformer_heads = config.transformer_heads
-        model_transformer_layers = config.transformer_layers
-        print("📊 Using standard model architecture")
+    # Use enhanced configuration by default (all parameters are now enhanced)
+    model_ff_dim = config.ff_dim
+    model_transformer_heads = config.transformer_heads
+    model_transformer_layers = config.transformer_layers
+    print("🚀 Using enhanced model architecture (default)")
     
     model = SeqSetVAE(
         input_dim=config.input_dim,
@@ -345,21 +288,14 @@ def main():
     print(f" - FF dimension: {model_ff_dim}")
     print(f" - Transformer heads: {model_transformer_heads}")
     print(f" - Transformer layers: {model_transformer_layers}")
-    print(f" - Classification head layers: {getattr(config, 'enhanced_cls_head_layers', 1)}")
+            print(f" - Classification head layers: {config.cls_head_layers}")
     
     # Set up training configuration
     print("⚙️ Setting up training configuration...")
     
-    # Determine checkpoint filename based on mode
-    if args.enhanced_mode:
-        checkpoint_name = "SeqSetVAE_enhanced"
-        mode_suffix = "_enhanced"
-    elif args.auc_mode:
-        checkpoint_name = "SeqSetVAE_auc_optimized"
-        mode_suffix = "_auc_optimized"
-    else:
-        checkpoint_name = "SeqSetVAE_optimized"
-        mode_suffix = "_optimized"
+    # All parameters now use enhanced values by default
+    checkpoint_name = "SeqSetVAE_enhanced"
+    mode_suffix = "_enhanced"
     
     # Ensure subdirectories exist at start
     os.makedirs(os.path.join(checkpoints_root_dir, checkpoint_name), exist_ok=True)
