@@ -247,8 +247,33 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         self.val_auc.reset(); self.val_auprc.reset(); self.val_acc.reset()
 
     def configure_optimizers(self):
-        optimizer = AdamW(self.cls_head.parameters(), lr=self.head_lr, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
-        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.6, patience=5, verbose=True, min_lr=self.head_lr * 1e-3)
+        # Use optimized parameters for classification head fine-tuning
+        weight_decay = getattr(config, 'head_weight_decay', 0.001)
+        betas = getattr(config, 'head_betas', (0.9, 0.999))
+        eps = getattr(config, 'head_eps', 1e-8)
+        
+        optimizer = AdamW(
+            self.cls_head.parameters(), 
+            lr=self.head_lr, 
+            weight_decay=weight_decay, 
+            betas=betas, 
+            eps=eps
+        )
+        
+        # More responsive learning rate scheduler
+        scheduler_factor = getattr(config, 'scheduler_factor', 0.7)
+        scheduler_patience = getattr(config, 'scheduler_patience', 3)
+        min_lr_factor = getattr(config, 'scheduler_min_lr_factor', 1e-3)
+        
+        scheduler = ReduceLROnPlateau(
+            optimizer, 
+            mode='max', 
+            factor=scheduler_factor, 
+            patience=scheduler_patience, 
+            verbose=True, 
+            min_lr=self.head_lr * min_lr_factor
+        )
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "monitor": "val_auc", "interval": "epoch"},
@@ -379,7 +404,13 @@ def main():
     )
     callbacks.append(ckpt_cb)
 
-    early_stop = EarlyStopping(monitor="val_auc", mode="max", patience=8, min_delta=1e-4, verbose=True)
+    early_stop = EarlyStopping(
+        monitor="val_auc", 
+        mode="max", 
+        patience=getattr(config, 'early_stopping_patience', 10), 
+        min_delta=getattr(config, 'early_stopping_min_delta', 1e-4), 
+        verbose=True
+    )
     callbacks.append(early_stop)
 
     lr_mon = LearningRateMonitor(logging_interval="epoch")
@@ -399,9 +430,9 @@ def main():
         precision=args.precision,
         callbacks=callbacks,
         logger=logger,
-        gradient_clip_val=0.1,
-        val_check_interval=0.2,
-        log_every_n_steps=50,
+        gradient_clip_val=getattr(config, 'gradient_clip_val', 0.05),  # Reduced for classification head
+        val_check_interval=getattr(config, 'val_check_interval', 0.25),
+        log_every_n_steps=getattr(config, 'log_every_n_steps', 25),
         enable_progress_bar=True,
         enable_checkpointing=True,
     )
