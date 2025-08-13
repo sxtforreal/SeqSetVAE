@@ -139,6 +139,11 @@ enhanced_transformer_dropout = 0.15  # Enhanced transformer dropout
 enhanced_post_norm = True  # Enable post-transformer normalization
 enhanced_feature_fusion = True  # Enable multi-scale feature fusion
 
+# Use enhanced mode by default to match checkpoint
+ff_dim = enhanced_ff_dim  # Use enhanced feed-forward dimension by default
+transformer_heads = enhanced_transformer_heads  # Use enhanced transformer heads by default
+transformer_layers = enhanced_transformer_layers  # Use enhanced transformer layers by default
+
 # Model Checkpoint and Pretrained Weights
 pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/checkpoints/best_SetVAE.ckpt"
 
@@ -151,6 +156,12 @@ enhanced_w = 3.0  # Enhanced classification loss weight
 enhanced_free_bits = 0.03  # Enhanced KL divergence weight
 enhanced_focal_alpha = 0.35  # Enhanced focal loss alpha
 enhanced_focal_gamma = 3.0  # Enhanced focal loss gamma
+
+# Use enhanced loss weights by default to match checkpoint
+w = enhanced_w  # Use enhanced classification loss weight by default
+free_bits = enhanced_free_bits  # Use enhanced KL divergence weight by default
+focal_alpha = enhanced_focal_alpha  # Use enhanced focal loss alpha by default
+focal_gamma = enhanced_focal_gamma  # Use enhanced focal loss gamma by default
 
 # Training Regularization and Optimization
 warmup_beta = True  # Enable beta warmup for KL annealing
@@ -173,6 +184,10 @@ enhanced_limit_val_batches = 0.6  # Enhanced validation batches
 enhanced_save_top_k = 5  # Enhanced checkpoint saving
 enhanced_monitor_metric = "val_auc"  # Enhanced monitoring metric
 
+# Use enhanced training parameters by default to match checkpoint
+lr = enhanced_lr  # Use enhanced learning rate by default
+gradient_clip_val = enhanced_gradient_clip_val  # Use enhanced gradient clipping by default
+
 # Logging Configuration
 name = "SeqSetVAE-v3"  # Experiment/model name for unified output directories
 model_name = name
@@ -188,5 +203,5 @@ precision = "16-mixed"  # Mixed precision training (16-bit float + 32-bit float)
 # Focal Loss Hyperparameters
 use_focal_loss = True
 # alpha for positive class in binary classification (set None to disable balancing)
-focal_alpha = 0.3  # Increased from 0.25 to better handle class imbalance
-focal_gamma = 2.5  # Increased from 2.0 for better focus on hard examples
+focal_alpha = enhanced_focal_alpha  # Use enhanced focal loss alpha by default
+focal_gamma = enhanced_focal_gamma  # Use enhanced focal loss gamma by default
