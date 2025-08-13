@@ -168,6 +168,16 @@ log_every_n_steps = 200  # Log metrics every N training steps
 ckpt_every_n_steps = 200  # Save checkpoint every N training steps
 seed = 0
 
+# Training Speed Optimizations
+training_speed_optimizations = True  # Enable training speed optimizations
+fast_batch_size = 16  # Optimized batch size for speed
+fast_num_workers = 8  # Optimized number of workers for speed
+fast_val_check_interval = 0.5  # Check validation less frequently for speed
+fast_log_every_n_steps = 50  # Log less frequently for speed
+fast_gradient_clip_val = 0.05  # Reduced gradient clipping for speed
+fast_drop_last = True  # Drop last batch for consistent training
+fast_prefetch_factor = 2  # Prefetch factor for data loading
+
 # Compute Configuration
 accelerator = "gpu"  # Training accelerator type (gpu/cpu/tpu)
 devices = 1  # Number of devices to use for training
@@ -177,3 +187,12 @@ precision = "16-mixed"  # Mixed precision training (16-bit float + 32-bit float)
 use_focal_loss = True
 # alpha for positive class in binary classification (set None to disable balancing)
 # focal_alpha and focal_gamma are already set above in Loss Function Weights section
+
+# Classifier Head Fine-tuning Optimizations
+cls_head_finetune = True  # Enable classifier head fine-tuning optimizations
+cls_head_lr = 5e-4  # Optimized learning rate for classifier head
+cls_head_weight_decay = 0.001  # Light weight decay for speed
+cls_head_betas = (0.9, 0.999)  # Optimized betas for classifier head
+cls_head_eps = 1e-8  # Optimized epsilon for classifier head
+cls_head_scheduler = "cosine"  # Use cosine annealing scheduler
+cls_head_scheduler_min_lr_factor = 1e-3  # Minimum LR factor for scheduler
