@@ -274,9 +274,10 @@ def main():
 
     # Output
     parser.add_argument("--output_root_dir", type=str, default="/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs")
-
+    parser.add_argument("--output_dir", type=str, default=None, help="Alias of --output_root_dir; if provided, overrides output_root_dir")
+    
     args = parser.parse_args()
-
+    
     # Data module setup
     data_module = SeqSetVAEDataModule(
         saved_dir=args.data_dir,
@@ -331,7 +332,8 @@ def main():
         ff_dim=getattr(config, 'ff_dim', config.enhanced_ff_dim if hasattr(config, 'enhanced_ff_dim') else 1024),
         transformer_heads=getattr(config, 'transformer_heads', config.enhanced_transformer_heads if hasattr(config, 'enhanced_transformer_heads') else 8),
         transformer_layers=getattr(config, 'transformer_layers', config.enhanced_transformer_layers if hasattr(config, 'enhanced_transformer_layers') else 4),
-        pretrained_ckpt=config.pretrained_ckpt,
+        pretrained_ckpt=None,
+        skip_pretrained_on_resume=True,
         w=config.w,
         free_bits=config.free_bits,
         warmup_beta=config.warmup_beta,
@@ -354,17 +356,21 @@ def main():
         if isinstance(unexpected, list) and len(unexpected) > 0:
             print(f"Unexpected keys when loading: {len(unexpected)} (ignored)")
 
-    # Logging and callbacks
+    # Logging and unified directories: output_dir/config.model_name/{checkpoints,logs,analysis}
     checkpoint_name = "SeqSetVAE_cls_head_finetune"
-    base_output_dir = args.output_root_dir.rstrip("/")
-    checkpoints_root_dir = os.path.join(base_output_dir, "checkpoints", checkpoint_name)
-    logs_root_dir = os.path.join(base_output_dir, "logs")
-    os.makedirs(checkpoints_root_dir, exist_ok=True)
-    os.makedirs(logs_root_dir, exist_ok=True)
+    base_output_dir = (args.output_dir or args.output_root_dir).rstrip("/")
+    model_name = getattr(config, 'model_name', getattr(config, 'name', 'SeqSetVAE-v3'))
+    experiment_root = os.path.join(base_output_dir, model_name)
+    checkpoints_root_dir = os.path.join(experiment_root, 'checkpoints')
+    logs_root_dir = os.path.join(experiment_root, 'logs')
+    analysis_root_dir = os.path.join(experiment_root, 'analysis')
+    os.makedirs(os.path.join(checkpoints_root_dir, checkpoint_name), exist_ok=True)
+    os.makedirs(os.path.join(logs_root_dir, checkpoint_name), exist_ok=True)
+    os.makedirs(os.path.join(analysis_root_dir, checkpoint_name), exist_ok=True)
 
     callbacks = []
     ckpt_cb = ModelCheckpoint(
-        dirpath=checkpoints_root_dir,
+        dirpath=os.path.join(checkpoints_root_dir, checkpoint_name),
         filename="best",
         save_top_k=3,
         monitor="val_auc",
@@ -380,7 +386,7 @@ def main():
     callbacks.append(lr_mon)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logger = TensorBoardLogger(save_dir=logs_root_dir, name=checkpoint_name, version=timestamp, log_graph=False)
+    logger = TensorBoardLogger(save_dir=logs_root_dir, name="", version=timestamp, log_graph=False)
 
     # Devices autodetect
     devices = args.devices

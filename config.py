@@ -174,7 +174,8 @@ enhanced_save_top_k = 5  # Enhanced checkpoint saving
 enhanced_monitor_metric = "val_auc"  # Enhanced monitoring metric
 
 # Logging Configuration
-name = "SeqSetVAE-v3"  # Experiment name for logging
+name = "SeqSetVAE-v3"  # Experiment/model name for unified output directories
+model_name = name
 log_every_n_steps = 200  # Log metrics every N training steps
 ckpt_every_n_steps = 200  # Save checkpoint every N training steps
 seed = 0

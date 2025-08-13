@@ -175,36 +175,7 @@ class SeqSetVAE(pl.LightningModule):
             lr,
         )
         
-        # Only load pretrained setvae weights when not resuming from checkpoint
-        if pretrained_ckpt is not None and not skip_pretrained_on_resume:
-            print(f"🔄 Loading pretrained SetVAE weights from: {pretrained_ckpt}")
-            
-            # Load checkpoint weights using utility function
-            state_dict = load_checkpoint_weights(pretrained_ckpt, device='cpu')
-            
-            # Extract SetVAE weights
-            setvae_state = {
-                k.replace("setvae.", ""): v
-                for k, v in state_dict.items()
-                if k.startswith("setvae.")
-            }
-            
-            # Load SetVAE weights
-            missing_keys, unexpected_keys = self.setvae.load_state_dict(setvae_state, strict=False)
-            
-            if missing_keys:
-                print(f"⚠️  Missing SetVAE keys: {len(missing_keys)} parameters not loaded")
-            else:
-                print("✅ All SetVAE parameters loaded successfully")
-            
-            if unexpected_keys:
-                print(f"⚠️  Unexpected SetVAE keys: {len(unexpected_keys)} extra parameters ignored")
-            
-            del state_dict, setvae_state
-        elif pretrained_ckpt is not None and skip_pretrained_on_resume:
-            print(f"⏭️  Skipping pretrained SetVAE loading (resuming from checkpoint)")
-        elif pretrained_ckpt is None:
-            print(f"ℹ️  No pretrained checkpoint provided, using random initialization")
+        # Pretrained loading disabled: always start from random initialization
 
         # Freeze X% pretrained parameters
         set_params = list(self.setvae.parameters())
