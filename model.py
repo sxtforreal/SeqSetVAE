@@ -558,16 +558,16 @@ class SeqSetVAE(pl.LightningModule):
         # Add layer normalization after transformer for better feature quality
         self.post_transformer_norm = nn.LayerNorm(latent_dim, eps=1e-6)
 
-        # Dynamic positional encoding - no fixed max sequence length
-        self.pos_embedding = nn.Parameter(torch.randn(1, 1, latent_dim) * 0.02)
-        
-        # Time encoder - convert continuous time to embeddings
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, latent_dim // 4),
-            nn.ReLU(),
-            nn.Linear(latent_dim // 4, latent_dim),
-            nn.Tanh()
-        )
+        # Robust time/position encoding (noise-tolerant):
+        # - Absolute sinusoidal position (index-based)
+        # - Relative time bucket embeddings for Δt between sets
+        self.num_time_buckets = 64
+        edges = torch.logspace(math.log10(0.5), math.log10(24 * 60.0), steps=self.num_time_buckets - 1)
+        self.register_buffer("time_bucket_edges", edges, persistent=False)
+        self.rel_time_bucket_embed = nn.Embedding(self.num_time_buckets, latent_dim)
+        # ALiBi-like relative time bias parameters (shared across heads)
+        self.alibi_slope = nn.Parameter(torch.tensor(1.0))
+        self.time_tau = nn.Parameter(torch.tensor(60.0))
 
         # Decoder & Classifier with improved architecture
         self.decoder = _SetDecoder(
@@ -645,6 +645,9 @@ class SeqSetVAE(pl.LightningModule):
             if use_focal_loss
             else None
         )
+        # Finetune mode: classification only (skip recon/KL) and keep backbone eval
+        self.classification_only = False
+        self.cls_head_lr = None
         
         self.save_hyperparameters(ignore=["setvae"])
 
@@ -659,33 +662,34 @@ class SeqSetVAE(pl.LightningModule):
         else:
             return self.max_beta
 
+    def _sinusoidal_positional_encoding(self, seq_len: int, dim: int, device: torch.device):
+        position = torch.arange(seq_len, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(seq_len, dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+
+    def _relative_time_bucket_embedding(self, minutes: torch.Tensor):
+        # minutes: [B, S] (float, minutes)
+        B, S = minutes.shape
+        deltas = torch.cat([
+            torch.zeros(B, 1, device=minutes.device, dtype=minutes.dtype),
+            torch.diff(minutes, dim=1).clamp(min=0.0)
+        ], dim=1)
+        log_delta = torch.log1p(deltas)
+        log_edges = torch.log1p(self.time_bucket_edges).to(log_delta.device)
+        bucket_idx = torch.bucketize(log_delta, log_edges, right=False)
+        bucket_idx = bucket_idx.clamp(max=self.num_time_buckets - 1)
+        return self.rel_time_bucket_embed(bucket_idx)
+
     def _apply_positional_encoding(self, x: torch.Tensor, pos: torch.Tensor, padding_mask: torch.Tensor = None):
-        """
-        Apply learned positional encoding and time encoding for variable length sequences.
-        
-        Args:
-            x: Tensor of shape [B, S, D]
-            pos: Tensor of shape [B, S] representing each set's minute value
-            padding_mask: Boolean mask of shape [B, S] where True indicates padding
-        Returns:
-            Tensor of same shape as x with positional encoding applied.
-        """
         B, S, D = x.shape
-        
-        # Positional encoding (based on sequence position)
-        positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
-        pos_emb = self.pos_embedding.expand(B, S, -1) * torch.sin(positions.unsqueeze(-1).float() * 0.01)
-        
-        # Time encoding (based on actual time)
-        time_emb = self.time_encoder(pos.unsqueeze(-1))
-        
-        # Combine positional and time encoding
-        encoded = x + pos_emb + time_emb
-        
-        # Zero out padding positions
+        pos_enc = self._sinusoidal_positional_encoding(S, D, x.device).unsqueeze(0).expand(B, -1, -1)
+        rel_time = self._relative_time_bucket_embedding(pos)
+        encoded = x + pos_enc + rel_time
         if padding_mask is not None:
             encoded = encoded.masked_fill(padding_mask.unsqueeze(-1), 0.0)
-        
         return encoded
 
     def _create_causal_mask(self, seq_len, device, padding_mask=None):
@@ -712,6 +716,17 @@ class SeqSetVAE(pl.LightningModule):
             mask = mask | expanded_padding.transpose(-1, -2)
         
         return mask
+
+    def _build_causal_time_bias_mask(self, minutes_1d: torch.Tensor):
+        # minutes_1d: [S] (float minutes)
+        S = minutes_1d.size(0)
+        device = minutes_1d.device
+        dt = (minutes_1d.unsqueeze(0) - minutes_1d.unsqueeze(1)).clamp(min=0.0)
+        bias = -self.alibi_slope * torch.log1p(dt / self.time_tau)
+        float_mask = bias.to(dtype=torch.float32)
+        future = torch.triu(torch.ones(S, S, device=device, dtype=torch.bool), diagonal=1)
+        float_mask = float_mask.masked_fill(future, float("-inf"))
+        return float_mask
 
     def forward(self, sets, padding_mask=None):
         """
@@ -904,33 +919,34 @@ class SeqSetVAE(pl.LightningModule):
         # Add layer normalization
         z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
         
-        # Create attention mask for transformer
-        attn_mask = self._create_causal_mask(S, z_seq.device, None)
-        
-        # Apply transformer with enhanced processing
-        h_seq = self.transformer(z_seq, mask=attn_mask[0] if attn_mask.dim() == 3 else attn_mask)
+        # Build causal + relative-time bias mask
+        minutes_1d = pos_tensor.squeeze(0) if pos_tensor.dim() == 2 else pos_tensor.view(-1)
+        attn_mask = self._build_causal_time_bias_mask(minutes_1d)
+        h_seq = self.transformer(z_seq, mask=attn_mask)
         
         # Apply post-transformer normalization for better feature quality
         h_seq = self.post_transformer_norm(h_seq)
         
-        # Reconstruction with improved loss
-        recon_loss_total = 0.0
-        valid_sets = 0
-        for idx, s_dict in enumerate(sets):
-            N_t = s_dict["var"].size(1)
-            recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)  # Reduce noise
-            if self.setvae.setvae.dim_reducer is not None:
-                reduced = self.setvae.setvae.dim_reducer(s_dict["var"])
-            else:
-                reduced = s_dict["var"]
-            norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
-            reduced_normalized = reduced / (norms + 1e-8)
-            target_x = reduced_normalized * s_dict["val"]
-            recon_loss_total += chamfer_recon_loss(recon, target_x)
-            valid_sets += 1
-            
-        if valid_sets > 0:
-            recon_loss_total /= valid_sets
+        # Classification-only finetune mode skips reconstruction entirely
+        if self.classification_only:
+            recon_loss_total = torch.tensor(0.0, device=h_seq.device)
+        else:
+            recon_loss_total = 0.0
+            valid_sets = 0
+            for idx, s_dict in enumerate(sets):
+                N_t = s_dict["var"].size(1)
+                recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)
+                if self.setvae.setvae.dim_reducer is not None:
+                    reduced = self.setvae.setvae.dim_reducer(s_dict["var"])
+                else:
+                    reduced = s_dict["var"]
+                norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+                reduced_normalized = reduced / (norms + 1e-8)
+                target_x = reduced_normalized * s_dict["val"]
+                recon_loss_total += chamfer_recon_loss(recon, target_x)
+                valid_sets += 1
+            if valid_sets > 0:
+                recon_loss_total /= valid_sets
         
         # Enhanced feature extraction using multi-scale pooling
         enhanced_features = self._extract_enhanced_features(h_seq)
@@ -948,7 +964,7 @@ class SeqSetVAE(pl.LightningModule):
             # Merge latent variable information from all sets (use first set as representative)
             self._last_z_list = all_z_lists[0] if all_z_lists else None
         
-        return logits, recon_loss_total, kl_total * current_beta
+        return logits, recon_loss_total, (torch.tensor(0.0, device=h_seq.device) if self.classification_only else kl_total * current_beta)
 
     def _forward_batch(self, all_patient_sets, padding_mask=None):
         """
@@ -1180,25 +1196,27 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # Improved loss calculation
+        # Loss calculation (classification-only finetune: use pure classification loss)
         if self.use_focal_loss and self.focal_loss_fn is not None:
             pred_loss = self.focal_loss_fn(logits, label)
         else:
             pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
-        
-        # Optimized weight strategy for better AUC/AUPRC
-        if stage == "train":
-            # More stable weight strategy: focus on classification throughout training
-            # Start with balanced weights, gradually increase classification focus
-            progress = min(1.0, self.current_step / 5000)
-            recon_weight = 0.8 * (1.0 - progress) + 0.3 * progress  # Decrease from 0.8 to 0.3
-            pred_weight = self.w * (0.5 + 0.5 * progress)  # Increase from 0.5*w to w
+
+        if self.classification_only:
+            total_loss = pred_loss
+            recon_loss = torch.tensor(0.0, device=pred_loss.device)
+            kl_loss = torch.tensor(0.0, device=pred_loss.device)
+            pred_weight = torch.tensor(1.0, device=pred_loss.device)
+            recon_weight = torch.tensor(0.0, device=pred_loss.device)
         else:
-            # Validation: use balanced weights for evaluation
-            recon_weight = 0.5
-            pred_weight = self.w
-            
-        total_loss = pred_weight * pred_loss + recon_weight * recon_loss + kl_loss
+            if stage == "train":
+                progress = min(1.0, self.current_step / 5000)
+                recon_weight = 0.8 * (1.0 - progress) + 0.3 * progress
+                pred_weight = self.w * (0.5 + 0.5 * progress)
+            else:
+                recon_weight = 0.5
+                pred_weight = self.w
+            total_loss = pred_weight * pred_loss + recon_weight * recon_loss + kl_loss
 
         # Metrics for validation stage
         if stage == "val":
@@ -1300,28 +1318,36 @@ class SeqSetVAE(pl.LightningModule):
                 self.log('grad_norm', total_norm, on_step=True, prog_bar=False)
 
     def configure_optimizers(self):
-        # Set different learning rates for different parts
-        setvae_params = list(self.setvae.parameters())
-        transformer_params = list(self.transformer.parameters())
-        other_params = [
-            p for n, p in self.named_parameters() 
-            if not any(n.startswith(prefix) for prefix in ['setvae', 'transformer'])
-        ]
-        
-        # Use smaller learning rate for pretrained SetVAE
-        param_groups = [
-            {'params': setvae_params, 'lr': self.lr * 0.05, 'name': 'setvae'},  # Reduced from 0.1
-            {'params': transformer_params, 'lr': self.lr, 'name': 'transformer'},
-            {'params': other_params, 'lr': self.lr, 'name': 'others'}
-        ]
-        
-        optimizer = AdamW(
-            param_groups,
-            lr=self.lr,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=0.02,  # Increased weight decay for better regularization
-        )
+        if self.classification_only:
+            # Optimize classifier head only with higher LR
+            cls_params = [p for p in self.cls_head.parameters() if p.requires_grad]
+            optimizer = AdamW(
+                [{'params': cls_params, 'lr': self.cls_head_lr or (self.lr * 10.0), 'name': 'cls_head'}],
+                lr=self.cls_head_lr or (self.lr * 10.0),
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.001,
+            )
+        else:
+            # Set different learning rates for different parts
+            setvae_params = list(self.setvae.parameters())
+            transformer_params = list(self.transformer.parameters())
+            other_params = [
+                p for n, p in self.named_parameters() 
+                if not any(n.startswith(prefix) for prefix in ['setvae', 'transformer'])
+            ]
+            param_groups = [
+                {'params': setvae_params, 'lr': self.lr * 0.05, 'name': 'setvae'},
+                {'params': transformer_params, 'lr': self.lr, 'name': 'transformer'},
+                {'params': other_params, 'lr': self.lr, 'name': 'others'}
+            ]
+            optimizer = AdamW(
+                param_groups,
+                lr=self.lr,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.02,
+            )
         
         # Improved learning rate scheduler for better AUC/AUPRC
         from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -1343,3 +1369,20 @@ class SeqSetVAE(pl.LightningModule):
                 "monitor": "val_loss",  # Monitor validation loss for scheduling
             },
         }
+
+    # -------- Finetune helpers --------
+    def enable_classification_only_mode(self, cls_head_lr: float | None = None):
+        self.classification_only = True
+        if cls_head_lr is not None:
+            self.cls_head_lr = cls_head_lr
+        self.set_backbone_eval()
+
+    def set_backbone_eval(self):
+        self.setvae.eval()
+        self.transformer.eval()
+        self.post_transformer_norm.eval()
+        self.decoder.eval()
+
+    def on_train_start(self):
+        if self.classification_only:
+            self.set_backbone_eval()

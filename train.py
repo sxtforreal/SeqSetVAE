@@ -248,17 +248,14 @@ def main():
             except Exception as e:
                 print(f"⚠️  Failed to load pretrained checkpoint: {e}")
 
-        # Freeze everything except classifier head
-        trainable_cnt = 0
-        total_cnt = 0
+        # Freeze everything except classifier head and set backbone eval
         for name, param in model.named_parameters():
-            total_cnt += param.numel()
             if name.startswith('cls_head'):
                 param.requires_grad = True
-                trainable_cnt += param.numel()
             else:
                 param.requires_grad = False
-        print(f"🧊 Finetune freeze applied. Trainable params (cls_head only): {trainable_cnt:,} / {total_cnt:,}")
+        model.enable_classification_only_mode(cls_head_lr=getattr(config, 'cls_head_lr', None))
+        print("🧊 Finetune freeze applied and backbone set to eval; classification-only loss enabled.")
 
     print("📊 Model Architecture:")
     print(f" - FF dimension: {ff_dim}")
