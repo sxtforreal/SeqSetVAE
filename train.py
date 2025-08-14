@@ -206,6 +206,14 @@ def main():
             free_bits=model_free_bits,
             transformer_dropout=config.transformer_dropout,
         )
+        # Optional: initialize from checkpoint (weights only)
+        if args.pretrained_ckpt is not None:
+            try:
+                state = load_checkpoint_weights(args.pretrained_ckpt, device='cpu')
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                print(f"🔁 Initialized pretrain model from ckpt (weights only). Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+            except Exception as e:
+                print(f"⚠️  Failed to initialize pretrain model from checkpoint: {e}")
         checkpoint_name = "SeqSetVAE_pretrain"
         monitor_metric = 'val_loss'
         monitor_mode = 'min'
