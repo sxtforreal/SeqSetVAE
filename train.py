@@ -276,14 +276,14 @@ def main():
         print(f" - Classification head layers: {config.cls_head_layers}")
 
     print("⚙️ Trainer setup...")
-    os.makedirs(os.path.join(checkpoints_root_dir, checkpoint_name), exist_ok=True)
-    os.makedirs(os.path.join(logs_root_dir, checkpoint_name), exist_ok=True)
+    os.makedirs(checkpoints_root_dir, exist_ok=True)
+    os.makedirs(logs_root_dir, exist_ok=True)
     os.makedirs(os.path.join(analysis_root_dir, checkpoint_name), exist_ok=True)
 
     # Callbacks
     callbacks = []
     checkpoint_callback = ModelCheckpoint(
-        dirpath=os.path.join(checkpoints_root_dir, checkpoint_name),
+        dirpath=checkpoints_root_dir,
         filename=f"{checkpoint_name}_batch{args.batch_size}",
         save_top_k=1,
         monitor=monitor_metric,
@@ -310,7 +310,7 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = TensorBoardLogger(
-        save_dir=os.path.join(logs_root_dir, checkpoint_name),
+        save_dir=logs_root_dir,
         name="",
         version=f"batch{args.batch_size}_{timestamp}",
         log_graph=True,
