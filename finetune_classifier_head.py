@@ -111,6 +111,26 @@ class ClassifierHeadFinetuner(SeqSetVAE):
         # IMPORTANT: Do NOT freeze parameters here - we'll load from checkpoint first
         # Freezing will be done after checkpoint loading in on_train_start()
 
+    def _log_trainable_by_prefix(self):
+        prefixes = [
+            "setvae",
+            "transformer",
+            "post_transformer_norm",
+            "decoder",
+            "feature_fusion",
+            "feature_projection",
+            "time_encoder",
+            "pos_embedding",
+            "cls_head",
+        ]
+        print("Trainable parameter counts by module prefix:")
+        state = self.state_dict()
+        for pref in prefixes:
+            params = [p for n, p in self.named_parameters() if n.startswith(pref)]
+            total = sum(p.numel() for p in params)
+            trainable = sum(p.numel() for p in params if p.requires_grad)
+            print(f"[{pref}] total={total:,} trainable={trainable:,}")
+
     def _create_lightweight_classifier(self):
         """Create a classifier head that matches the checkpoint dimensions."""
         # Remove existing classifier head if any
@@ -234,6 +254,8 @@ class ClassifierHeadFinetuner(SeqSetVAE):
     def on_train_start(self):
         # Ensure backbone is frozen after checkpoint loading
         self._freeze_backbone_after_loading()
+        # Log which parts are trainable to verify freezing status
+        self._log_trainable_by_prefix()
 
     # Lightweight classification-only forward: skip reconstruction and KL; run frozen backbone in inference_mode
     def forward(self, batch):
@@ -502,6 +524,16 @@ def main():
             if 'weight' in k or 'bias' in k:
                 shape = state_dict[k].shape
                 print(f"  {k}: {shape}")
+        
+        # NEW: quick coverage summary by module prefix
+        def _coverage(prefix):
+            model_keys = [k for k, v in model.state_dict().items() if k.startswith(prefix)]
+            ckpt_keys = [k for k in state_dict.keys() if k.startswith(prefix)]
+            matched = [k for k in model_keys if k in state_dict and state_dict[k].shape == model.state_dict()[k].shape]
+            print(f"[{prefix}] model={len(model_keys)} ckpt={len(ckpt_keys)} matched={len(matched)}")
+        print("Checkpoint coverage summary:")
+        for pref in ["setvae", "transformer", "post_transformer_norm", "decoder", "feature_fusion", "feature_projection", "time_encoder", "pos_embedding", "cls_head"]:
+            _coverage(pref)
         
         # Adapt classifier head to checkpoint if needed
         model._adapt_classifier_to_checkpoint(state_dict)
