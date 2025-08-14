@@ -359,12 +359,12 @@ class SeqSetVAEPretrain(pl.LightningModule):
             pos_list.append(minute_val)
 
             # Encode set -> z
-            recon_unused, z_list, _ = self.set_encoder(var, val)
+            # Deterministic latent features during pretraining metrics: use mu
+            z_list, _ = self.set_encoder.encode_from_var_val(var, val)
             z_sample, mu, logvar = z_list[-1]
-            z_prims.append(z_sample.squeeze(1))
+            z_prims.append(mu.squeeze(1))
             all_z_lists.append(z_list)
 
-            # KL with free-bits
             kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
             min_kl = self.free_bits * self.latent_dim
             kl_div = torch.clamp(kl_div, min=min_kl)
@@ -700,8 +700,8 @@ class SeqSetVAE(pl.LightningModule):
             torch.ones(seq_len, seq_len, device=device), diagonal=1
         ).bool()
         
-        # Add some randomness during training (simulate real clinical scenarios)
-        if self.training:
+        # Avoid randomness in classification-only finetune to keep features stable
+        if self.training and not self.classification_only:
             random_mask = torch.rand(seq_len, seq_len, device=device) < 0.1
             mask = mask & ~random_mask
         
@@ -891,22 +891,18 @@ class SeqSetVAE(pl.LightningModule):
             minute_val = time.unique().float()  # Ensure float type
             pos_list.append(minute_val)
             
-            recon, z_list, _ = self.setvae(var, val)
-            z_sample, mu, logvar = z_list[-1]  # Choose the deepest layer
-            z_prims.append(z_sample.squeeze(1))  # -> [B, latent]
+            # Deterministic latent features: use posterior mean mu (no sampling)
+            z_list, _ = self.setvae.setvae.encode_from_var_val(var, val)
+            z_sample, mu, logvar = z_list[-1]
+            z_prims.append(mu.squeeze(1))  # use mu as deterministic feature
             
             # Collect latent variable information (for collapse detector)
             all_z_lists.append(z_list)
             
-            # Improved KL loss calculation
-            # Use more stable KL divergence calculation
+            # KL calculation (still use mu/logvar for monitoring/loss if needed)
             kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
-            
-            # Apply free bits
             min_kl = self.free_bits * self.latent_dim
             kl_div = torch.clamp(kl_div, min=min_kl)
-            
-            # Add KL regularization term to prevent variance from being too small
             var_reg = -0.1 * torch.mean(logvar)
             kl_total += kl_div.mean() + var_reg
             
@@ -952,10 +948,10 @@ class SeqSetVAE(pl.LightningModule):
         # Enhanced feature extraction using multi-scale pooling
         enhanced_features = self._extract_enhanced_features(h_seq)
         
-        # Alternative: Use attention-based pooling as fallback
+        # Alternative: Use attention-based pooling as fallback (deterministic)
         if enhanced_features is None:
-            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)  # [B, S]
-            enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
+            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
+            enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
         
         # Classification with enhanced features
         logits = self.cls_head(enhanced_features)
@@ -1383,6 +1379,11 @@ class SeqSetVAE(pl.LightningModule):
         self.transformer.eval()
         self.post_transformer_norm.eval()
         self.decoder.eval()
+        # Ensure pooling/projection parts are deterministic too
+        if hasattr(self, 'feature_fusion'):
+            self.feature_fusion.eval()
+        if hasattr(self, 'feature_projection'):
+            self.feature_projection.eval()
  
     def on_train_start(self):
         if self.classification_only:
