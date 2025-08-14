@@ -189,15 +189,16 @@ class SeqSetVAEPretrain(pl.LightningModule):
             m=m,
         )
 
-        # Positional/time encoding design
-        # - Absolute sinusoidal positional encoding (parameter-free, unbounded length)
-        # - Continuous-time Fourier features with log-spaced frequencies -> Linear projection to latent_dim
-        self.time_num_frequencies = max(1, min(time_num_frequencies, latent_dim // 4))
-        low, high = 1e-4, 1.0
-        freqs = torch.exp(torch.linspace(math.log(low), math.log(high), self.time_num_frequencies))
-        self.register_buffer("time_freqs", freqs, persistent=False)  # [K]
-        self.time_proj = nn.Linear(self.time_num_frequencies * 2, latent_dim)
-        self.pos_scale = nn.Parameter(torch.tensor(1.0))
+        # Robust time/position encoding (noise-tolerant)
+        # - Absolute sinusoidal position (index-based)
+        # - Relative time bucket embeddings for Δt between sets
+        self.num_time_buckets = 64
+        edges = torch.logspace(math.log10(0.5), math.log10(24 * 60.0), steps=self.num_time_buckets - 1)
+        self.register_buffer("time_bucket_edges", edges, persistent=False)
+        self.rel_time_bucket_embed = nn.Embedding(self.num_time_buckets, latent_dim)
+        # ALiBi-like relative time bias parameters (shared across heads)
+        self.alibi_slope = nn.Parameter(torch.tensor(1.0))
+        self.time_tau = nn.Parameter(torch.tensor(60.0))
 
         # Training hyperparameters
         self.lr = lr
@@ -222,31 +223,41 @@ class SeqSetVAEPretrain(pl.LightningModule):
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe  # [S, D]
 
-    def _time_fourier_encoding(self, minutes: torch.Tensor):
-        # minutes: [B, S] (float)
-        # scale minutes to hours to stabilize
-        t = (minutes.float() / 60.0).unsqueeze(-1)  # [B, S, 1]
-        # [1, 1, K]
-        freqs = self.time_freqs.view(1, 1, -1)
-        ang = t * freqs * 2 * math.pi  # [B, S, K]
-        sin = torch.sin(ang)
-        cos = torch.cos(ang)
-        feats = torch.cat([sin, cos], dim=-1)  # [B, S, 2K]
-        emb = self.time_proj(feats)  # [B, S, D]
-        return emb
+    def _relative_time_bucket_embedding(self, minutes: torch.Tensor):
+        # minutes: [B, S] (float, minutes)
+        B, S = minutes.shape
+        deltas = torch.cat([
+            torch.zeros(B, 1, device=minutes.device, dtype=minutes.dtype),
+            torch.diff(minutes, dim=1).clamp(min=0.0)
+        ], dim=1)
+        log_delta = torch.log1p(deltas)
+        log_edges = torch.log1p(self.time_bucket_edges).to(log_delta.device)
+        bucket_idx = torch.bucketize(log_delta, log_edges, right=False)
+        bucket_idx = bucket_idx.clamp(max=self.num_time_buckets - 1)
+        return self.rel_time_bucket_embed(bucket_idx)  # [B, S, D]
 
     def _apply_positional_encoding(self, x: torch.Tensor, minutes: torch.Tensor):
         # x: [B, S, D]; minutes: [B, S]
         B, S, D = x.shape
-        pos = self._sinusoidal_positional_encoding(S, D, x.device)  # [S, D]
-        pos = pos.unsqueeze(0).expand(B, -1, -1) * self.pos_scale  # [B, S, D]
-        time_emb = self._time_fourier_encoding(minutes)  # [B, S, D]
-        return x + pos + time_emb
+        pos = self._sinusoidal_positional_encoding(S, D, x.device).unsqueeze(0).expand(B, -1, -1)
+        rel_time_emb = self._relative_time_bucket_embedding(minutes)
+        return x + pos + rel_time_emb
 
     # ----------------------- Masks -----------------------
     def _strict_causal_mask(self, seq_len: int, device: torch.device):
         # Bool mask: True means blocked (no attention)
         return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+
+    def _build_causal_time_bias_mask(self, minutes_1d: torch.Tensor):
+        # minutes_1d: [S] (float minutes)
+        S = minutes_1d.size(0)
+        device = minutes_1d.device
+        dt = (minutes_1d.unsqueeze(0) - minutes_1d.unsqueeze(1)).clamp(min=0.0)  # [S, S], dt_{i,j} = t_i - t_j
+        bias = -self.alibi_slope * torch.log1p(dt / self.time_tau)  # [S, S]
+        float_mask = bias.to(dtype=torch.float32)
+        future = torch.triu(torch.ones(S, S, device=device, dtype=torch.bool), diagonal=1)
+        float_mask = float_mask.masked_fill(future, float("-inf"))
+        return float_mask
 
     # ----------------------- Beta schedule -----------------------
     def _current_beta(self) -> float:
@@ -361,14 +372,20 @@ class SeqSetVAEPretrain(pl.LightningModule):
 
         kl_total = kl_total / S
         z_seq = torch.stack(z_prims, dim=1)  # [B, S, D]
-        pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
+        pos_tensor = torch.stack(pos_list, dim=1)
+        # normalize shape to [B, S]
+        if pos_tensor.dim() == 1:
+            pos_tensor = pos_tensor.unsqueeze(0)
+        elif pos_tensor.dim() == 3:
+            pos_tensor = pos_tensor.squeeze(-1)
 
-        # Positional + time encoding
+        # Positional + relative time bucket encoding
         z_seq = self._apply_positional_encoding(z_seq, pos_tensor)
         z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
 
-        # Strict causal mask
-        attn_mask = self._strict_causal_mask(S, z_seq.device)
+        # Build causal + relative-time bias mask (per patient)
+        minutes_1d = pos_tensor.squeeze(0) if pos_tensor.dim() == 2 else pos_tensor.view(-1)
+        attn_mask = self._build_causal_time_bias_mask(minutes_1d)
         h_seq = self.transformer(z_seq, mask=attn_mask)
         h_seq = self.post_transformer_norm(h_seq)
 
