@@ -128,9 +128,11 @@ def main():
     checkpoints_root_dir = os.path.join(experiment_root, 'checkpoints')
     logs_root_dir = os.path.join(experiment_root, 'logs')
     analysis_root_dir = os.path.join(experiment_root, 'analysis')
+    monitor_root_dir = os.path.join(experiment_root, 'monitor')
     os.makedirs(checkpoints_root_dir, exist_ok=True)
     os.makedirs(logs_root_dir, exist_ok=True)
     os.makedirs(analysis_root_dir, exist_ok=True)
+    os.makedirs(monitor_root_dir, exist_ok=True)
 
     # Seed/determinism
     if args.seed is not None:
@@ -305,8 +307,16 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks.append(lr_monitor)
 
-    experiment_output_dir = os.path.join(analysis_root_dir, checkpoint_name)
-    callbacks.append(setup_metrics_monitor(args, experiment_output_dir))
+    # Posterior/metrics monitoring -> keep only latest under monitor_root_dir
+    # Clean previous monitor directory to only keep latest run
+    import shutil
+    try:
+        if os.path.isdir(monitor_root_dir):
+            shutil.rmtree(monitor_root_dir)
+    except Exception:
+        pass
+    os.makedirs(monitor_root_dir, exist_ok=True)
+    callbacks.append(setup_metrics_monitor(args, monitor_root_dir))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = TensorBoardLogger(
