@@ -7,7 +7,7 @@ import os
 import glob
 import re
 from functools import lru_cache
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 import random
 
 
@@ -521,8 +521,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             for _, row in cached.iterrows()
         }
 
-        self.params_map: Dict[str, Dict[str, float]] | None = None
-        self.label_map: Dict[str, int] | None = None
+        self.params_map: Optional[Dict[str, Dict[str, float]]] = None
+        self.label_map: Optional[Dict[str, int]] = None
 
     def setup(self, stage=None):
         """

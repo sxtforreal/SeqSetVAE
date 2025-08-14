@@ -14,6 +14,7 @@ from modules import (
 )
 from losses import FocalLoss
 import math
+from typing import Optional
 
 
 def load_checkpoint_weights(checkpoint_path, device='cpu'):
@@ -1371,12 +1372,12 @@ class SeqSetVAE(pl.LightningModule):
         }
 
     # -------- Finetune helpers --------
-    def enable_classification_only_mode(self, cls_head_lr: float | None = None):
+    def enable_classification_only_mode(self, cls_head_lr: Optional[float] = None):
         self.classification_only = True
         if cls_head_lr is not None:
             self.cls_head_lr = cls_head_lr
         self.set_backbone_eval()
- 
+
     def set_backbone_eval(self):
         self.setvae.eval()
         self.transformer.eval()
