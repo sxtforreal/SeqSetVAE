@@ -128,9 +128,11 @@ def main():
     checkpoints_root_dir = os.path.join(experiment_root, 'checkpoints')
     logs_root_dir = os.path.join(experiment_root, 'logs')
     analysis_root_dir = os.path.join(experiment_root, 'analysis')
+    monitor_root_dir = os.path.join(experiment_root, 'monitor')
     os.makedirs(checkpoints_root_dir, exist_ok=True)
     os.makedirs(logs_root_dir, exist_ok=True)
     os.makedirs(analysis_root_dir, exist_ok=True)
+    os.makedirs(monitor_root_dir, exist_ok=True)
 
     # Seed/determinism
     if args.seed is not None:
@@ -206,6 +208,14 @@ def main():
             free_bits=model_free_bits,
             transformer_dropout=config.transformer_dropout,
         )
+        # Optional: initialize from checkpoint (weights only)
+        if args.pretrained_ckpt is not None:
+            try:
+                state = load_checkpoint_weights(args.pretrained_ckpt, device='cpu')
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                print(f"🔁 Initialized pretrain model from ckpt (weights only). Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+            except Exception as e:
+                print(f"⚠️  Failed to initialize pretrain model from checkpoint: {e}")
         checkpoint_name = "SeqSetVAE_pretrain"
         monitor_metric = 'val_loss'
         monitor_mode = 'min'
@@ -248,6 +258,9 @@ def main():
             except Exception as e:
                 print(f"⚠️  Failed to load pretrained checkpoint: {e}")
 
+        # Re-initialize classifier head with Xavier for finetune
+        model.init_classifier_head_xavier()
+
         # Freeze everything except classifier head and set backbone eval
         for name, param in model.named_parameters():
             if name.startswith('cls_head'):
@@ -265,14 +278,14 @@ def main():
         print(f" - Classification head layers: {config.cls_head_layers}")
 
     print("⚙️ Trainer setup...")
-    os.makedirs(os.path.join(checkpoints_root_dir, checkpoint_name), exist_ok=True)
-    os.makedirs(os.path.join(logs_root_dir, checkpoint_name), exist_ok=True)
+    os.makedirs(checkpoints_root_dir, exist_ok=True)
+    os.makedirs(logs_root_dir, exist_ok=True)
     os.makedirs(os.path.join(analysis_root_dir, checkpoint_name), exist_ok=True)
 
     # Callbacks
     callbacks = []
     checkpoint_callback = ModelCheckpoint(
-        dirpath=os.path.join(checkpoints_root_dir, checkpoint_name),
+        dirpath=checkpoints_root_dir,
         filename=f"{checkpoint_name}_batch{args.batch_size}",
         save_top_k=1,
         monitor=monitor_metric,
@@ -294,12 +307,20 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks.append(lr_monitor)
 
-    experiment_output_dir = os.path.join(analysis_root_dir, checkpoint_name)
-    callbacks.append(setup_metrics_monitor(args, experiment_output_dir))
+    # Posterior/metrics monitoring -> keep only latest under monitor_root_dir
+    # Clean previous monitor directory to only keep latest run
+    import shutil
+    try:
+        if os.path.isdir(monitor_root_dir):
+            shutil.rmtree(monitor_root_dir)
+    except Exception:
+        pass
+    os.makedirs(monitor_root_dir, exist_ok=True)
+    callbacks.append(setup_metrics_monitor(args, monitor_root_dir))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = TensorBoardLogger(
-        save_dir=os.path.join(logs_root_dir, checkpoint_name),
+        save_dir=logs_root_dir,
         name="",
         version=f"batch{args.batch_size}_{timestamp}",
         log_graph=True,

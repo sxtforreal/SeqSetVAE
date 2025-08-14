@@ -210,7 +210,7 @@ class PosteriorMetricsMonitor(pl.Callback):
         
         # Adjust layout and save
         plt.tight_layout()
-        plot_path = os.path.join(self.log_dir, f'posterior_monitoring_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plot_path = os.path.join(self.log_dir, 'posterior_monitoring_latest.png')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         
         if self.verbose:
@@ -243,31 +243,10 @@ class PosteriorMetricsMonitor(pl.Callback):
             for k, v in additional_metrics.items():
                 nested_metrics['metrics'][k] = v
         
-        # Save to history file (JSON array)
-        metrics_file = os.path.join(self.log_dir, 'metrics_history.json')
-        # Load existing data or create new
-        if os.path.exists(metrics_file):
-            try:
-                with open(metrics_file, 'r') as f:
-                    history = json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
-                history = []
-        else:
-            history = []
-        history.append(metrics_data)
-        # Keep recent history
-        if len(history) > 1000:
-            history = history[-1000:]
-        with open(metrics_file, 'w') as f:
-            json.dump(history, f, indent=2)
-        
-        # Additionally, write per-step JSON for realtime visualizer compatibility
-        step_file = os.path.join(self.log_dir, f'metrics_step_{step}.json')
-        try:
-            with open(step_file, 'w') as f:
-                json.dump(nested_metrics, f)
-        except Exception:
-            pass
+        # Save only the latest snapshot to a fixed file
+        latest_file = os.path.join(self.log_dir, 'metrics_latest.json')
+        with open(latest_file, 'w') as f:
+            json.dump({'latest': metrics_data, 'nested': nested_metrics}, f, indent=2)
     
     def get_collapse_status(self) -> Dict[str, Any]:
         """

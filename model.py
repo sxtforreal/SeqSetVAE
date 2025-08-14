@@ -650,7 +650,7 @@ class SeqSetVAE(pl.LightningModule):
         self.cls_head_lr = None
         
         self.save_hyperparameters(ignore=["setvae"])
-
+ 
     def get_current_beta(self):
         """Calculate current beta value with support for warmup and annealing"""
         if not self.warmup_beta:
@@ -1376,13 +1376,21 @@ class SeqSetVAE(pl.LightningModule):
         if cls_head_lr is not None:
             self.cls_head_lr = cls_head_lr
         self.set_backbone_eval()
-
+ 
     def set_backbone_eval(self):
         self.setvae.eval()
         self.transformer.eval()
         self.post_transformer_norm.eval()
         self.decoder.eval()
-
+ 
     def on_train_start(self):
         if self.classification_only:
             self.set_backbone_eval()
+ 
+    def init_classifier_head_xavier(self):
+        """Initialize classifier head Linear layers with Xavier uniform and zero biases."""
+        for module in self.cls_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
