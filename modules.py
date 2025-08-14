@@ -162,6 +162,23 @@ class SetVAEModule(nn.Module):
             z_list.append((z_sampled, mu, logvar))
         return (z_list, current)
 
+    def encode_from_var_val(self, var, val):
+        """
+        Encode directly from raw (var, val) without decoding.
+        This mirrors the preprocessing in forward() but stops after encode().
+        Returns (z_list, encoded).
+        """
+        if self.dim_reducer is not None:
+            reduced = self.dim_reducer(var)
+        else:
+            reduced = var
+        norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+        reduced_normalized = reduced / (norms + 1e-8)
+        x = reduced_normalized * val
+        if self.training:
+            x = F.dropout(x, p=0.1, training=True)
+        return self.encode(x)
+
     def decode(self, z_list, target_n, use_mean=False, noise_std=0.5):
         idx = 1 if use_mean else 0
         current = z_list[-1][idx]
