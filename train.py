@@ -156,11 +156,19 @@ def main():
     adaptive_config = get_adaptive_training_config(args)
 
     print("📊 Setting up data module...")
+    # Enforce batch policy: pretrain -> single patient; finetune -> multi-patient
+    if args.mode == 'pretrain':
+        dm_batch_size = 1
+    else:
+        dm_batch_size = args.batch_size if args.batch_size and args.batch_size > 1 else 2
+        if args.batch_size == 1:
+            print("⚠️  Finetune requires multi-patient batches; overriding batch_size to 2")
+    print(f" - DataModule batch_size: {dm_batch_size}")
     data_module = SeqSetVAEDataModule(
         saved_dir=args.data_dir,
         params_map_path=args.params_map_path,
         label_path=args.label_path,
-        batch_size=args.batch_size,
+        batch_size=dm_batch_size,
         max_sequence_length=None,
         use_dynamic_padding=True,
         num_workers=adaptive_config['num_workers'],
