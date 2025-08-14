@@ -17,7 +17,7 @@ from lightning.pytorch import seed_everything
 from datetime import datetime
 
 # Import local modules
-from model import SeqSetVAE
+from model import SeqSetVAE, SeqSetVAEPretrain
 from dataset import SeqSetVAEDataModule
 from posterior_collapse_detector import PosteriorMetricsMonitor
 import config
@@ -143,6 +143,7 @@ def main():
     parser.add_argument("--compile_model", action="store_true", help="Enable model compilation")
     
     # Training modes
+    parser.add_argument("--pretrain", action="store_true", help="Enable pretraining mode (no classifier; reconstruct only)")
     parser.add_argument("--auc_mode", action="store_true", help="Enable AUC/AUPRC optimization mode")
     parser.add_argument("--enhanced_mode", action="store_true", help="Enable enhanced model architecture mode")
     
@@ -258,49 +259,78 @@ def main():
     model_transformer_layers = config.transformer_layers
     print("🚀 Using enhanced model architecture (default)")
     
-    model = SeqSetVAE(
-        input_dim=config.input_dim,
-        reduced_dim=config.reduced_dim,
-        latent_dim=config.latent_dim,
-        levels=config.levels,
-        heads=config.heads,
-        m=config.m,
-        beta=config.beta,
-        lr=model_lr,
-        num_classes=config.num_classes,
-        ff_dim=model_ff_dim,
-        transformer_heads=model_transformer_heads,
-        transformer_layers=model_transformer_layers,
-        pretrained_ckpt=None,
-        w=model_w,
-        free_bits=model_free_bits,
-        warmup_beta=config.warmup_beta,
-        max_beta=model_max_beta,
-        beta_warmup_steps=model_beta_warmup_steps,
-        kl_annealing=config.kl_annealing,
-        use_focal_loss=getattr(config, 'use_focal_loss', True),
-        focal_alpha=model_focal_alpha,
-        focal_gamma=model_focal_gamma,
-    )
+    if args.pretrain:
+        # Pretraining-only model (no classifier)
+        model = SeqSetVAEPretrain(
+            input_dim=config.input_dim,
+            reduced_dim=config.reduced_dim,
+            latent_dim=config.latent_dim,
+            levels=config.levels,
+            heads=config.heads,
+            m=config.m,
+            beta=config.beta,
+            lr=model_lr,
+            ff_dim=model_ff_dim,
+            transformer_heads=model_transformer_heads,
+            transformer_layers=model_transformer_layers,
+            warmup_beta=config.warmup_beta,
+            max_beta=model_max_beta,
+            beta_warmup_steps=model_beta_warmup_steps,
+            free_bits=model_free_bits,
+            transformer_dropout=config.transformer_dropout,
+        )
+    else:
+        model = SeqSetVAE(
+            input_dim=config.input_dim,
+            reduced_dim=config.reduced_dim,
+            latent_dim=config.latent_dim,
+            levels=config.levels,
+            heads=config.heads,
+            m=config.m,
+            beta=config.beta,
+            lr=model_lr,
+            num_classes=config.num_classes,
+            ff_dim=model_ff_dim,
+            transformer_heads=model_transformer_heads,
+            transformer_layers=model_transformer_layers,
+            pretrained_ckpt=None,
+            w=model_w,
+            free_bits=model_free_bits,
+            warmup_beta=config.warmup_beta,
+            max_beta=model_max_beta,
+            beta_warmup_steps=model_beta_warmup_steps,
+            kl_annealing=config.kl_annealing,
+            use_focal_loss=getattr(config, 'use_focal_loss', True),
+            focal_alpha=model_focal_alpha,
+            focal_gamma=model_focal_gamma,
+        )
     
     # Print model architecture details
     print(f"📊 Model Architecture:")
     print(f" - FF dimension: {model_ff_dim}")
     print(f" - Transformer heads: {model_transformer_heads}")
     print(f" - Transformer layers: {model_transformer_layers}")
-            print(f" - Classification head layers: {config.cls_head_layers}")
+    if not args.pretrain:
+        print(f" - Classification head layers: {config.cls_head_layers}")
     
     # Set up training configuration
     print("⚙️ Setting up training configuration...")
     
     # All parameters now use enhanced values by default
-    checkpoint_name = "SeqSetVAE_enhanced"
-    mode_suffix = "_enhanced"
+    checkpoint_name = "SeqSetVAE_pretrain" if args.pretrain else "SeqSetVAE_enhanced"
+    mode_suffix = "_pretrain" if args.pretrain else "_enhanced"
     
     # Ensure subdirectories exist at start
     os.makedirs(os.path.join(checkpoints_root_dir, checkpoint_name), exist_ok=True)
     os.makedirs(os.path.join(logs_root_dir, checkpoint_name), exist_ok=True)
     os.makedirs(os.path.join(analysis_root_dir, checkpoint_name), exist_ok=True)
+
+    # Choose monitor metric
+    if args.pretrain:
+        monitor_metric = 'val_loss'
+        monitor_mode = 'min'
+    else:
+        monitor_mode = "max" if monitor_metric in ["val_auc", "val_auprc"] else "min"
 
     # Set up callbacks
     callbacks = []
@@ -311,7 +341,7 @@ def main():
         filename=f"{checkpoint_name}_batch{args.batch_size}",
         save_top_k=save_top_k,
         monitor=monitor_metric,
-        mode="max" if monitor_metric in ["val_auc", "val_auprc"] else "min",
+        mode=monitor_mode,
         save_last=True,
         save_on_train_epoch_end=False,
     )
@@ -321,7 +351,7 @@ def main():
     early_stopping = EarlyStopping(
         monitor=monitor_metric,
         patience=early_stopping_patience,
-        mode="max" if monitor_metric in ["val_auc", "val_auprc"] else "min",
+        mode=monitor_mode,
         min_delta=early_stopping_min_delta,
         verbose=True,
     )
@@ -333,7 +363,7 @@ def main():
     
     # Set up posterior metrics monitor (write to analysis directory)
     experiment_output_dir = os.path.join(analysis_root_dir, checkpoint_name)
-    monitor = setup_metrics_monitor(args, experiment_output_dir, auc_mode=args.auc_mode)
+    monitor = setup_metrics_monitor(args, experiment_output_dir, auc_mode=(args.auc_mode and not args.pretrain))
     callbacks.append(monitor)
     
     # Set up logger (save under unified logs dir)

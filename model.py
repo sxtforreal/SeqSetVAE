@@ -13,6 +13,7 @@ from modules import (
     recon_loss as chamfer_recon_loss,
 )
 from losses import FocalLoss
+import math
 
 
 def load_checkpoint_weights(checkpoint_path, device='cpu'):
@@ -122,6 +123,348 @@ class _SetDecoder(nn.Module):
             current = layer_out + current.expand_as(layer_out)
         recon = self.out(current)
         return recon
+
+
+##### Pretraining-only Sequential SetVAE (no classifier)
+class SeqSetVAEPretrain(pl.LightningModule):
+    """
+    Pretraining stage for SeqSetVAE without classification.
+    - Encode each set with SetVAE to obtain z_t (history-free latent)
+    - Inject historical info via Transformer with a STRICT causal mask
+    - Decode each enriched state h_t back to the original set to reconstruct
+    - Optimize reconstruction + KL only (with beta warmup)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        reduced_dim: int,
+        latent_dim: int,
+        levels: int,
+        heads: int,
+        m: int,
+        beta: float,
+        lr: float,
+        ff_dim: int,
+        transformer_heads: int,
+        transformer_layers: int,
+        warmup_beta: bool = True,
+        max_beta: float = 0.1,
+        beta_warmup_steps: int = 5000,
+        free_bits: float = 0.1,
+        transformer_dropout: float = 0.1,
+        time_num_frequencies: int = 64,
+    ):
+        super().__init__()
+
+        # Encoder for per-set latents
+        self.set_encoder = SetVAEModule(
+            input_dim=input_dim,
+            reduced_dim=reduced_dim,
+            latent_dim=latent_dim,
+            levels=levels,
+            heads=heads,
+            m=m,
+        )
+
+        # Transformer for historical conditioning (STRICT causal mask)
+        enc_layer = TransformerEncoderLayer(
+            d_model=latent_dim,
+            nhead=transformer_heads,
+            dim_feedforward=ff_dim,
+            dropout=transformer_dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = TransformerEncoder(enc_layer, num_layers=transformer_layers)
+        self.post_transformer_norm = nn.LayerNorm(latent_dim, eps=1e-6)
+
+        # Decoder to reconstruct sets from enriched latents
+        self.decoder = _SetDecoder(
+            latent_dim=latent_dim,
+            reduced_dim=reduced_dim if reduced_dim is not None else input_dim,
+            levels=levels,
+            heads=heads,
+            m=m,
+        )
+
+        # Positional/time encoding design
+        # - Absolute sinusoidal positional encoding (parameter-free, unbounded length)
+        # - Continuous-time Fourier features with log-spaced frequencies -> Linear projection to latent_dim
+        self.time_num_frequencies = max(1, min(time_num_frequencies, latent_dim // 4))
+        low, high = 1e-4, 1.0
+        freqs = torch.exp(torch.linspace(math.log(low), math.log(high), self.time_num_frequencies))
+        self.register_buffer("time_freqs", freqs, persistent=False)  # [K]
+        self.time_proj = nn.Linear(self.time_num_frequencies * 2, latent_dim)
+        self.pos_scale = nn.Parameter(torch.tensor(1.0))
+
+        # Training hyperparameters
+        self.lr = lr
+        self.warmup_beta = warmup_beta
+        self.max_beta = max_beta
+        self.beta_warmup_steps = beta_warmup_steps
+        self.free_bits = free_bits
+        self.latent_dim = latent_dim
+        self.current_step = 0
+
+        # For collapse monitoring
+        self._last_z_list = None
+
+        self.save_hyperparameters()
+
+    # ----------------------- Positional/Time Encoding -----------------------
+    def _sinusoidal_positional_encoding(self, seq_len: int, dim: int, device: torch.device):
+        position = torch.arange(seq_len, device=device).unsqueeze(1)  # [S, 1]
+        div_term = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))  # [D/2]
+        pe = torch.zeros(seq_len, dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe  # [S, D]
+
+    def _time_fourier_encoding(self, minutes: torch.Tensor):
+        # minutes: [B, S] (float)
+        # scale minutes to hours to stabilize
+        t = (minutes.float() / 60.0).unsqueeze(-1)  # [B, S, 1]
+        # [1, 1, K]
+        freqs = self.time_freqs.view(1, 1, -1)
+        ang = t * freqs * 2 * math.pi  # [B, S, K]
+        sin = torch.sin(ang)
+        cos = torch.cos(ang)
+        feats = torch.cat([sin, cos], dim=-1)  # [B, S, 2K]
+        emb = self.time_proj(feats)  # [B, S, D]
+        return emb
+
+    def _apply_positional_encoding(self, x: torch.Tensor, minutes: torch.Tensor):
+        # x: [B, S, D]; minutes: [B, S]
+        B, S, D = x.shape
+        pos = self._sinusoidal_positional_encoding(S, D, x.device)  # [S, D]
+        pos = pos.unsqueeze(0).expand(B, -1, -1) * self.pos_scale  # [B, S, D]
+        time_emb = self._time_fourier_encoding(minutes)  # [B, S, D]
+        return x + pos + time_emb
+
+    # ----------------------- Masks -----------------------
+    def _strict_causal_mask(self, seq_len: int, device: torch.device):
+        # Bool mask: True means blocked (no attention)
+        return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+
+    # ----------------------- Beta schedule -----------------------
+    def _current_beta(self) -> float:
+        if not self.warmup_beta:
+            return self.max_beta
+        if self.current_step < self.beta_warmup_steps:
+            return self.max_beta * (self.current_step / self.beta_warmup_steps)
+        return self.max_beta
+
+    # ----------------------- Core Forward -----------------------
+    def _split_sets(self, var, val, time, set_ids, padding_mask=None):
+        batch_size = var.size(0)
+        all_sets = []
+        for b in range(batch_size):
+            patient_sets = []
+            patient_var = var[b]
+            patient_val = val[b]
+            patient_time = time[b]
+            patient_set_ids = set_ids[b]
+            if padding_mask is not None:
+                patient_padding_mask = padding_mask[b]
+                valid_indices = ~patient_padding_mask
+                if not valid_indices.any():
+                    patient_sets.append({
+                        "var": torch.empty(0, patient_var.size(-1), device=patient_var.device).unsqueeze(0),
+                        "val": torch.empty(0, 1, device=patient_val.device).unsqueeze(0),
+                        "minute": torch.empty(0, 1, device=patient_time.device).unsqueeze(0),
+                    })
+                    all_sets.append(patient_sets)
+                    continue
+                patient_var = patient_var[valid_indices]
+                patient_val = patient_val[valid_indices]
+                patient_time = patient_time[valid_indices]
+                patient_set_ids = patient_set_ids[valid_indices]
+            if len(patient_set_ids) == 0:
+                patient_sets.append({
+                    "var": patient_var.unsqueeze(0),
+                    "val": patient_val.unsqueeze(0),
+                    "minute": patient_time.unsqueeze(0),
+                })
+            else:
+                if patient_set_ids.dim() > 1:
+                    patient_set_ids = patient_set_ids.squeeze(-1)
+                if patient_set_ids.dtype != torch.long:
+                    patient_set_ids = patient_set_ids.long()
+                try:
+                    if hasattr(torch, 'unique_consecutive'):
+                        unique_set_ids, counts = torch.unique_consecutive(patient_set_ids, return_counts=True)
+                    else:
+                        unique_set_ids = torch.unique(patient_set_ids)
+                        counts = torch.tensor([(patient_set_ids == uid).sum().item() for uid in unique_set_ids])
+                    counts_list = [int(c.item()) for c in counts]
+                    if not counts_list or any(c <= 0 for c in counts_list):
+                        patient_sets.append({
+                            "var": patient_var.unsqueeze(0),
+                            "val": patient_val.unsqueeze(0),
+                            "minute": patient_time.unsqueeze(0),
+                        })
+                    else:
+                        indices = torch.split(torch.arange(len(patient_set_ids), device=patient_set_ids.device), counts_list)
+                        for idx in indices:
+                            if len(idx) > 0:
+                                patient_sets.append({
+                                    "var": patient_var[idx].unsqueeze(0),
+                                    "val": patient_val[idx].unsqueeze(0),
+                                    "minute": patient_time[idx].unsqueeze(0),
+                                })
+                except Exception:
+                    patient_sets.append({
+                        "var": patient_var.unsqueeze(0),
+                        "val": patient_val.unsqueeze(0),
+                        "minute": patient_time.unsqueeze(0),
+                    })
+            all_sets.append(patient_sets)
+        return all_sets
+
+    def _forward_single(self, sets):
+        if not isinstance(sets, list):
+            raise ValueError(f"Expected sets to be a list, got {type(sets)}")
+        S = len(sets)
+        if S == 0:
+            device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
+            recon_loss = torch.tensor(0.0, device=device)
+            kl_loss = torch.tensor(0.0, device=device)
+            return recon_loss, kl_loss
+
+        z_prims, kl_total = [], 0.0
+        pos_list = []
+        all_z_lists = []
+        for i, s_dict in enumerate(sets):
+            required_keys = ["var", "val", "minute"]
+            for key in required_keys:
+                if key not in s_dict:
+                    raise ValueError(f"Missing required key '{key}' in s_dict at index {i}")
+            var, val, time = s_dict["var"], s_dict["val"], s_dict["minute"]
+            assert time.unique().numel() == 1, "Time is not constant in this set"
+            minute_val = time.unique().float()
+            pos_list.append(minute_val)
+
+            # Encode set -> z
+            recon_unused, z_list, _ = self.set_encoder(var, val)
+            z_sample, mu, logvar = z_list[-1]
+            z_prims.append(z_sample.squeeze(1))
+            all_z_lists.append(z_list)
+
+            # KL with free-bits
+            kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+            min_kl = self.free_bits * self.latent_dim
+            kl_div = torch.clamp(kl_div, min=min_kl)
+            var_reg = -0.1 * torch.mean(logvar)
+            kl_total += kl_div.mean() + var_reg
+
+        kl_total = kl_total / S
+        z_seq = torch.stack(z_prims, dim=1)  # [B, S, D]
+        pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
+
+        # Positional + time encoding
+        z_seq = self._apply_positional_encoding(z_seq, pos_tensor)
+        z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
+
+        # Strict causal mask
+        attn_mask = self._strict_causal_mask(S, z_seq.device)
+        h_seq = self.transformer(z_seq, mask=attn_mask)
+        h_seq = self.post_transformer_norm(h_seq)
+
+        # Reconstruction
+        recon_loss_total = 0.0
+        valid_sets = 0
+        for idx, s_dict in enumerate(sets):
+            N_t = s_dict["var"].size(1)
+            recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)
+            if self.set_encoder.dim_reducer is not None:
+                reduced = self.set_encoder.dim_reducer(s_dict["var"])
+            else:
+                reduced = s_dict["var"]
+            norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+            reduced_normalized = reduced / (norms + 1e-8)
+            target_x = reduced_normalized * s_dict["val"]
+            recon_loss_total += chamfer_recon_loss(recon, target_x)
+            valid_sets += 1
+
+        if valid_sets > 0:
+            recon_loss_total = recon_loss_total / valid_sets
+
+        if all_z_lists:
+            self._last_z_list = all_z_lists[0]
+
+        return recon_loss_total, kl_total
+
+    def forward(self, batch_or_sets):
+        # Provides compatibility with both direct list-of-sets and dataloader dict
+        if isinstance(batch_or_sets, dict):
+            var, val, time, set_ids = (
+                batch_or_sets["var"],
+                batch_or_sets["val"],
+                batch_or_sets["minute"],
+                batch_or_sets["set_id"],
+            )
+            padding_mask = batch_or_sets.get("padding_mask", None)
+            all_patient_sets = self._split_sets(var, val, time, set_ids, padding_mask)
+            total_recon, total_kl, valid = 0.0, 0.0, 0
+            for patient_sets in all_patient_sets:
+                recon_loss, kl_loss = self._forward_single(patient_sets)
+                total_recon += recon_loss
+                total_kl += kl_loss
+                valid += 1
+            if valid == 0:
+                device = var.device
+                return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            return total_recon / valid, total_kl / valid
+        elif isinstance(batch_or_sets, list):
+            return self._forward_single(batch_or_sets)
+        else:
+            raise ValueError("Unsupported input type for forward")
+
+    # ----------------------- Training hooks -----------------------
+    def training_step(self, batch, batch_idx):
+        recon_loss, kl_loss = self.forward(batch)
+        beta = self._current_beta()
+        total = recon_loss + beta * kl_loss
+        self.log_dict({
+            "train_loss": total,
+            "train_recon": recon_loss,
+            "train_kl": kl_loss,
+            "train_beta": beta,
+        }, prog_bar=True, on_step=True, on_epoch=True)
+        self.logged_metrics = {
+            'train_kl': kl_loss,
+            'train_recon': recon_loss,
+        }
+        self.current_step += 1
+        return total
+
+    def validation_step(self, batch, batch_idx):
+        recon_loss, kl_loss = self.forward(batch)
+        beta = self._current_beta()
+        total = recon_loss + beta * kl_loss
+        self.log_dict({
+            "val_loss": total,
+            "val_recon": recon_loss,
+            "val_kl": kl_loss,
+            "val_beta": beta,
+        }, prog_bar=True, on_step=False, on_epoch=True)
+        return total
+
+    def configure_optimizers(self):
+        optimizer = AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.02)
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=150, verbose=True, min_lr=self.lr * 0.001)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+                "monitor": "val_loss",
+            },
+        }
 
 
 ##### Sequential SetVAE
@@ -717,9 +1060,9 @@ class SeqSetVAE(pl.LightningModule):
             if len(patient_set_ids) == 0:
                 # Empty patient, create empty set
                 patient_sets.append({
-                    "var": torch.empty(0, patient_var.size(-1), device=patient_var.device).unsqueeze(0),
-                    "val": torch.empty(0, 1, device=patient_val.device).unsqueeze(0),
-                    "minute": torch.empty(0, 1, device=patient_time.device).unsqueeze(0),
+                    "var": patient_var.unsqueeze(0),  # [1, N, D]
+                    "val": patient_val.unsqueeze(0),  # [1, N, 1]
+                    "minute": patient_time.unsqueeze(0),  # [1, N, 1]
                 })
             else:
                 # Ensure set_ids is the right shape and type
