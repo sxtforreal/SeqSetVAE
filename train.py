@@ -256,6 +256,9 @@ def main():
             except Exception as e:
                 print(f"⚠️  Failed to load pretrained checkpoint: {e}")
 
+        # Re-initialize classifier head with Xavier for finetune
+        model.init_classifier_head_xavier()
+
         # Freeze everything except classifier head and set backbone eval
         for name, param in model.named_parameters():
             if name.startswith('cls_head'):
