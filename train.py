@@ -277,7 +277,7 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(checkpoints_root_dir, checkpoint_name),
         filename=f"{checkpoint_name}_batch{args.batch_size}",
-        save_top_k=config.save_top_k,
+        save_top_k=1,
         monitor=monitor_metric,
         mode=monitor_mode,
         save_last=True,
@@ -318,7 +318,7 @@ def main():
         logger=logger,
         gradient_clip_val=model_gradient_clip_val,
         accumulate_grad_batches=args.gradient_accumulation_steps,
-        val_check_interval=config.val_check_interval,
+        val_check_interval=0.1,
         limit_val_batches=config.limit_val_batches,
         log_every_n_steps=50,
         deterministic=args.deterministic,
