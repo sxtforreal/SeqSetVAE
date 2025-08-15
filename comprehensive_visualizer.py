@@ -493,7 +493,17 @@ def _plot_input_vs_recon_umap(orig_events: np.ndarray, recon_events: np.ndarray,
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(emb[y == 0, 0], emb[y == 0, 1], s=8, alpha=0.7, c='tab:blue', label='Original')
     ax.scatter(emb[y == 1, 0], emb[y == 1, 1], s=8, alpha=0.7, c='tab:orange', label='Reconstruction')
-    ax.set_title('Events: Original vs Reconstruction (UMAP/PCA)')
+    # Report quantitative alignment in title
+    try:
+        # compute mean nearest-neighbor cosine similarity and l2 distance in original feature space
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=1).fit(orig)
+        dists, idxs = nn.kneighbors(recon)
+        chamfer_like = float(np.mean(dists))
+        title_extra = f"  |  NN-dist(mean)={chamfer_like:.3f}"
+    except Exception:
+        title_extra = ""
+    ax.set_title('Events: Original vs Reconstruction (UMAP/PCA)'+title_extra)
     ax.set_xlabel('Component 1')
     ax.set_ylabel('Component 2')
     ax.legend(frameon=True)
