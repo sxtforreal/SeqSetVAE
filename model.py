@@ -360,7 +360,7 @@ class SeqSetVAEPretrain(pl.LightningModule):
 
             # Encode set -> z
             # Deterministic latent features during pretraining metrics: use mu
-            z_list, _ = self.set_encoder.encode_from_var_val(var, val)
+            _, z_list, _ = self.set_encoder(var, val)
             z_sample, mu, logvar = z_list[-1]
             z_prims.append(mu.squeeze(1))
             all_z_lists.append(z_list)
@@ -907,7 +907,7 @@ class SeqSetVAE(pl.LightningModule):
             pos_list.append(minute_val)
             
             # Deterministic latent features: use posterior mean mu (no sampling)
-            z_list, _ = self.setvae.setvae.encode_from_var_val(var, val)
+            _, z_list, _ = self.setvae.setvae(var, val)
             z_sample, mu, logvar = z_list[-1]
             z_prims.append(mu.squeeze(1))  # use mu as deterministic feature
             
