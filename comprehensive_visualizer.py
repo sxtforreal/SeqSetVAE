@@ -273,6 +273,45 @@ class RealTimeCollapseVisualizer:
         plt.show()
 
 
+def _prepare_state_dict_for_seqsetvae(state_dict):
+    """Clean prefixes and remap keys if checkpoint comes from pretrain module.
+    - Strip leading 'model.' / 'module.'
+    - If keys start with 'set_encoder.', map to 'setvae.setvae.' for SeqSetVAE
+    - Keep transformer/decoder/time-encoding related keys as-is
+    """
+    cleaned = {}
+    for k, v in state_dict.items():
+        new_k = k
+        if new_k.startswith("model."):
+            new_k = new_k[len("model."):]
+        if new_k.startswith("module."):
+            new_k = new_k[len("module."):]
+        cleaned[new_k] = v
+
+    keys = list(cleaned.keys())
+    is_pretrain_ckpt = any(k.startswith("set_encoder.") for k in keys)
+    if not is_pretrain_ckpt:
+        return cleaned
+
+    remapped = {}
+    for k, v in cleaned.items():
+        if k.startswith('set_encoder.'):
+            remapped['setvae.setvae.' + k[len('set_encoder.'):]] = v
+        elif (
+            k.startswith('transformer.') or
+            k.startswith('post_transformer_norm.') or
+            k.startswith('decoder.') or
+            k.startswith('rel_time_bucket_embed.') or
+            k in ('alibi_slope', 'time_tau', 'time_bucket_edges')
+        ):
+            remapped[k] = v
+        else:
+            # Skip unrelated keys (e.g., metrics buffers from different modules)
+            pass
+    print("🔁 Detected pretrain checkpoint; remapped keys for SeqSetVAE.")
+    return remapped
+
+
 def load_model(checkpoint_path, config):
     """Load model from checkpoint - only loads weights since only weights are saved"""
     print(f"Loading model weights from {checkpoint_path}")
@@ -308,6 +347,9 @@ def load_model(checkpoint_path, config):
     
     # Load checkpoint weights using utility function
     state_dict = load_checkpoint_weights(checkpoint_path, device='cpu')
+    
+    # Clean/remap keys if needed (e.g., pretrain -> finetune)
+    state_dict = _prepare_state_dict_for_seqsetvae(state_dict)
     
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
