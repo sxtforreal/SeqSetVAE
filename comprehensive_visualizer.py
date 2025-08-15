@@ -473,22 +473,31 @@ def _plot_input_vs_recon_umap(orig_events: np.ndarray, recon_events: np.ndarray,
         orig = orig[idx]
         recon = recon[idx]
         n = max_points
-    X = np.concatenate([orig, recon], axis=0)
+    # Labels for plotting
     y = np.concatenate([np.zeros(n, dtype=int), np.ones(n, dtype=int)], axis=0)
-    # Standardize features for better manifold projection
+    # Standardize using ORIGINAL data only; then apply the same transform to recon
     try:
-        X_scaled = StandardScaler(with_mean=True, with_std=True).fit_transform(X)
+        scaler = StandardScaler(with_mean=True, with_std=True).fit(orig)
+        orig_scaled = scaler.transform(orig)
+        recon_scaled = scaler.transform(recon)
     except Exception:
-        X_scaled = X
-    # Fit reducer
+        orig_scaled = orig
+        recon_scaled = recon
+    # Fit reducer on ORIGINAL only, then transform RECON into the same space
     try:
         if umap is not None:
             reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
-            emb = reducer.fit_transform(X_scaled)
+            orig_emb = reducer.fit_transform(orig_scaled)
+            recon_emb = reducer.transform(recon_scaled)
         else:
-            emb = PCA(n_components=2).fit_transform(X_scaled)
+            pca = PCA(n_components=2)
+            orig_emb = pca.fit_transform(orig_scaled)
+            recon_emb = pca.transform(recon_scaled)
     except Exception:
-        emb = PCA(n_components=2).fit_transform(X_scaled)
+        pca = PCA(n_components=2)
+        orig_emb = pca.fit_transform(orig_scaled)
+        recon_emb = pca.transform(recon_scaled)
+    emb = np.vstack([orig_emb, recon_emb])
     # Plot
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(emb[y == 0, 0], emb[y == 0, 1], s=8, alpha=0.7, c='tab:blue', label='Original')
@@ -497,8 +506,8 @@ def _plot_input_vs_recon_umap(orig_events: np.ndarray, recon_events: np.ndarray,
     try:
         # compute mean nearest-neighbor cosine similarity and l2 distance in original feature space
         from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=1).fit(orig)
-        dists, idxs = nn.kneighbors(recon)
+        nn = NearestNeighbors(n_neighbors=1).fit(orig_scaled)
+        dists, idxs = nn.kneighbors(recon_scaled)
         chamfer_like = float(np.mean(dists))
         title_extra = f"  |  NN-dist(mean)={chamfer_like:.3f}"
     except Exception:
