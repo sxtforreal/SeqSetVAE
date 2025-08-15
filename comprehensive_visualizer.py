@@ -430,8 +430,43 @@ def plot_single_sample_visualizations(results, save_dir, sample_idx=0):
     for level, mu in enumerate(mus):
         mu_ = mu[0]
         if mu_.shape[-1] > 2:
-            tsne = TSNE(n_components=2, random_state=42)
-            mu_2d = tsne.fit_transform(mu_)
+            n_samples = mu_.shape[0]
+            if n_samples < 2:
+                if mu_.shape[1] >= 2:
+                    mu_2d = mu_[:, :2]
+                else:
+                    mu_2d = np.hstack([mu_, np.zeros((n_samples, 2 - mu_.shape[1]))])
+            elif n_samples < 5:
+                try:
+                    mu_2d = PCA(n_components=2).fit_transform(mu_)
+                except Exception:
+                    if mu_.shape[1] >= 2:
+                        mu_2d = mu_[:, :2]
+                    else:
+                        mu_2d = np.hstack([mu_, np.zeros((n_samples, 2 - mu_.shape[1]))])
+            else:
+                safe_perplexity = min(30.0, max(5.0, float(n_samples - 1) / 3.0))
+                if safe_perplexity >= n_samples:
+                    safe_perplexity = float(n_samples - 1)
+                    if safe_perplexity < 2.0:
+                        safe_perplexity = 2.0
+                try:
+                    tsne = TSNE(
+                        n_components=2,
+                        random_state=42,
+                        perplexity=safe_perplexity,
+                        init="random",
+                        learning_rate="auto",
+                    )
+                    mu_2d = tsne.fit_transform(mu_)
+                except Exception:
+                    try:
+                        mu_2d = PCA(n_components=2).fit_transform(mu_)
+                    except Exception:
+                        if mu_.shape[1] >= 2:
+                            mu_2d = mu_[:, :2]
+                        else:
+                            mu_2d = np.hstack([mu_, np.zeros((n_samples, 2 - mu_.shape[1]))])
         else:
             mu_2d = mu_
         ax1.scatter(mu_2d[:, 0], mu_2d[:, 1], alpha=0.7, label=f'Level {level}')
