@@ -393,6 +393,8 @@ class SeqSetVAEPretrain(pl.LightningModule):
         # Reconstruction
         recon_loss_total = 0.0
         valid_sets = 0
+        last_recon_list = []
+        last_target_list = []
         for idx, s_dict in enumerate(sets):
             N_t = s_dict["var"].size(1)
             recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)
@@ -403,11 +405,24 @@ class SeqSetVAEPretrain(pl.LightningModule):
             norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
             reduced_normalized = reduced / (norms + 1e-8)
             target_x = reduced_normalized * s_dict["val"]
+            # store for visualization
+            try:
+                last_recon_list.append(recon.detach())
+                last_target_list.append(target_x.detach())
+            except Exception:
+                pass
             recon_loss_total += chamfer_recon_loss(recon, target_x)
             valid_sets += 1
 
         if valid_sets > 0:
             recon_loss_total = recon_loss_total / valid_sets
+
+        # Save last reconstructions and targets for visualization
+        try:
+            self._last_recon_list = locals().get('last_recon_list', [])
+            self._last_target_list = locals().get('last_target_list', [])
+        except Exception:
+            pass
 
         if all_z_lists:
             self._last_z_list = all_z_lists[0]
@@ -930,20 +945,37 @@ class SeqSetVAE(pl.LightningModule):
         else:
             recon_loss_total = 0.0
             valid_sets = 0
+            last_recon_list = []
+            last_target_list = []
             for idx, s_dict in enumerate(sets):
                 N_t = s_dict["var"].size(1)
                 recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)
                 if self.setvae.setvae.dim_reducer is not None:
-                    reduced = self.setvae.setvae.dim_reducer(s_dict["var"])
+                    reduced = self.setvae.setvae.dim_reducer(s_dict["var"]) 
                 else:
                     reduced = s_dict["var"]
                 norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
                 reduced_normalized = reduced / (norms + 1e-8)
                 target_x = reduced_normalized * s_dict["val"]
+                # store for visualization
+                try:
+                    last_recon_list.append(recon.detach())
+                    last_target_list.append(target_x.detach())
+                except Exception:
+                    pass
                 recon_loss_total += chamfer_recon_loss(recon, target_x)
                 valid_sets += 1
             if valid_sets > 0:
                 recon_loss_total /= valid_sets
+            # expose concatenated tensors if possible
+            try:
+                self._last_recon_list = last_recon_list
+                self._last_target_list = last_target_list
+                self._last_recon_cat = torch.cat(last_recon_list, dim=1) if len(last_recon_list) > 0 else None
+                self._last_target_cat = torch.cat(last_target_list, dim=1) if len(last_target_list) > 0 else None
+            except Exception:
+                self._last_recon_cat = None
+                self._last_target_cat = None
         
         # Enhanced feature extraction using multi-scale pooling
         enhanced_features = self._extract_enhanced_features(h_seq)

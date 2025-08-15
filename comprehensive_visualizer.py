@@ -16,7 +16,12 @@ from matplotlib.patches import Rectangle
 import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
-# import umap  # optional
+from sklearn.preprocessing import StandardScaler
+# Try to import UMAP; fall back later if unavailable
+try:
+    import umap
+except Exception:
+    umap = None
 import argparse
 import os
 import json
@@ -381,6 +386,14 @@ def collect_single_sample_representations(model, dataloader, sample_idx=0):
         'mus': mus,
         'logvars': logvars,
     }
+    # Try to fetch reconstructions and targets from model for later visualization
+    try:
+        if hasattr(model, '_last_recon_cat') and model._last_recon_cat is not None:
+            results['recon_events'] = model._last_recon_cat.detach().cpu().numpy()
+        if hasattr(model, '_last_target_cat') and model._last_target_cat is not None:
+            results['orig_events'] = model._last_target_cat.detach().cpu().numpy()
+    except Exception:
+        pass
     return results
 
 
@@ -412,6 +425,60 @@ def analyze_single_sample_posterior_collapse(mus, logvars, threshold=0.01):
     return collapse_analysis
 
 
+def _plot_input_vs_recon_umap(orig_events: np.ndarray, recon_events: np.ndarray, save_dir: str, sample_idx: int):
+    """Project original vs reconstructed events to 2D and overlay scatter.
+    Uses UMAP if available; otherwise falls back to PCA.
+    """
+    if orig_events is None or recon_events is None:
+        print("⚠️  Skipping UMAP overlay: missing original or reconstructed events")
+        return
+    # Squeeze batch dim if present
+    if orig_events.ndim == 3:
+        orig_events = orig_events[0]
+    if recon_events.ndim == 3:
+        recon_events = recon_events[0]
+    # Align lengths (in case of slight mismatch)
+    n = min(len(orig_events), len(recon_events))
+    orig = orig_events[:n]
+    recon = recon_events[:n]
+    # Optionally subsample to keep visualization responsive
+    max_points = 10000
+    if n > max_points:
+        idx = np.random.choice(n, size=max_points, replace=False)
+        orig = orig[idx]
+        recon = recon[idx]
+        n = max_points
+    X = np.concatenate([orig, recon], axis=0)
+    y = np.concatenate([np.zeros(n, dtype=int), np.ones(n, dtype=int)], axis=0)
+    # Standardize features for better manifold projection
+    try:
+        X_scaled = StandardScaler(with_mean=True, with_std=True).fit_transform(X)
+    except Exception:
+        X_scaled = X
+    # Fit reducer
+    try:
+        if umap is not None:
+            reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+            emb = reducer.fit_transform(X_scaled)
+        else:
+            emb = PCA(n_components=2).fit_transform(X_scaled)
+    except Exception:
+        emb = PCA(n_components=2).fit_transform(X_scaled)
+    # Plot
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(emb[y == 0, 0], emb[y == 0, 1], s=8, alpha=0.7, c='tab:blue', label='Original')
+    ax.scatter(emb[y == 1, 0], emb[y == 1, 1], s=8, alpha=0.7, c='tab:orange', label='Reconstruction')
+    ax.set_title('Events: Original vs Reconstruction (UMAP/PCA)')
+    ax.set_xlabel('Component 1')
+    ax.set_ylabel('Component 2')
+    ax.legend(frameon=True)
+    ax.grid(True, alpha=0.3)
+    save_path = os.path.join(save_dir, f'events_umap_overlay_sample_{sample_idx}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✅ UMAP overlay saved to: {save_path}")
+    plt.close(fig)
+
+
 def plot_single_sample_visualizations(results, save_dir, sample_idx=0):
     """Create visualizations for a single sample using latent mus/logvars only."""
     print(f"Creating visualizations for sample {sample_idx}")
@@ -420,6 +487,14 @@ def plot_single_sample_visualizations(results, save_dir, sample_idx=0):
     mus = results['mus']
     logvars = results['logvars']
     collapse_analysis = analyze_single_sample_posterior_collapse(mus, logvars)
+
+    # Optional: UMAP overlay of original vs reconstructed events
+    _plot_input_vs_recon_umap(
+        results.get('orig_events', None),
+        results.get('recon_events', None),
+        save_dir,
+        sample_idx
+    )
 
     # Figure layout (3 rows x 2 cols)
     fig = plt.figure(figsize=(18, 14))
