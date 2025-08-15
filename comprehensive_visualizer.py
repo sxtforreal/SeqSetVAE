@@ -32,7 +32,7 @@ from collections import deque
 from pathlib import Path
 from tqdm import tqdm
 
-from model import SeqSetVAE
+from model import SeqSetVAE, SeqSetVAEPretrain, load_checkpoint_weights
 from dataset import SeqSetVAEDataModule
 import config
 
@@ -278,59 +278,84 @@ class RealTimeCollapseVisualizer:
         plt.show()
 
 
-def load_model(checkpoint_path, config):
-    """Load model from checkpoint - only loads weights since only weights are saved"""
+def load_model(checkpoint_path, config, checkpoint_type: str = 'auto'):
+    """Load model from checkpoint with auto checkpoint-type detection.
+    If the checkpoint was saved from pretraining (keys start with 'set_encoder.'),
+    we instantiate SeqSetVAEPretrain. Otherwise we use SeqSetVAE.
+    """
     print(f"Loading model weights from {checkpoint_path}")
-    
-    model = SeqSetVAE(
-        input_dim=config.input_dim,
-        reduced_dim=config.reduced_dim,
-        latent_dim=config.latent_dim,
-        levels=config.levels,
-        heads=config.heads,
-        m=config.m,
-        beta=config.beta,
-        lr=config.lr,
-        num_classes=config.num_classes,
-        ff_dim=config.ff_dim,
-        transformer_heads=config.transformer_heads,
-        transformer_layers=config.transformer_layers,
-        freeze_ratio=0.0,
-        pretrained_ckpt=None,  # Don't load pretrained here
-        w=config.w,
-        free_bits=config.free_bits,
-        warmup_beta=config.warmup_beta,
-        max_beta=config.max_beta,
-        beta_warmup_steps=config.beta_warmup_steps,
-        kl_annealing=config.kl_annealing,
-    )
-    
-    # Import the utility function from model.py
-    import sys
-    import os
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-    from model import load_checkpoint_weights
-    
-    # Load checkpoint weights using utility function
+
+    # Load raw state dict (weights only)
     state_dict = load_checkpoint_weights(checkpoint_path, device='cpu')
-    
-    # Load state dict
+
+    # Auto-detect checkpoint type if requested
+    if checkpoint_type == 'auto':
+        if any(k.startswith('set_encoder.') for k in state_dict.keys()):
+            checkpoint_type = 'pretrain'
+        else:
+            checkpoint_type = 'finetune'
+    print(f"Detected/selected checkpoint type: {checkpoint_type}")
+
+    # Build the appropriate model
+    if checkpoint_type == 'pretrain':
+        model = SeqSetVAEPretrain(
+            input_dim=config.input_dim,
+            reduced_dim=config.reduced_dim,
+            latent_dim=config.latent_dim,
+            levels=config.levels,
+            heads=config.heads,
+            m=config.m,
+            beta=config.beta,
+            lr=config.lr,
+            ff_dim=config.ff_dim,
+            transformer_heads=config.transformer_heads,
+            transformer_layers=config.transformer_layers,
+            warmup_beta=config.warmup_beta,
+            max_beta=config.max_beta,
+            beta_warmup_steps=config.beta_warmup_steps,
+            free_bits=config.free_bits,
+        )
+    else:
+        model = SeqSetVAE(
+            input_dim=config.input_dim,
+            reduced_dim=config.reduced_dim,
+            latent_dim=config.latent_dim,
+            levels=config.levels,
+            heads=config.heads,
+            m=config.m,
+            beta=config.beta,
+            lr=config.lr,
+            num_classes=config.num_classes,
+            ff_dim=config.ff_dim,
+            transformer_heads=config.transformer_heads,
+            transformer_layers=config.transformer_layers,
+            freeze_ratio=0.0,
+            pretrained_ckpt=None,
+            w=config.w,
+            free_bits=config.free_bits,
+            warmup_beta=config.warmup_beta,
+            max_beta=config.max_beta,
+            beta_warmup_steps=config.beta_warmup_steps,
+            kl_annealing=config.kl_annealing,
+        )
+
+    # Load parameters (non-strict so extra classifier heads etc. won't block)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    
+
     if missing_keys:
         print(f"⚠️  Missing keys: {len(missing_keys)} parameters not loaded")
-        if len(missing_keys) <= 5:  # Show first few missing keys
+        if len(missing_keys) <= 5:
             for key in missing_keys[:5]:
                 print(f"   - {key}")
     else:
         print("✅ All model parameters loaded successfully")
-    
+
     if unexpected_keys:
         print(f"⚠️  Unexpected keys: {len(unexpected_keys)} extra parameters ignored")
-        if len(unexpected_keys) <= 5:  # Show first few unexpected keys
+        if len(unexpected_keys) <= 5:
             for key in unexpected_keys[:5]:
                 print(f"   - {key}")
-    
+
     return model
 
 
@@ -468,7 +493,17 @@ def _plot_input_vs_recon_umap(orig_events: np.ndarray, recon_events: np.ndarray,
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(emb[y == 0, 0], emb[y == 0, 1], s=8, alpha=0.7, c='tab:blue', label='Original')
     ax.scatter(emb[y == 1, 0], emb[y == 1, 1], s=8, alpha=0.7, c='tab:orange', label='Reconstruction')
-    ax.set_title('Events: Original vs Reconstruction (UMAP/PCA)')
+    # Report quantitative alignment in title
+    try:
+        # compute mean nearest-neighbor cosine similarity and l2 distance in original feature space
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=1).fit(orig)
+        dists, idxs = nn.kneighbors(recon)
+        chamfer_like = float(np.mean(dists))
+        title_extra = f"  |  NN-dist(mean)={chamfer_like:.3f}"
+    except Exception:
+        title_extra = ""
+    ax.set_title('Events: Original vs Reconstruction (UMAP/PCA)'+title_extra)
     ax.set_xlabel('Component 1')
     ax.set_ylabel('Component 2')
     ax.legend(frameon=True)
@@ -634,6 +669,8 @@ def main():
                        help='Visualization mode: static analysis or real-time monitoring')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
+    parser.add_argument('--checkpoint_type', type=str, choices=['auto', 'pretrain', 'finetune'], default='auto',
+                       help='Type of checkpoint to load (auto-detect by default)')
     parser.add_argument('--data_dir', type=str, required=True,
                        help='Path to data directory (patient_ehr folder)')
     parser.add_argument('--params_map_path', type=str, required=True,
@@ -657,7 +694,7 @@ def main():
         
         # Load model
         model_config = Config()
-        model = load_model(args.checkpoint, model_config)
+        model = load_model(args.checkpoint, model_config, checkpoint_type=args.checkpoint_type)
         
         # Load data
         data_module = SeqSetVAEDataModule(
