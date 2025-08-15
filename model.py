@@ -949,7 +949,7 @@ class SeqSetVAE(pl.LightningModule):
             last_target_list = []
             for idx, s_dict in enumerate(sets):
                 N_t = s_dict["var"].size(1)
-                recon = self.decoder(h_seq[:, idx], N_t, noise_std=0.3)
+                recon = self.decoder(h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3))
                 if self.setvae.setvae.dim_reducer is not None:
                     reduced = self.setvae.setvae.dim_reducer(s_dict["var"]) 
                 else:
