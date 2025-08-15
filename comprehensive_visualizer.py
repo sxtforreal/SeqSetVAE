@@ -519,9 +519,22 @@ def plot_single_sample_visualizations(results, save_dir, sample_idx=0):
     # 5. Correlation matrix of concatenated mus
     ax5 = fig.add_subplot(gs[2, 1])
     if len(mus) > 0:
-        mu_combined = np.concatenate([m[0] for m in mus], axis=1)
-        corr_matrix = np.corrcoef(mu_combined.T)
-        im = ax5.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+        # Estimate correlation via Monte Carlo samples from q(z|x) to avoid empty heatmap with batch_size=1
+        num_mc_samples = 512
+        samples_list = []
+        for mu, logvar in zip(mus, logvars):
+            mu_vec = np.asarray(mu[0]).squeeze(0)
+            logvar_vec = np.asarray(logvar[0]).squeeze(0)
+            std_vec = np.exp(0.5 * logvar_vec)
+            std_vec = np.maximum(std_vec, 1e-6)
+            samples = np.random.normal(loc=mu_vec, scale=std_vec, size=(num_mc_samples, mu_vec.shape[-1]))
+            samples_list.append(samples)
+        sample_matrix = np.concatenate(samples_list, axis=1)
+        # compute correlation across dimensions
+        corr_matrix = np.corrcoef(sample_matrix, rowvar=False)
+        # sanitize possible NaNs/Infs
+        corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        im = ax5.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1, aspect='auto')
         ax5.set_title('Latent Mean Correlations')
         plt.colorbar(im, ax=ax5)
 
