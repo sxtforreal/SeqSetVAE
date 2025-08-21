@@ -190,6 +190,7 @@ def main():
 
     print("🧠 Building model...")
     if args.mode == 'pretrain':
+        print("📋 Using SeqSetVAEPretrain - maintains original design for representation learning")
         model = SeqSetVAEPretrain(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,
@@ -220,6 +221,7 @@ def main():
         monitor_metric = 'val_loss'
         monitor_mode = 'min'
     else:
+        print("📋 Using SeqSetVAE - enhanced with modern VAE features and complete freezing for finetune")
         model = SeqSetVAE(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,

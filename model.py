@@ -1170,8 +1170,11 @@ class SeqSetVAE(pl.LightningModule):
 
     def _fuse_vae_features(self, mu, logvar):
         """
-        Advanced VAE feature fusion using both mean and variance information.
-        Based on recent research in VAE representation learning.
+        Advanced VAE feature fusion for FINETUNE MODEL ONLY.
+        Uses both mean and variance information for better classification performance.
+        
+        NOTE: This method is only used in SeqSetVAE (finetune model).
+        SeqSetVAEPretrain maintains the original simple design using only mu.
         
         Args:
             mu: [B, latent_dim] - posterior mean
@@ -1183,7 +1186,7 @@ class SeqSetVAE(pl.LightningModule):
         # Convert logvar to std for more interpretable variance features
         std = torch.exp(0.5 * logvar)  # [B, latent_dim]
         
-        # Method 1: Learnable gated fusion (inspired by recent VAE literature)
+        # Method 1: Learnable gated fusion (for full training mode)
         if hasattr(self, 'vae_feature_fusion') and not self.classification_only:
             # Project mean and variance to same space
             mu_proj = self.vae_feature_fusion['mean_projection'](mu)
@@ -1202,9 +1205,9 @@ class SeqSetVAE(pl.LightningModule):
             
             return fused
         
-        # Method 2: Simple but effective fusion for classification-only mode (more stable)
+        # Method 2: Simple but effective fusion for classification-only finetune mode
         else:
-            # Uncertainty-aware feature weighting
+            # Uncertainty-aware feature weighting for stable finetune performance
             uncertainty = torch.mean(std, dim=-1, keepdim=True)  # [B, 1] - average uncertainty
             uncertainty_weight = torch.sigmoid(-uncertainty + 1.0)  # Higher certainty -> higher weight
             

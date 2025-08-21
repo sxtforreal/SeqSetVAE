@@ -2,13 +2,19 @@
 
 ## 🎯 改进概述
 
-根据你的要求，我们对SeqSetVAE的微调阶段进行了三个关键改进，这些改进应该能显著提升AUC和AUPRC性能：
+根据你的要求，我们实现了**预训练与微调的完全分离**，并对微调阶段进行了三个关键改进：
+
+- ✅ **预训练阶段**: 完全保持原有设计，使用`SeqSetVAEPretrain`类
+- ✅ **微调阶段**: 应用现代改进，使用增强的`SeqSetVAE`类
+- ✅ **完全分离**: 两个阶段互不影响，各自专注于自己的目标
 
 ## 📋 具体改进内容
 
-### 1. ✅ 确保完整的预训练权重加载
+**重要**: 以下改进**仅应用于微调阶段的`SeqSetVAE`类**，预训练阶段的`SeqSetVAEPretrain`类完全保持原有设计。
 
-**问题**: 原代码中预训练权重加载被禁用，导致模型从随机初始化开始训练。
+### 1. ✅ 确保完整的预训练权重加载 (仅微调阶段)
+
+**问题**: 原微调代码中预训练权重加载被禁用，导致模型从随机初始化开始训练。
 
 **解决方案**:
 - 完全重写了预训练权重加载逻辑 (`model.py` 第554-617行)
@@ -78,18 +84,26 @@ def _fuse_vae_features(self, mu, logvar):
 
 ## 🚀 使用方法
 
-### 1. 使用优化的配置进行训练
+### 1. 预训练阶段 (保持原有设计)
 
 ```bash
-# 使用新的finetune配置
+# 预训练使用SeqSetVAEPretrain - 完全保持原有设计
+python train.py --mode pretrain \
+    --batch_size 8 \
+    --max_epochs 100
+```
+
+### 2. 微调阶段 (使用改进设计)
+
+```bash
+# 微调使用SeqSetVAE - 应用现代改进
 python train.py --mode finetune \
     --pretrained_ckpt your_pretrain_checkpoint.ckpt \
-    --config finetune_config \
     --batch_size 4 \
     --max_epochs 15
 ```
 
-### 2. 使用调试脚本分析性能
+### 3. 使用调试脚本分析性能
 
 ```bash
 python debug_finetune.py \
