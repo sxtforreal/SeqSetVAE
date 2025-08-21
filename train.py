@@ -261,13 +261,14 @@ def main():
         # Re-initialize classifier head with Xavier for finetune
         model.init_classifier_head_xavier()
 
-        # Freeze everything except classifier head and set backbone eval
+        # Freeze everything except classifier head - COMPLETE FREEZE for better stability
         frozen_params = 0
         trainable_params = 0
         for name, param in model.named_parameters():
-            if name.startswith('cls_head') or name.startswith('feature_projection'):
+            if name.startswith('cls_head'):
                 param.requires_grad = True
                 trainable_params += param.numel()
+                print(f"   ✅ Trainable: {name} ({param.numel():,} params)")
             else:
                 param.requires_grad = False
                 frozen_params += param.numel()

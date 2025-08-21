@@ -523,7 +523,7 @@ class SeqSetVAE(pl.LightningModule):
         ff_dim: int,
         transformer_heads: int,
         transformer_layers: int,
-        freeze_ratio: float = 0.0,  # Default: no freezing
+
         pretrained_ckpt: str = None,
         w: float = 1.0,
         free_bits: float = 0.1,
@@ -551,28 +551,70 @@ class SeqSetVAE(pl.LightningModule):
             lr,
         )
         
-        # Load pretrained weights if provided
+        # Load pretrained weights if provided - CRITICAL for good performance
         if pretrained_ckpt is not None:
             try:
                 print(f"🔄 Loading pretrained weights from: {pretrained_ckpt}")
                 state_dict = load_checkpoint_weights(pretrained_ckpt, device='cpu')
-                # Only load SetVAE related parameters
-                setvae_state = {}
-                for k, v in state_dict.items():
-                    if k.startswith('setvae.'):
-                        setvae_state[k] = v
                 
-                missing, unexpected = self.setvae.load_state_dict(setvae_state, strict=False)
-                print(f"✅ Loaded pretrained SetVAE weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+                # Load all compatible parameters except classifier head
+                loaded_params = {}
+                skipped_params = []
+                
+                for k, v in state_dict.items():
+                    # Skip classifier head parameters (will be randomly initialized)
+                    if k.startswith('cls_head'):
+                        skipped_params.append(k)
+                        continue
+                    
+                    # Try to load all other parameters
+                    if k in self.state_dict():
+                        if self.state_dict()[k].shape == v.shape:
+                            loaded_params[k] = v
+                        else:
+                            print(f"⚠️ Shape mismatch for {k}: {self.state_dict()[k].shape} vs {v.shape}")
+                            skipped_params.append(k)
+                    else:
+                        # Try to map keys for compatibility
+                        mapped_key = None
+                        if k.startswith('set_encoder.'):
+                            mapped_key = 'setvae.setvae.' + k[len('set_encoder.'):]
+                        elif k.startswith('setvae.'):
+                            mapped_key = k
+                        elif k.startswith('transformer.'):
+                            mapped_key = k
+                        elif k.startswith('post_transformer_norm.'):
+                            mapped_key = k
+                        elif k.startswith('decoder.'):
+                            mapped_key = k
+                        
+                        if mapped_key and mapped_key in self.state_dict():
+                            if self.state_dict()[mapped_key].shape == v.shape:
+                                loaded_params[mapped_key] = v
+                            else:
+                                skipped_params.append(f"{k} -> {mapped_key}")
+                        else:
+                            skipped_params.append(k)
+                
+                # Load the compatible parameters
+                missing, unexpected = self.load_state_dict(loaded_params, strict=False)
+                
+                print(f"✅ Loaded pretrained weights:")
+                print(f"   - Successfully loaded: {len(loaded_params)} parameters")
+                print(f"   - Missing: {len(missing)} parameters")
+                print(f"   - Unexpected: {len(unexpected)} parameters")
+                print(f"   - Skipped: {len(skipped_params)} parameters")
+                
+                if len(loaded_params) == 0:
+                    print("❌ WARNING: No parameters were loaded! Check checkpoint compatibility.")
+                    
             except Exception as e:
-                print(f"⚠️ Failed to load pretrained weights: {e}")
-                print("🔄 Continuing with random initialization...")
-
-        # Freeze X% pretrained parameters
-        set_params = list(self.setvae.parameters())
-        freeze_cnt = int(len(set_params) * freeze_ratio)
-        for p in set_params[:freeze_cnt]:
-            p.requires_grad = False
+                print(f"❌ Failed to load pretrained weights: {e}")
+                print("❌ This will significantly hurt performance!")
+                raise e  # Don't continue with random initialization
+        else:
+            print("⚠️ WARNING: No pretrained checkpoint provided - using random initialization!")
+            print("⚠️ This will significantly hurt finetune performance!")
 
         # Enhanced Transformer encoder with improved configuration for better AUC/AUPRC
         enc_layer = TransformerEncoderLayer(
@@ -652,6 +694,22 @@ class SeqSetVAE(pl.LightningModule):
             nn.ReLU(),
             nn.Dropout(0.1)
         )
+        
+        # Modern VAE feature fusion module - learnable combination of mean and variance
+        self.vae_feature_fusion = nn.ModuleDict({
+            'mean_projection': nn.Linear(latent_dim, latent_dim),
+            'var_projection': nn.Linear(latent_dim, latent_dim),
+            'fusion_gate': nn.Sequential(
+                nn.Linear(latent_dim * 2, latent_dim),
+                nn.Sigmoid()
+            ),
+            'uncertainty_calibration': nn.Sequential(
+                nn.Linear(latent_dim, latent_dim // 4),
+                nn.ReLU(),
+                nn.Linear(latent_dim // 4, 1),
+                nn.Sigmoid()
+            )
+        })
 
         # Metrics
         task_type = "binary" if num_classes == 2 else "multiclass"
@@ -921,10 +979,18 @@ class SeqSetVAE(pl.LightningModule):
             minute_val = time.unique().float()  # Ensure float type
             pos_list.append(minute_val)
             
-            # Deterministic latent features: use posterior mean mu (no sampling)
+            # Modern VAE feature extraction: use both mean and variance for richer representation
             _, z_list, _ = self.setvae.setvae(var, val)
             z_sample, mu, logvar = z_list[-1]
-            z_prims.append(mu.squeeze(1))  # use mu as deterministic feature
+            
+            # Extract and process mean and variance features
+            mu_feat = mu.squeeze(1)  # [B, latent_dim]
+            logvar_feat = logvar.squeeze(1)  # [B, latent_dim] - keep as logvar for numerical stability
+            
+            # Apply learnable VAE feature fusion
+            combined_feat = self._fuse_vae_features(mu_feat, logvar_feat)
+            
+            z_prims.append(combined_feat)
             
             # Collect latent variable information (for collapse detector)
             all_z_lists.append(z_list)
@@ -1101,6 +1167,56 @@ class SeqSetVAE(pl.LightningModule):
         enhanced_features = self.feature_projection(combined_features)  # [B, D]
         
         return enhanced_features
+
+    def _fuse_vae_features(self, mu, logvar):
+        """
+        Advanced VAE feature fusion using both mean and variance information.
+        Based on recent research in VAE representation learning.
+        
+        Args:
+            mu: [B, latent_dim] - posterior mean
+            logvar: [B, latent_dim] - posterior log variance
+            
+        Returns:
+            fused_features: [B, latent_dim] - enhanced features combining mean and uncertainty
+        """
+        # Convert logvar to std for more interpretable variance features
+        std = torch.exp(0.5 * logvar)  # [B, latent_dim]
+        
+        # Method 1: Learnable gated fusion (inspired by recent VAE literature)
+        if hasattr(self, 'vae_feature_fusion') and not self.classification_only:
+            # Project mean and variance to same space
+            mu_proj = self.vae_feature_fusion['mean_projection'](mu)
+            var_proj = self.vae_feature_fusion['var_projection'](std)
+            
+            # Learn fusion gate based on both mean and variance
+            concat_features = torch.cat([mu_proj, var_proj], dim=-1)
+            fusion_gate = self.vae_feature_fusion['fusion_gate'](concat_features)
+            
+            # Gated combination
+            fused = fusion_gate * mu_proj + (1 - fusion_gate) * var_proj
+            
+            # Uncertainty calibration - use variance to modulate confidence
+            uncertainty_score = self.vae_feature_fusion['uncertainty_calibration'](std.mean(dim=-1, keepdim=True))
+            fused = fused * (1.0 + 0.1 * uncertainty_score)  # Slight modulation based on uncertainty
+            
+            return fused
+        
+        # Method 2: Simple but effective fusion for classification-only mode (more stable)
+        else:
+            # Uncertainty-aware feature weighting
+            uncertainty = torch.mean(std, dim=-1, keepdim=True)  # [B, 1] - average uncertainty
+            uncertainty_weight = torch.sigmoid(-uncertainty + 1.0)  # Higher certainty -> higher weight
+            
+            # Variance-modulated mean features
+            # High variance -> more exploration, low variance -> more exploitation
+            variance_modulation = 1.0 + 0.05 * torch.tanh(std)  # Small modulation to avoid instability
+            modulated_mu = mu * variance_modulation
+            
+            # Combine with uncertainty weighting
+            fused = uncertainty_weight * modulated_mu + (1 - uncertainty_weight) * mu
+            
+            return fused
 
     # Helpers
     def _split_sets(self, var, val, time, set_ids, padding_mask=None):
@@ -1445,11 +1561,13 @@ class SeqSetVAE(pl.LightningModule):
         self.transformer.eval()
         self.post_transformer_norm.eval()
         self.decoder.eval()
-        # Ensure pooling/projection parts are deterministic too
+        # Ensure all backbone components are in eval mode
         if hasattr(self, 'feature_fusion'):
             self.feature_fusion.eval()
         if hasattr(self, 'feature_projection'):
             self.feature_projection.eval()
+        if hasattr(self, 'vae_feature_fusion'):
+            self.vae_feature_fusion.eval()
  
     def on_train_start(self):
         if self.classification_only:

@@ -10,13 +10,13 @@ from config import *  # Import base config
 
 # ====== 关键改进设置 ======
 
-# 1. 更保守的学习率设置
-cls_head_lr = 2e-4  # 降低分类头学习率，避免过快收敛
-lr = 5e-5  # 保持backbone学习率较低
+# 1. 更保守的学习率设置 (针对完全冻结的backbone)
+cls_head_lr = 1e-4  # 进一步降低分类头学习率，配合完全冻结的backbone
+lr = 1e-5  # backbone学习率(虽然会被冻结，但用于初始化)
 
-# 2. 更好的正则化
-cls_head_weight_decay = 0.02  # 增加分类头的权重衰减
-dropout_rate = 0.3  # 增加dropout防止过拟合
+# 2. 更好的正则化 (配合VAE特征融合)
+cls_head_weight_decay = 0.01  # 适度的权重衰减，避免过度正则化VAE特征
+dropout_rate = 0.2  # 适中的dropout，让VAE的不确定性信息能够传递
 
 # 3. 优化的训练策略
 warmup_steps = 500  # 减少warmup步数，快速进入有效训练
