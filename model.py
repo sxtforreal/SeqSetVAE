@@ -551,7 +551,22 @@ class SeqSetVAE(pl.LightningModule):
             lr,
         )
         
-        # Pretrained loading disabled: always start from random initialization
+        # Load pretrained weights if provided
+        if pretrained_ckpt is not None:
+            try:
+                print(f"🔄 Loading pretrained weights from: {pretrained_ckpt}")
+                state_dict = load_checkpoint_weights(pretrained_ckpt, device='cpu')
+                # Only load SetVAE related parameters
+                setvae_state = {}
+                for k, v in state_dict.items():
+                    if k.startswith('setvae.'):
+                        setvae_state[k] = v
+                
+                missing, unexpected = self.setvae.load_state_dict(setvae_state, strict=False)
+                print(f"✅ Loaded pretrained SetVAE weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+            except Exception as e:
+                print(f"⚠️ Failed to load pretrained weights: {e}")
+                print("🔄 Continuing with random initialization...")
 
         # Freeze X% pretrained parameters
         set_params = list(self.setvae.parameters())
@@ -1047,6 +1062,23 @@ class SeqSetVAE(pl.LightningModule):
         """
         B, S, D = h_t.shape
         
+        # For classification-only mode, use simpler and more stable feature extraction
+        if self.classification_only:
+            # Use last token (most recent) with attention-weighted pooling
+            last_token = h_t[:, -1, :]  # [B, D] - most recent representation
+            
+            # Attention-weighted pooling over all tokens
+            attn_weights = F.softmax(
+                torch.matmul(h_t, last_token.unsqueeze(-1)).squeeze(-1), 
+                dim=1
+            )  # [B, S]
+            attn_pooled = torch.sum(h_t * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
+            
+            # Combine last token and attention pooling
+            enhanced_features = 0.7 * last_token + 0.3 * attn_pooled
+            return enhanced_features
+        
+        # For full training mode, use multi-scale pooling
         # Global average pooling
         global_avg = self.feature_fusion['global_pool'](h_t.transpose(1, 2)).squeeze(-1)  # [B, D]
         
@@ -1348,14 +1380,16 @@ class SeqSetVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.classification_only:
-            # Optimize classifier head only with higher LR
+            # Optimize classifier head only with more conservative LR
             cls_params = [p for p in self.cls_head.parameters() if p.requires_grad]
+            # Use more conservative learning rate for better stability
+            cls_lr = self.cls_head_lr or (self.lr * 3.0)  # Reduced from 10x to 3x
             optimizer = AdamW(
-                [{'params': cls_params, 'lr': self.cls_head_lr or (self.lr * 10.0), 'name': 'cls_head'}],
-                lr=self.cls_head_lr or (self.lr * 10.0),
-                betas=(0.9, 0.999),
+                [{'params': cls_params, 'lr': cls_lr, 'name': 'cls_head'}],
+                lr=cls_lr,
+                betas=(0.9, 0.98),  # Slightly adjusted beta2 for better stability
                 eps=1e-8,
-                weight_decay=0.001,
+                weight_decay=0.01,  # Increased weight decay for better regularization
             )
         else:
             # Set different learning rates for different parts

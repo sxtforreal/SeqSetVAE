@@ -262,13 +262,21 @@ def main():
         model.init_classifier_head_xavier()
 
         # Freeze everything except classifier head and set backbone eval
+        frozen_params = 0
+        trainable_params = 0
         for name, param in model.named_parameters():
-            if name.startswith('cls_head'):
+            if name.startswith('cls_head') or name.startswith('feature_projection'):
                 param.requires_grad = True
+                trainable_params += param.numel()
             else:
                 param.requires_grad = False
+                frozen_params += param.numel()
+        
         model.enable_classification_only_mode(cls_head_lr=getattr(config, 'cls_head_lr', None))
         print("🧊 Finetune freeze applied and backbone set to eval; classification-only loss enabled.")
+        print(f"   - Frozen parameters: {frozen_params:,}")
+        print(f"   - Trainable parameters: {trainable_params:,}")
+        print(f"   - Trainable ratio: {trainable_params/(frozen_params+trainable_params)*100:.2f}%")
 
     print("📊 Model Architecture:")
     print(f" - FF dimension: {ff_dim}")
