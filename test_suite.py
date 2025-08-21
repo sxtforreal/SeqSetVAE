@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SeqSetVAE Complete Test Suite
-综合测试套件：验证所有改进功能和预训练微调分离
+Comprehensive test suite: verify all improvements and pretrain-finetune separation
 """
 
 import torch
@@ -15,11 +15,11 @@ from dataset import SeqSetVAEDataModule
 import config
 
 def test_model_independence():
-    """测试两个模型的完全独立性"""
+    """Test complete independence of the two models"""
     print("🧪 Testing Model Independence")
     print("-" * 40)
     
-    # 创建预训练模型
+    # Create pretrain model
     pretrain_model = SeqSetVAEPretrain(
         input_dim=config.input_dim,
         reduced_dim=config.reduced_dim,
@@ -34,7 +34,7 @@ def test_model_independence():
         transformer_layers=config.transformer_layers,
     )
     
-    # 创建微调模型
+    # Create finetune model
     finetune_model = SeqSetVAE(
         input_dim=config.input_dim,
         reduced_dim=config.reduced_dim,
@@ -51,11 +51,11 @@ def test_model_independence():
         pretrained_ckpt=None,
     )
     
-    # 检查模型类型
+    # Check model types
     print(f"   - Pretrain model type: {type(pretrain_model).__name__}")
     print(f"   - Finetune model type: {type(finetune_model).__name__}")
     
-    # 检查模型是否有不同的方法
+    # Check if models have different methods
     pretrain_methods = set(dir(pretrain_model))
     finetune_methods = set(dir(finetune_model))
     
@@ -68,24 +68,24 @@ def test_model_independence():
     return True
 
 def test_vae_feature_extraction():
-    """测试VAE特征提取的不同实现"""
+    """Test different implementations of VAE feature extraction"""
     print("\n🧪 Testing VAE Feature Extraction Differences")
     print("-" * 40)
     
     batch_size = 2
     latent_dim = config.latent_dim
     
-    # 创建模拟的VAE输出
+    # Create mock VAE outputs
     mu = torch.randn(batch_size, latent_dim)
     logvar = torch.randn(batch_size, latent_dim)
     
-    # 测试预训练模型的特征提取（应该只使用mu）
+    # Test pretrain model feature extraction (should only use mu)
     print("   - Pretrain model feature extraction:")
     print("     Uses only mu (original design)")
-    pretrain_feature = mu.clone()  # 预训练模型直接使用mu
+    pretrain_feature = mu.clone()  # Pretrain model directly uses mu
     print(f"     Feature shape: {pretrain_feature.shape}")
     
-    # 测试微调模型的特征提取（使用mu+logvar融合）
+    # Test finetune model feature extraction (uses mu+logvar fusion)
     print("   - Finetune model feature extraction:")
     finetune_model = SeqSetVAE(
         input_dim=config.input_dim,
@@ -103,13 +103,13 @@ def test_vae_feature_extraction():
         pretrained_ckpt=None,
     )
     
-    # 测试分类模式下的VAE特征融合
+    # Test VAE feature fusion in classification mode
     finetune_model.classification_only = True
     fused_feature = finetune_model._fuse_vae_features(mu, logvar)
     print("     Uses mu + logvar fusion (enhanced design)")
     print(f"     Feature shape: {fused_feature.shape}")
     
-    # 验证特征不同
+    # Verify features are different
     feature_diff = torch.norm(pretrain_feature - fused_feature).item()
     print(f"     Feature difference norm: {feature_diff:.4f}")
     
@@ -121,7 +121,7 @@ def test_vae_feature_extraction():
         return False
 
 def test_parameter_freezing():
-    """测试参数冻结机制"""
+    """Test parameter freezing mechanism"""
     print("\n🧪 Testing Parameter Freezing Mechanism")
     print("-" * 40)
     
@@ -141,7 +141,7 @@ def test_parameter_freezing():
         pretrained_ckpt=None,
     )
     
-    # 模拟finetune模式的冻结
+    # Simulate finetune mode freezing
     model.enable_classification_only_mode()
     
     frozen_params = 0
@@ -160,7 +160,7 @@ def test_parameter_freezing():
     print(f"   - Trainable ratio: {trainable_params/(frozen_params+trainable_params)*100:.2f}%")
     print(f"   - Trainable parameter names: {trainable_names}")
     
-    # 验证只有分类头是可训练的
+    # Verify only classification head is trainable
     all_cls_head = all(name.startswith('cls_head') for name in trainable_names)
     if all_cls_head and trainable_params > 0:
         print("   ✅ Freezing mechanism working correctly")
@@ -170,27 +170,27 @@ def test_parameter_freezing():
         return False
 
 def test_model_forward():
-    """测试模型前向传播"""
+    """Test model forward pass"""
     print("\n🧪 Testing Model Forward Pass")
     print("-" * 40)
     
-    # 创建模拟输入
+    # Create mock input
     batch_size = 1
     seq_len = 3
     num_vars = 10
     
-    # 创建模拟的患者序列数据
+    # Create mock patient sequence data
     sets = []
     for i in range(seq_len):
         set_dict = {
             'var': torch.randn(batch_size, num_vars, config.input_dim),
             'val': torch.rand(batch_size, num_vars, 1),
-            'minute': torch.tensor([[i * 60.0]] * batch_size)  # 每小时一个set
+            'minute': torch.tensor([[i * 60.0]] * batch_size)  # One set per hour
         }
         sets.append(set_dict)
     
     try:
-        # 测试预训练模型
+        # Test pretrain model
         pretrain_model = SeqSetVAEPretrain(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,
@@ -211,7 +211,7 @@ def test_model_forward():
         
         print(f"   - Pretrain model output: recon={recon_loss.item():.4f}, kl={kl_loss.item():.4f}")
         
-        # 测试微调模型
+        # Test finetune model
         finetune_model = SeqSetVAE(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,
@@ -241,10 +241,10 @@ def test_model_forward():
         return False
 
 def analyze_model_weights(model):
-    """分析模型权重分布"""
+    """Analyze model weight distribution"""
     print("\n🔍 Model Weight Analysis:")
     
-    # 分析分类头权重
+    # Analyze classification head weights
     cls_weights = []
     cls_biases = []
     
@@ -264,7 +264,7 @@ def analyze_model_weights(model):
         print(f"   - Classification head biases: mean={all_biases.mean():.4f}, std={all_biases.std():.4f}")
 
 def evaluate_model_performance(model, dataloader, device, max_batches=50):
-    """评估模型性能"""
+    """Evaluate model performance"""
     print("\n🔍 Model Performance Analysis:")
     
     model.eval()
@@ -322,7 +322,7 @@ def evaluate_model_performance(model, dataloader, device, max_batches=50):
             print(f"   - Extreme probabilities: {extreme_low} low (<0.01), {extreme_high} high (>0.99)")
 
 def main():
-    """主测试函数"""
+    """Main test function"""
     parser = argparse.ArgumentParser(description="SeqSetVAE Complete Test Suite")
     parser.add_argument("--checkpoint", type=str, help="Path to checkpoint for performance testing")
     parser.add_argument("--data_dir", type=str, help="Path to data directory for performance testing")
@@ -335,7 +335,7 @@ def main():
     print("🚀 SeqSetVAE Complete Test Suite")
     print("=" * 60)
     
-    # 基础功能测试
+    # Basic functionality tests
     basic_tests = [
         ("Model Independence", test_model_independence),
         ("VAE Feature Extraction", test_vae_feature_extraction),
@@ -353,7 +353,7 @@ def main():
             print(f"   ❌ Test failed with exception: {e}")
             results.append((test_name, False))
     
-    # 性能测试（如果提供了参数）
+    # Performance testing (if parameters provided)
     if all([args.checkpoint, args.data_dir, args.params_map, args.label_file]):
         print(f"\n📋 Performance Analysis")
         try:
@@ -407,7 +407,7 @@ def main():
             print(f"   ❌ Performance analysis failed: {e}")
             results.append(("Performance Analysis", False))
     
-    # 总结
+    # Summary
     print("\n" + "=" * 60)
     print("📊 Test Results Summary:")
     passed = 0
