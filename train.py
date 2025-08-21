@@ -190,6 +190,7 @@ def main():
 
     print("🧠 Building model...")
     if args.mode == 'pretrain':
+        print("📋 Using SeqSetVAEPretrain - maintains original design for representation learning")
         model = SeqSetVAEPretrain(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,
@@ -220,6 +221,7 @@ def main():
         monitor_metric = 'val_loss'
         monitor_mode = 'min'
     else:
+        print("📋 Using SeqSetVAE - enhanced with modern VAE features and complete freezing for finetune")
         model = SeqSetVAE(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,
@@ -261,14 +263,23 @@ def main():
         # Re-initialize classifier head with Xavier for finetune
         model.init_classifier_head_xavier()
 
-        # Freeze everything except classifier head and set backbone eval
+        # Freeze everything except classifier head - COMPLETE FREEZE for better stability
+        frozen_params = 0
+        trainable_params = 0
         for name, param in model.named_parameters():
             if name.startswith('cls_head'):
                 param.requires_grad = True
+                trainable_params += param.numel()
+                print(f"   ✅ Trainable: {name} ({param.numel():,} params)")
             else:
                 param.requires_grad = False
+                frozen_params += param.numel()
+        
         model.enable_classification_only_mode(cls_head_lr=getattr(config, 'cls_head_lr', None))
         print("🧊 Finetune freeze applied and backbone set to eval; classification-only loss enabled.")
+        print(f"   - Frozen parameters: {frozen_params:,}")
+        print(f"   - Trainable parameters: {trainable_params:,}")
+        print(f"   - Trainable ratio: {trainable_params/(frozen_params+trainable_params)*100:.2f}%")
 
     print("📊 Model Architecture:")
     print(f" - FF dimension: {ff_dim}")
