@@ -1380,11 +1380,9 @@ class SeqSetVAE(pl.LightningModule):
             if active_ratios:
                 active_units_ratio = torch.stack(active_ratios).mean()
         log_payload = {
-                f"{stage}_loss": total_loss,
                 f"{stage}_recon": recon_loss,
                 f"{stage}_kl": kl_loss,
                 f"{stage}_pred": pred_loss,
-                f"{stage}_class_loss": pred_loss,
                 f"{stage}_beta": current_beta,
                 f"{stage}_recon_weight": recon_weight,
                 f"{stage}_pred_weight": pred_weight,
