@@ -534,7 +534,6 @@ class SeqSetVAE(pl.LightningModule):
         beta_warmup_steps: int = 5000,
         kl_annealing: bool = True,
         skip_pretrained_on_resume: bool = False,  # New parameter: whether to skip pretrained loading when resuming
-        use_focal_loss: bool = False,
         focal_gamma: float = 2.0,
         focal_alpha = None,
     ):
@@ -681,12 +680,8 @@ class SeqSetVAE(pl.LightningModule):
         self.beta_warmup_steps = beta_warmup_steps
         self.kl_annealing = kl_annealing
         self.current_step = 0
-        self.use_focal_loss = use_focal_loss
-        self.focal_loss_fn = (
-            FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean")
-            if use_focal_loss
-            else None
-        )
+        # Always use focal loss for classification
+        self.focal_loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean")
         # Finetune mode: classification only (skip recon/KL) and keep backbone eval
         self.classification_only = False
         self.cls_head_lr = None
@@ -1305,40 +1300,30 @@ class SeqSetVAE(pl.LightningModule):
         return all_sets
 
     def _step(self, batch, stage: str):
-        """Optimized training/validation step using efficient forward pass"""
-        label = batch.get("label")
+        """Training/validation step with completely separated pretraining and finetuning"""
         
-        # OPTIMIZED: Use the efficient forward pass directly
-        logits, recon_loss, kl_loss = self(batch)
-        
-        # Loss calculation (classification-only finetune: use pure classification loss)
-        if self.use_focal_loss and self.focal_loss_fn is not None:
-            pred_loss = self.focal_loss_fn(logits, label)
-        else:
-            pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
-
         if self.classification_only:
-            # OPTIMIZED: Pure focal loss for finetune mode - no reconstruction or KL loss
-            total_loss = pred_loss
-            # Set other losses to zero for logging (but don't compute them)
-            recon_loss = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
-            kl_loss = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
-            pred_weight = torch.tensor(1.0, device=pred_loss.device, requires_grad=False)
-            recon_weight = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
+            # Finetune mode: only classification, no reconstruction
+            label = batch.get("label")
+            logits, recon_loss, kl_loss = self(batch)
+            
+            # Only use focal loss for classification
+            total_loss = self.focal_loss_fn(logits, label)
+            
+            # Set reconstruction losses to zero for logging
+            recon_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=False)
+            kl_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=False)
         else:
-            # Full training mode with reconstruction
-            if stage == "train":
-                progress = min(1.0, self.current_step / 5000)
-                recon_weight = 0.8 * (1.0 - progress) + 0.3 * progress
-                pred_weight = self.w * (0.5 + 0.5 * progress)
-            else:
-                recon_weight = 0.5
-                pred_weight = self.w
+            # Pretraining mode: only reconstruction + KL, no classification
+            logits, recon_loss, kl_loss = self(batch)
+            
+            # Pure reconstruction loss like SeqSetVAEPretrain
             current_beta = self.get_current_beta()
-            total_loss = pred_weight * pred_loss + recon_weight * recon_loss + current_beta * kl_loss
+            total_loss = recon_loss + current_beta * kl_loss
 
-        # Metrics for validation stage
-        if stage == "val":
+        # Metrics for validation stage (only in finetune mode)
+        if stage == "val" and self.classification_only:
+            label = batch.get("label")
             if self.num_classes == 2:
                 probs = torch.softmax(logits, dim=1)[:, 1]
             else:
@@ -1348,8 +1333,6 @@ class SeqSetVAE(pl.LightningModule):
             preds = logits.argmax(dim=1)
             self.val_acc.update(preds, label)
 
-        # Log more useful metrics
-        current_beta = self.get_current_beta()
         # Compute latent statistics if available
         mean_variance = None
         active_units_ratio = None
@@ -1365,16 +1348,15 @@ class SeqSetVAE(pl.LightningModule):
                 mean_variance = torch.stack(variances).mean()
             if active_ratios:
                 active_units_ratio = torch.stack(active_ratios).mean()
-        # Optimized logging for finetune vs full training modes
+        # Completely separated logging for two modes
         if self.classification_only:
-            # Finetune mode: only log classification-related metrics
+            # Finetune mode: only focal loss
             log_payload = {
-                f"{stage}/focal_loss": pred_loss,
-                f"{stage}/loss": total_loss,
+                f"{stage}/focal_loss": total_loss,  # This is the focal loss
+                f"{stage}/total_loss": total_loss,
             }
-            # Add meaningful metrics for finetune monitoring
+            # Add VAE feature statistics for monitoring
             if hasattr(self, '_last_z_list') and self._last_z_list:
-                # Log VAE feature statistics for monitoring
                 try:
                     _, mu, logvar = self._last_z_list[-1]
                     mu_norm = torch.norm(mu, dim=-1).mean()
@@ -1386,14 +1368,13 @@ class SeqSetVAE(pl.LightningModule):
                 except:
                     pass
         else:
-            # Full training mode: log all metrics
+            # Pretraining mode: only reconstruction + KL (like SeqSetVAEPretrain)
+            current_beta = self.get_current_beta()
             log_payload = {
-                f"{stage}/pred_loss": pred_loss,
-                f"{stage}/pred_weight": pred_weight,
-                f"{stage}/recon": recon_loss,
-                f"{stage}/kl": kl_loss,
-                f"{stage}/beta": current_beta,
-                f"{stage}/recon_weight": recon_weight,
+                f"{stage}/recon_loss": recon_loss,     # Reconstruction loss
+                f"{stage}/kl_loss": kl_loss,          # KL divergence loss  
+                f"{stage}/total_loss": total_loss,     # recon_loss + beta * kl_loss
+                f"{stage}/beta": current_beta,         # KL annealing factor
             }
             if mean_variance is not None:
                 log_payload[f"{stage}/variance"] = mean_variance
