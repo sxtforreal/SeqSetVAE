@@ -559,61 +559,122 @@ class SeqSetVAE(pl.LightningModule):
                 print(f"🔄 Loading pretrained weights from: {pretrained_ckpt}")
                 state_dict = load_checkpoint_weights(pretrained_ckpt, device='cpu')
                 
-                # Load all compatible parameters except classifier head
+                # Enhanced parameter mapping with intelligent prefix/suffix handling
                 loaded_params = {}
                 skipped_params = []
+                mapping_stats = {
+                    'exact_match': 0,
+                    'prefix_mapped': 0,
+                    'shape_mismatch': 0,
+                    'not_found': 0
+                }
                 
                 for k, v in state_dict.items():
                     # Skip classifier head parameters (will be randomly initialized)
                     if k.startswith('cls_head'):
-                        skipped_params.append(k)
+                        skipped_params.append(f"{k} (classifier head - will be reinitialized)")
                         continue
                     
-                    # Try to load all other parameters
+                    # Try exact match first
                     if k in self.state_dict():
                         if self.state_dict()[k].shape == v.shape:
                             loaded_params[k] = v
+                            mapping_stats['exact_match'] += 1
+                            continue
                         else:
                             print(f"⚠️ Shape mismatch for {k}: {self.state_dict()[k].shape} vs {v.shape}")
-                            skipped_params.append(k)
+                            skipped_params.append(f"{k} (shape mismatch)")
+                            mapping_stats['shape_mismatch'] += 1
+                            continue
+                    
+                    # Try intelligent parameter name mapping for different checkpoint formats
+                    mapped_key = None
+                    mapping_type = None
+                    
+                    # Handle different prefixes from different training modes
+                    if k.startswith('set_encoder.'):
+                        mapped_key = 'setvae.setvae.' + k[len('set_encoder.'):]
+                        mapping_type = "set_encoder -> setvae.setvae"
+                    elif k.startswith('setvae.setvae.') and not k.startswith('setvae.setvae.setvae.'):
+                        mapped_key = k  # Already correctly prefixed
+                        mapping_type = "setvae.setvae (correct prefix)"
+                    elif k.startswith('setvae.') and not k.startswith('setvae.setvae.'):
+                        mapped_key = k  # setvae.* parameters
+                        mapping_type = "setvae prefix"
+                    elif k.startswith('transformer.'):
+                        mapped_key = k
+                        mapping_type = "transformer"
+                    elif k.startswith('post_transformer_norm.'):
+                        mapped_key = k
+                        mapping_type = "post_transformer_norm"
+                    elif k.startswith('decoder.'):
+                        mapped_key = k
+                        mapping_type = "decoder"
                     else:
-                        # Try to map keys for compatibility
-                        mapped_key = None
-                        if k.startswith('set_encoder.'):
-                            mapped_key = 'setvae.setvae.' + k[len('set_encoder.'):]
-                        elif k.startswith('setvae.'):
-                            mapped_key = k
-                        elif k.startswith('transformer.'):
-                            mapped_key = k
-                        elif k.startswith('post_transformer_norm.'):
-                            mapped_key = k
-                        elif k.startswith('decoder.'):
-                            mapped_key = k
-                        
-                        if mapped_key and mapped_key in self.state_dict():
-                            if self.state_dict()[mapped_key].shape == v.shape:
-                                loaded_params[mapped_key] = v
-                            else:
-                                skipped_params.append(f"{k} -> {mapped_key}")
+                        # Try removing common prefixes that might exist in some checkpoints
+                        for prefix in ['model.', 'module.', 'net.']:
+                            if k.startswith(prefix):
+                                candidate_key = k[len(prefix):]
+                                if candidate_key in self.state_dict():
+                                    mapped_key = candidate_key
+                                    mapping_type = f"removed {prefix} prefix"
+                                    break
+                    
+                    # Try to load the mapped parameter
+                    if mapped_key and mapped_key in self.state_dict():
+                        if self.state_dict()[mapped_key].shape == v.shape:
+                            loaded_params[mapped_key] = v
+                            mapping_stats['prefix_mapped'] += 1
+                            print(f"✅ Mapped: {k} -> {mapped_key} ({mapping_type})")
                         else:
-                            skipped_params.append(k)
+                            skipped_params.append(f"{k} -> {mapped_key} (shape mismatch: {self.state_dict()[mapped_key].shape} vs {v.shape})")
+                            mapping_stats['shape_mismatch'] += 1
+                    else:
+                        skipped_params.append(f"{k} (no compatible parameter found)")
+                        mapping_stats['not_found'] += 1
                 
                 # Load the compatible parameters
                 missing, unexpected = self.load_state_dict(loaded_params, strict=False)
                 
-                print(f"✅ Loaded pretrained weights:")
-                print(f"   - Successfully loaded: {len(loaded_params)} parameters")
-                print(f"   - Missing: {len(missing)} parameters")
-                print(f"   - Unexpected: {len(unexpected)} parameters")
-                print(f"   - Skipped: {len(skipped_params)} parameters")
+                print(f"✅ Pretrained weight loading summary:")
+                print(f"   📊 Parameter mapping statistics:")
+                print(f"      - Exact matches: {mapping_stats['exact_match']}")
+                print(f"      - Prefix mapped: {mapping_stats['prefix_mapped']}")
+                print(f"      - Shape mismatches: {mapping_stats['shape_mismatch']}")
+                print(f"      - Not found: {mapping_stats['not_found']}")
+                print(f"   📥 Loading results:")
+                print(f"      - Successfully loaded: {len(loaded_params)} parameters")
+                print(f"      - Missing in checkpoint: {len(missing)} parameters")
+                print(f"      - Unexpected in checkpoint: {len(unexpected)} parameters")
+                print(f"      - Skipped: {len(skipped_params)} parameters")
+                
+                # Show some examples of skipped parameters for debugging
+                if skipped_params:
+                    print(f"   ⚠️ Examples of skipped parameters:")
+                    for param in skipped_params[:5]:  # Show first 5
+                        print(f"      - {param}")
+                    if len(skipped_params) > 5:
+                        print(f"      ... and {len(skipped_params) - 5} more")
                 
                 if len(loaded_params) == 0:
                     print("❌ WARNING: No parameters were loaded! Check checkpoint compatibility.")
+                    print("💡 Possible issues:")
+                    print("   - Checkpoint format doesn't match expected parameter names")
+                    print("   - Checkpoint is from a different model architecture")
+                    print("   - Parameter name prefixes have changed")
                     raise ValueError("No pretrained parameters were loaded - this will hurt performance!")
+                elif len(loaded_params) < 10:  # Arbitrary threshold for "too few" parameters
+                    print(f"⚠️ Warning: Only {len(loaded_params)} parameters loaded. This might indicate compatibility issues.")
+                else:
+                    print(f"🎉 Successfully loaded {len(loaded_params)} pretrained parameters!")
                     
             except Exception as e:
                 print(f"❌ Failed to load pretrained weights: {e}")
                 print("❌ This will significantly hurt performance!")
+                print("💡 Debugging tips:")
+                print(f"   - Check if checkpoint file exists: {pretrained_ckpt}")
+                print("   - Verify checkpoint format compatibility")
+                print("   - Check if checkpoint contains expected parameter names")
                 raise e  # Don't continue with random initialization
         else:
             raise ValueError("❌ Pretrained checkpoint is required for finetune mode!")

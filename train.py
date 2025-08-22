@@ -250,16 +250,7 @@ def main():
         monitor_metric = 'val_auc'
         monitor_mode = 'max'
 
-        # Load pretrained weights if provided
-        if args.pretrained_ckpt is not None:
-            try:
-                state = load_checkpoint_weights(args.pretrained_ckpt, device='cpu')
-                remapped = remap_pretrain_to_finetune_keys(state)
-                missing, unexpected = model.load_state_dict(remapped, strict=False)
-                print(f"🔁 Loaded pretrained weights with remap. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-            except Exception as e:
-                print(f"⚠️  Failed to load pretrained checkpoint: {e}")
-
+        # Note: Pretrained weights are now loaded automatically in SeqSetVAE constructor
         # Re-initialize classifier head with Xavier for finetune
         model.init_classifier_head_xavier()
 
