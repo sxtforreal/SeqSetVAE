@@ -97,7 +97,7 @@ def remap_pretrain_to_finetune_keys(state_dict):
 def main():
     parser = argparse.ArgumentParser(description="Train SeqSetVAE (pretrain/finetune)")
     # Basic training parameters
-    parser.add_argument("--mode", type=str, choices=["pretrain", "finetune"], required=True, help="Training mode")
+    parser.add_argument("--mode", type=str, choices=["pretrain", "finetune"], required=True, help="Training mode (only these two modes are supported)")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--max_epochs", type=int, default=100, help="Maximum epochs")
@@ -250,15 +250,16 @@ def main():
         monitor_metric = 'val_auc'
         monitor_mode = 'max'
 
-        # Load pretrained weights if provided
-        if args.pretrained_ckpt is not None:
-            try:
-                state = load_checkpoint_weights(args.pretrained_ckpt, device='cpu')
-                remapped = remap_pretrain_to_finetune_keys(state)
-                missing, unexpected = model.load_state_dict(remapped, strict=False)
-                print(f"🔁 Loaded pretrained weights with remap. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-            except Exception as e:
-                print(f"⚠️  Failed to load pretrained checkpoint: {e}")
+        # Require pretrained checkpoint for finetune to avoid random init
+        if args.pretrained_ckpt is None:
+            raise ValueError("Finetune mode requires --pretrained_ckpt from pretraining to avoid random initialization")
+        try:
+            state = load_checkpoint_weights(args.pretrained_ckpt, device='cpu')
+            remapped = remap_pretrain_to_finetune_keys(state)
+            missing, unexpected = model.load_state_dict(remapped, strict=False)
+            print(f"🔁 Loaded pretrained weights with remap. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load pretrained checkpoint for finetune: {e}")
 
         # Re-initialize classifier head with Xavier for finetune
         model.init_classifier_head_xavier()
