@@ -1350,9 +1350,12 @@ class SeqSetVAE(pl.LightningModule):
             # Always update current step during training
             self.current_step += 1
         elif stage == "val":
-            # Only log validation loss (no detailed metrics to avoid confusion)
+            # Consolidated validation logging to avoid duplicate val_loss logging
             if self.classification_only:
-                self.log("val_loss", total_loss, prog_bar=True, on_epoch=True)
+                # For finetune mode, only log the loss
+                self.log_dict({
+                    "val_loss": total_loss,
+                }, prog_bar=True, on_epoch=True)
             else:
                 # For pretraining mode, log validation reconstruction and KL
                 current_beta = self.get_current_beta()
