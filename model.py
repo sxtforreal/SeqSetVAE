@@ -227,9 +227,10 @@ class SeqSetVAEPretrain(pl.LightningModule):
     def _relative_time_bucket_embedding(self, minutes: torch.Tensor):
         # minutes: [B, S] (float, minutes)
         B, S = minutes.shape
+        diffs = (minutes[:, 1:] - minutes[:, :-1]).clamp(min=0.0)
         deltas = torch.cat([
             torch.zeros(B, 1, device=minutes.device, dtype=minutes.dtype),
-            torch.diff(minutes, dim=1).clamp(min=0.0)
+            diffs
         ], dim=1)
         log_delta = torch.log1p(deltas)
         log_edges = torch.log1p(self.time_bucket_edges).to(log_delta.device)
@@ -792,9 +793,10 @@ class SeqSetVAE(pl.LightningModule):
     def _relative_time_bucket_embedding(self, minutes: torch.Tensor):
         # minutes: [B, S] (float, minutes)
         B, S = minutes.shape
+        diffs = (minutes[:, 1:] - minutes[:, :-1]).clamp(min=0.0)
         deltas = torch.cat([
             torch.zeros(B, 1, device=minutes.device, dtype=minutes.dtype),
-            torch.diff(minutes, dim=1).clamp(min=0.0)
+            diffs
         ], dim=1)
         log_delta = torch.log1p(deltas)
         log_edges = torch.log1p(self.time_bucket_edges).to(log_delta.device)
