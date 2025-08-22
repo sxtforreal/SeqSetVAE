@@ -1368,8 +1368,14 @@ class SeqSetVAE(pl.LightningModule):
         # Optimized logging for finetune vs full training modes
         if self.classification_only:
             # Finetune mode: only log classification-related metrics
+            # Use appropriate loss name based on actual loss function used
+            if self.use_focal_loss and self.focal_loss_fn is not None:
+                loss_name = f"{stage}/focal_loss"
+            else:
+                loss_name = f"{stage}/ce_loss"  # Cross-entropy loss
+            
             log_payload = {
-                f"{stage}/focal_loss": pred_loss,
+                loss_name: pred_loss,
                 f"{stage}/loss": total_loss,
             }
             # Add meaningful metrics for finetune monitoring
@@ -1386,14 +1392,21 @@ class SeqSetVAE(pl.LightningModule):
                 except:
                     pass
         else:
-            # Full training mode: log all metrics
+            # Full training mode (pretraining): log all metrics including recon and KL losses
+            # Use appropriate prediction loss name
+            if self.use_focal_loss and self.focal_loss_fn is not None:
+                pred_loss_name = f"{stage}/focal_loss"
+            else:
+                pred_loss_name = f"{stage}/ce_loss"
+                
             log_payload = {
-                f"{stage}/pred_loss": pred_loss,
+                pred_loss_name: pred_loss,
                 f"{stage}/pred_weight": pred_weight,
-                f"{stage}/recon": recon_loss,
-                f"{stage}/kl": kl_loss,
+                f"{stage}/recon_loss": recon_loss,  # Only log in pretraining
+                f"{stage}/kl_loss": kl_loss,       # Only log in pretraining
                 f"{stage}/beta": current_beta,
                 f"{stage}/recon_weight": recon_weight,
+                f"{stage}/total_loss": total_loss,
             }
             if mean_variance is not None:
                 log_payload[f"{stage}/variance"] = mean_variance
