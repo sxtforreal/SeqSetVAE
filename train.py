@@ -235,7 +235,7 @@ def main():
             ff_dim=ff_dim,
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
-            pretrained_ckpt=None,  # Will be loaded separately
+            pretrained_ckpt=args.pretrained_ckpt,
             w=config.w,
             free_bits=model_free_bits,
             warmup_beta=config.warmup_beta,
