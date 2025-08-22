@@ -728,12 +728,9 @@ class SeqSetVAE(pl.LightningModule):
         self.beta_warmup_steps = beta_warmup_steps
         self.kl_annealing = kl_annealing
         self.current_step = 0
-        self.use_focal_loss = use_focal_loss
-        self.focal_loss_fn = (
-            FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean")
-            if use_focal_loss
-            else None
-        )
+        # Always enable focal loss for classification
+        self.use_focal_loss = True
+        self.focal_loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean")
         # Finetune mode: classification only (skip recon/KL) and keep backbone eval
         self.classification_only = False
         self.cls_head_lr = None
@@ -979,28 +976,37 @@ class SeqSetVAE(pl.LightningModule):
             minute_val = time.unique().float()  # Ensure float type
             pos_list.append(minute_val)
             
-            # Modern VAE feature extraction: use both mean and variance for richer representation
-            _, z_list, _ = self.setvae.setvae(var, val)
-            z_sample, mu, logvar = z_list[-1]
-            
-            # Extract and process mean and variance features
-            mu_feat = mu.squeeze(1)  # [B, latent_dim]
-            logvar_feat = logvar.squeeze(1)  # [B, latent_dim] - keep as logvar for numerical stability
-            
-            # Apply learnable VAE feature fusion
-            combined_feat = self._fuse_vae_features(mu_feat, logvar_feat)
-            
-            z_prims.append(combined_feat)
-            
-            # Collect latent variable information (for collapse detector)
-            all_z_lists.append(z_list)
-            
-            # KL calculation (still use mu/logvar for monitoring/loss if needed)
-            kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
-            min_kl = self.free_bits * self.latent_dim
-            kl_div = torch.clamp(kl_div, min=min_kl)
-            var_reg = -0.1 * torch.mean(logvar)
-            kl_total += kl_div.mean() + var_reg
+            # Use pretrained posterior mean only in classification-only finetune for stability and speed
+            if self.classification_only:
+                z_list, _ = self.setvae.setvae.encode_from_var_val(var, val)
+                _, mu, _ = z_list[-1]
+                mu_feat = mu.squeeze(1)  # [B, latent_dim]
+                z_prims.append(mu_feat)
+                all_z_lists.append(z_list)
+                # Skip KL computation entirely in classification-only mode
+            else:
+                # Full feature extraction path when not classification-only (e.g., joint training)
+                _, z_list, _ = self.setvae.setvae(var, val)
+                z_sample, mu, logvar = z_list[-1]
+                
+                # Extract and process mean and variance features
+                mu_feat = mu.squeeze(1)
+                logvar_feat = logvar.squeeze(1)
+                
+                # Apply learnable VAE feature fusion
+                combined_feat = self._fuse_vae_features(mu_feat, logvar_feat)
+                
+                z_prims.append(combined_feat)
+                
+                # Collect latent variable information (for collapse detector)
+                all_z_lists.append(z_list)
+                
+                # KL calculation (still use mu/logvar for monitoring/loss if needed)
+                kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+                min_kl = self.free_bits * self.latent_dim
+                kl_div = torch.clamp(kl_div, min=min_kl)
+                var_reg = -0.1 * torch.mean(logvar)
+                kl_total += kl_div.mean() + var_reg
             
         kl_total = kl_total / S
         z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
@@ -1377,10 +1383,7 @@ class SeqSetVAE(pl.LightningModule):
             kl_loss = total_kl_loss / valid_patients
         
         # Loss calculation (classification-only finetune: use pure classification loss)
-        if self.use_focal_loss and self.focal_loss_fn is not None:
-            pred_loss = self.focal_loss_fn(logits, label)
-        else:
-            pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
+        pred_loss = self.focal_loss_fn(logits, label)
 
         if self.classification_only:
             total_loss = pred_loss
