@@ -1350,8 +1350,14 @@ class SeqSetVAE(pl.LightningModule):
             # Always update current step during training
             self.current_step += 1
         elif stage == "val":
-            # No logging in validation step to avoid duplicate logging errors
-            pass
+            # Only log validation loss, metrics will be logged in on_validation_epoch_end
+            if self.classification_only:
+                self.log("FT_val_loss", total_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+            else:
+                current_beta = self.get_current_beta()
+                self.log("PT_val_loss", total_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+                self.log("PT_val_recon", recon_loss, on_epoch=True, sync_dist=True)
+                self.log("PT_val_kl", kl_loss, on_epoch=True, sync_dist=True)
                 
         # Expose latent variables for collapse detector
         if hasattr(self, 'setvae') and hasattr(self.setvae, '_last_z_list'):
@@ -1369,9 +1375,19 @@ class SeqSetVAE(pl.LightningModule):
         return None
 
     def on_validation_epoch_end(self):
-        """Reset metrics without logging to avoid duplicate logging errors"""
+        """Compute and log validation metrics at epoch end"""
         if self.classification_only:
-            # Just reset metrics without logging
+            # Compute metrics
+            auc = self.val_auc.compute()
+            auprc = self.val_auprc.compute()
+            acc = self.val_acc.compute()
+            
+            # Log metrics individually to avoid conflicts
+            self.log("FT_val_auc", auc, prog_bar=True, sync_dist=True)
+            self.log("FT_val_auprc", auprc, prog_bar=True, sync_dist=True)
+            self.log("FT_val_accuracy", acc, prog_bar=True, sync_dist=True)
+            
+            # Reset metrics
             self.val_auc.reset()
             self.val_auprc.reset()
             self.val_acc.reset()
@@ -1414,9 +1430,14 @@ class SeqSetVAE(pl.LightningModule):
                 weight_decay=0.02,
             )
         
-        # Simplified scheduler without monitoring to avoid logging conflicts
-        from torch.optim.lr_scheduler import StepLR
-        scheduler = StepLR(optimizer, step_size=50, gamma=0.8)
+        # Use exponential decay scheduler for stable training
+        from torch.optim.lr_scheduler import ExponentialLR
+        if self.classification_only:
+            # For finetune, use slower decay
+            scheduler = ExponentialLR(optimizer, gamma=0.98)
+        else:
+            # For pretraining, use even slower decay
+            scheduler = ExponentialLR(optimizer, gamma=0.995)
         
         return {
             "optimizer": optimizer,
