@@ -653,16 +653,13 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # Simplified classification head for better efficiency and performance
-        self.cls_head = nn.Sequential(
-            # First layer with moderate regularization
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            # Final classification layer
-            nn.Linear(128, num_classes)
-        )
+        # Simplified single-layer classification head (best practice for finetuning)
+        # Research shows that simpler heads work better when backbone is frozen
+        self.cls_head = nn.Linear(latent_dim * 2, num_classes)  # *2 for mean+var features
+        
+        # Initialize with small weights to prevent early saturation
+        nn.init.normal_(self.cls_head.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.cls_head.bias)
         
         # Simplified feature processing for efficiency (removed complex fusion modules)
         # Complex feature fusion modules removed to improve training speed and reduce overfitting
@@ -984,12 +981,13 @@ class SeqSetVAE(pl.LightningModule):
             # Collect latent variable information (for collapse detector)
             all_z_lists.append(z_list)
             
-            # KL calculation (still use mu/logvar for monitoring/loss if needed)
-            kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
-            min_kl = self.free_bits * self.latent_dim
-            kl_div = torch.clamp(kl_div, min=min_kl)
-            var_reg = -0.1 * torch.mean(logvar)
-            kl_total += kl_div.mean() + var_reg
+            # KL calculation (skip in classification-only mode for speed)
+            if not self.classification_only:
+                kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+                min_kl = self.free_bits * self.latent_dim
+                kl_div = torch.clamp(kl_div, min=min_kl)
+                var_reg = -0.1 * torch.mean(logvar)
+                kl_total += kl_div.mean() + var_reg
             
         kl_total = kl_total / S
         z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
@@ -1047,13 +1045,31 @@ class SeqSetVAE(pl.LightningModule):
                 self._last_recon_cat = None
                 self._last_target_cat = None
         
-        # Enhanced feature extraction using multi-scale pooling
-        enhanced_features = self._extract_enhanced_features(h_seq)
-        
-        # Alternative: Use attention-based pooling as fallback (deterministic)
-        if enhanced_features is None:
-            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
-            enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
+        # Optimized feature extraction for finetune mode
+        if self.classification_only:
+            # Use VAE features directly for better performance in finetune mode
+            # Aggregate VAE features from all timesteps using last timestep (most informative)
+            if all_z_lists:
+                # Get the last timestep's VAE features (most recent and informative)
+                last_z_list = all_z_lists[-1]  # Features from last timestep
+                if last_z_list:
+                    _, mu, logvar = last_z_list[-1]  # Get the final layer's mu, logvar
+                    mu_feat = mu.squeeze(1)  # [B, latent_dim]
+                    logvar_feat = logvar.squeeze(1)  # [B, latent_dim]
+                    enhanced_features = self._fuse_vae_features(mu_feat, logvar_feat)  # [B, latent_dim * 2]
+                else:
+                    # Fallback: use transformer output
+                    enhanced_features = h_seq[:, -1, :]  # [B, latent_dim]
+            else:
+                # Fallback: use transformer output
+                enhanced_features = h_seq[:, -1, :]  # [B, latent_dim]
+        else:
+            # Full training mode: use enhanced features
+            enhanced_features = self._extract_enhanced_features(h_seq)
+            # Fallback if needed
+            if enhanced_features is None:
+                attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
+                enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
         
         # Classification with enhanced features
         logits = self.cls_head(enhanced_features)
@@ -1159,56 +1175,25 @@ class SeqSetVAE(pl.LightningModule):
 
     def _fuse_vae_features(self, mu, logvar):
         """
-        Advanced VAE feature fusion for FINETUNE MODEL ONLY.
-        Uses both mean and variance information for better classification performance.
-        
-        NOTE: This method is only used in SeqSetVAE (finetune model).
-        SeqSetVAEPretrain maintains the original simple design using only mu.
+        Optimized VAE feature fusion for sequence-level prediction.
+        Based on recent research: concatenating mean and variance features 
+        works better than complex fusion for classification tasks.
         
         Args:
             mu: [B, latent_dim] - posterior mean
             logvar: [B, latent_dim] - posterior log variance
             
         Returns:
-            fused_features: [B, latent_dim] - enhanced features combining mean and uncertainty
+            fused_features: [B, latent_dim * 2] - concatenated mean and variance features
         """
-        # Convert logvar to std for more interpretable variance features
-        std = torch.exp(0.5 * logvar)  # [B, latent_dim]
+        # Convert logvar to standard deviation for better numerical stability
+        std = torch.exp(0.5 * logvar.clamp(-10, 10))  # Clamp for numerical stability
         
-        # Method 1: Learnable gated fusion (for full training mode)
-        if hasattr(self, 'vae_feature_fusion') and not self.classification_only:
-            # Project mean and variance to same space
-            mu_proj = self.vae_feature_fusion['mean_projection'](mu)
-            var_proj = self.vae_feature_fusion['var_projection'](std)
-            
-            # Learn fusion gate based on both mean and variance
-            concat_features = torch.cat([mu_proj, var_proj], dim=-1)
-            fusion_gate = self.vae_feature_fusion['fusion_gate'](concat_features)
-            
-            # Gated combination
-            fused = fusion_gate * mu_proj + (1 - fusion_gate) * var_proj
-            
-            # Uncertainty calibration - use variance to modulate confidence
-            uncertainty_score = self.vae_feature_fusion['uncertainty_calibration'](std.mean(dim=-1, keepdim=True))
-            fused = fused * (1.0 + 0.1 * uncertainty_score)  # Slight modulation based on uncertainty
-            
-            return fused
+        # Simple concatenation works best for frozen backbone + simple classifier
+        # This allows the classifier to learn optimal combination of mean and uncertainty
+        fused_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
         
-        # Method 2: Simple but effective fusion for classification-only finetune mode
-        else:
-            # Uncertainty-aware feature weighting for stable finetune performance
-            uncertainty = torch.mean(std, dim=-1, keepdim=True)  # [B, 1] - average uncertainty
-            uncertainty_weight = torch.sigmoid(-uncertainty + 1.0)  # Higher certainty -> higher weight
-            
-            # Variance-modulated mean features
-            # High variance -> more exploration, low variance -> more exploitation
-            variance_modulation = 1.0 + 0.05 * torch.tanh(std)  # Small modulation to avoid instability
-            modulated_mu = mu * variance_modulation
-            
-            # Combine with uncertainty weighting
-            fused = uncertainty_weight * modulated_mu + (1 - uncertainty_weight) * mu
-            
-            return fused
+        return fused_features
 
     # Helpers
     def _split_sets(self, var, val, time, set_ids, padding_mask=None):
@@ -1333,12 +1318,13 @@ class SeqSetVAE(pl.LightningModule):
             pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
 
         if self.classification_only:
-            # OPTIMIZED: Pure classification loss for finetune mode
+            # OPTIMIZED: Pure focal loss for finetune mode - no reconstruction or KL loss
             total_loss = pred_loss
-            recon_loss = torch.tensor(0.0, device=pred_loss.device)
-            kl_loss = torch.tensor(0.0, device=pred_loss.device)
-            pred_weight = torch.tensor(1.0, device=pred_loss.device)
-            recon_weight = torch.tensor(0.0, device=pred_loss.device)
+            # Set other losses to zero for logging (but don't compute them)
+            recon_loss = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
+            kl_loss = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
+            pred_weight = torch.tensor(1.0, device=pred_loss.device, requires_grad=False)
+            recon_weight = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
         else:
             # Full training mode with reconstruction
             if stage == "train":
@@ -1379,21 +1365,40 @@ class SeqSetVAE(pl.LightningModule):
                 mean_variance = torch.stack(variances).mean()
             if active_ratios:
                 active_units_ratio = torch.stack(active_ratios).mean()
-        log_payload = {
+        # Optimized logging for finetune vs full training modes
+        if self.classification_only:
+            # Finetune mode: only log classification-related metrics
+            log_payload = {
+                f"{stage}/focal_loss": pred_loss,
+                f"{stage}/loss": total_loss,
+            }
+            # Add meaningful metrics for finetune monitoring
+            if hasattr(self, '_last_z_list') and self._last_z_list:
+                # Log VAE feature statistics for monitoring
+                try:
+                    _, mu, logvar = self._last_z_list[-1]
+                    mu_norm = torch.norm(mu, dim=-1).mean()
+                    std_mean = torch.exp(0.5 * logvar).mean()
+                    log_payload.update({
+                        f"{stage}/mu_norm": mu_norm,
+                        f"{stage}/std_mean": std_mean,
+                    })
+                except:
+                    pass
+        else:
+            # Full training mode: log all metrics
+            log_payload = {
                 f"{stage}/pred_loss": pred_loss,
                 f"{stage}/pred_weight": pred_weight,
-            }
-        if not self.classification_only:
-            log_payload.update({
                 f"{stage}/recon": recon_loss,
                 f"{stage}/kl": kl_loss,
                 f"{stage}/beta": current_beta,
                 f"{stage}/recon_weight": recon_weight,
-            })
-        if mean_variance is not None:
-            log_payload[f"{stage}/variance"] = mean_variance
-        if active_units_ratio is not None:
-            log_payload[f"{stage}/active_units"] = active_units_ratio
+            }
+            if mean_variance is not None:
+                log_payload[f"{stage}/variance"] = mean_variance
+            if active_units_ratio is not None:
+                log_payload[f"{stage}/active_units"] = active_units_ratio
         self.log_dict(
             log_payload,
             prog_bar=True,
@@ -1401,14 +1406,17 @@ class SeqSetVAE(pl.LightningModule):
             on_epoch=True,
         )
         
-        # Store logged metrics for collapse detector
-        if stage == "train":
+        # Store logged metrics for collapse detector (only in full training mode)
+        if stage == "train" and not self.classification_only:
             self.logged_metrics = {
                 'train_kl': kl_loss,
                 'train_recon': recon_loss,
                 'train_variance': mean_variance if mean_variance is not None else torch.tensor(0.0, device=kl_loss.device),
                 'train_active_units': active_units_ratio if active_units_ratio is not None else torch.tensor(0.0, device=kl_loss.device),
             }
+        
+        # Always update current step
+        if stage == "train":
             self.current_step += 1
             
         # Expose latent variables for collapse detector
@@ -1539,9 +1547,16 @@ class SeqSetVAE(pl.LightningModule):
             self.set_backbone_eval()
  
     def init_classifier_head_xavier(self):
-        """Initialize classifier head Linear layers with Xavier uniform and zero biases."""
-        for module in self.cls_head.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=1.0)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        """Initialize classifier head with Xavier uniform and zero biases."""
+        if isinstance(self.cls_head, nn.Linear):
+            # Single linear layer
+            nn.init.xavier_uniform_(self.cls_head.weight, gain=1.0)
+            if self.cls_head.bias is not None:
+                nn.init.zeros_(self.cls_head.bias)
+        else:
+            # Sequential or other module types
+            for module in self.cls_head.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=1.0)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)

@@ -94,17 +94,30 @@ def remap_pretrain_to_finetune_keys(state_dict):
     new_state = {}
     for k, v in state_dict.items():
         if k.startswith("set_encoder."):
+            # Map set_encoder to setvae.setvae
             new_k = "setvae.setvae." + k[len("set_encoder.") :]
+            new_state[new_k] = v
         elif k.startswith("transformer."):
-            new_k = k
+            # Keep transformer layers
+            new_state[k] = v
         elif k.startswith("post_transformer_norm."):
-            new_k = k
+            # Keep post transformer normalization
+            new_state[k] = v
         elif k.startswith("decoder."):
-            new_k = k
+            # Keep decoder (will be frozen anyway)
+            new_state[k] = v
+        elif k.startswith("rel_time_bucket_embed."):
+            # Keep time embeddings
+            new_state[k] = v
+        elif k.startswith("time_bucket_edges"):
+            # Keep time bucket edges (buffer)
+            new_state[k] = v
         else:
-            # Skip optimizer/scheduler/cls_head or unrelated keys
+            # Skip optimizer/scheduler/cls_head or other unrelated keys
+            print(f"🔍 Skipping key during remap: {k}")
             continue
-        new_state[new_k] = v
+    
+    print(f"✅ Remapped {len(new_state)} parameters from pretrain to finetune format")
     return new_state
 
 
@@ -117,6 +130,11 @@ def main():
         choices=["pretrain", "finetune"],
         required=True,
         help="Training mode",
+    )
+    parser.add_argument(
+        "--finetune",
+        action="store_true",
+        help="Enable finetune mode (alias for --mode finetune)",
     )
     parser.add_argument(
         "--batch_size",
@@ -197,6 +215,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Handle --finetune flag
+    if args.finetune:
+        args.mode = "finetune"
 
     # Prepare unified output dirs
     base_output_dir = (args.output_dir or args.output_root_dir).rstrip("/")
