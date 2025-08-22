@@ -113,8 +113,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training")
-    # Pretrained checkpoint for finetune
-    parser.add_argument("--pretrained_ckpt", type=str, default=None, help="Path to pretrained checkpoint (from pretrain mode)")
+    # Pretrained checkpoint for finetune (with aliases)
+    parser.add_argument("--pretrained_ckpt", "--pretrained", "--ckpt", "--checkpoint", dest="pretrained_ckpt", type=str, default=None, help="Path to pretrained checkpoint (from pretrain mode)")
     # Output root directory
     parser.add_argument("--output_root_dir", type=str, default="/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs", help="Root directory to save logs, checkpoints, and outputs")
     parser.add_argument("--output_dir", type=str, default=None, help="Alias of --output_root_dir; if provided, overrides output_root_dir")
@@ -235,7 +235,7 @@ def main():
             ff_dim=ff_dim,
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
-            pretrained_ckpt=None,  # Will be loaded separately
+            pretrained_ckpt=args.pretrained_ckpt,
             w=config.w,
             free_bits=model_free_bits,
             warmup_beta=config.warmup_beta,
@@ -249,16 +249,6 @@ def main():
         checkpoint_name = "SeqSetVAE_finetune"
         monitor_metric = 'val_auc'
         monitor_mode = 'max'
-
-        # Load pretrained weights if provided
-        if args.pretrained_ckpt is not None:
-            try:
-                state = load_checkpoint_weights(args.pretrained_ckpt, device='cpu')
-                remapped = remap_pretrain_to_finetune_keys(state)
-                missing, unexpected = model.load_state_dict(remapped, strict=False)
-                print(f"🔁 Loaded pretrained weights with remap. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-            except Exception as e:
-                print(f"⚠️  Failed to load pretrained checkpoint: {e}")
 
         # Re-initialize classifier head with Xavier for finetune
         model.init_classifier_head_xavier()

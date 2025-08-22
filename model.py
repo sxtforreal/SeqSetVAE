@@ -37,14 +37,27 @@ def load_checkpoint_weights(checkpoint_path, device='cpu'):
     # Handle different checkpoint formats
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         # Full PyTorch Lightning checkpoint
-        state_dict = ckpt["state_dict"]
+        raw_state_dict = ckpt["state_dict"]
         print(f"✅ Found PyTorch Lightning checkpoint with state_dict")
     else:
         # Direct state dict (weights only)
-        state_dict = ckpt
+        raw_state_dict = ckpt
         print(f"✅ Found direct state dict (weights only)")
     
-    return state_dict
+    # Normalize common prefixes to improve compatibility
+    normalized_state = {}
+    for k, v in raw_state_dict.items():
+        new_k = k
+        if new_k.startswith('model.'):
+            new_k = new_k[len('model.'):]
+        if new_k.startswith('module.'):
+            new_k = new_k[len('module.'):]
+        # Some exports may redundantly include 'state_dict.' prefix
+        if new_k.startswith('state_dict.'):
+            new_k = new_k[len('state_dict.'):]
+        normalized_state[new_k] = v
+    
+    return normalized_state
 
 
 ##### SetVAE
