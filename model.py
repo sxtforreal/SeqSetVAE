@@ -471,7 +471,7 @@ class SeqSetVAEPretrain(pl.LightningModule):
                 "scheduler": scheduler,
                 "interval": "epoch",
                 "frequency": 1,
-                "monitor": "val/loss",
+                "monitor": "train_loss",
             },
         }
 
@@ -1376,7 +1376,10 @@ class SeqSetVAE(pl.LightningModule):
         return self._step(batch, "train")
 
     def validation_step(self, batch, batch_idx):
-        return self._step(batch, "val")
+        loss = self._step(batch, "val")
+        # Don't return the loss to avoid automatic logging conflicts
+        # We handle all logging manually in _step
+        return None
 
     def on_validation_epoch_end(self):
         """Only compute validation metrics in finetune mode"""
