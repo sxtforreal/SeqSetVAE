@@ -80,20 +80,6 @@ class SetVAE(pl.LightningModule):
         )
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        var, val = batch["var"], batch["val"]
-        recon, z_list, _ = self(var, val)
-        reduced = (
-            self.setvae.dim_reducer(var) if self.setvae.dim_reducer is not None else var
-        )
-        input_x = reduced * val
-        recon_loss, kl = elbo_loss(recon, input_x, z_list)  # noqa: F405
-        loss = recon_loss + self.beta * kl
-        self.log_dict(
-            {"val/loss": loss, "val/recon": recon_loss, "val/kl": kl}, prog_bar=True
-        )
-        return loss
-
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)
         sch = get_linear_schedule_with_warmup(
@@ -473,18 +459,6 @@ class SeqSetVAEPretrain(pl.LightningModule):
         self.current_step += 1
         return total
 
-    def validation_step(self, batch, batch_idx):
-        recon_loss, kl_loss = self.forward(batch)
-        beta = self._current_beta()
-        total = recon_loss + beta * kl_loss
-        self.log_dict({
-            "val/loss": total,
-            "val/recon": recon_loss,
-            "val/kl": kl_loss,
-            "val/beta": beta,
-        }, prog_bar=True, on_step=False, on_epoch=True)
-        return total
-
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.02)
 
@@ -536,6 +510,8 @@ class SeqSetVAE(pl.LightningModule):
         skip_pretrained_on_resume: bool = False,  # New parameter: whether to skip pretrained loading when resuming
         focal_gamma: float = 2.0,
         focal_alpha = None,
+        vae_fusion_method: str = "enhanced_concat",
+        estimate_uncertainty: bool = True,
     ):
 
         super().__init__()
@@ -652,18 +628,13 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # Simplified single-layer classification head (best practice for finetuning)
-        # Research shows that simpler heads work better when backbone is frozen
-        self.cls_head = nn.Linear(latent_dim * 2, num_classes)  # *2 for mean+var features
-        
-        # Initialize with small weights to prevent early saturation
-        nn.init.normal_(self.cls_head.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.cls_head.bias)
+        # Note: Classifier head will be created after VAE fusion components are initialized
+        # This is done in _init_vae_fusion_components to get the correct input dimension
         
         # Simplified feature processing for efficiency (removed complex fusion modules)
         # Complex feature fusion modules removed to improve training speed and reduce overfitting
 
-        # Metrics
+        # Metrics for validation (only used in finetune mode)
         task_type = "binary" if num_classes == 2 else "multiclass"
         self.val_auc = AUROC(task=task_type, num_classes=num_classes)
         self.val_auprc = AveragePrecision(task=task_type, num_classes=num_classes)
@@ -680,11 +651,19 @@ class SeqSetVAE(pl.LightningModule):
         self.beta_warmup_steps = beta_warmup_steps
         self.kl_annealing = kl_annealing
         self.current_step = 0
+        
+        # VAE fusion and uncertainty parameters
+        self.vae_fusion_method = vae_fusion_method
+        self.estimate_uncertainty = estimate_uncertainty
+        
         # Always use focal loss for classification
         self.focal_loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean")
         # Finetune mode: classification only (skip recon/KL) and keep backbone eval
         self.classification_only = False
         self.cls_head_lr = None
+
+        # Initialize VAE fusion components
+        self._init_vae_fusion_components(latent_dim, vae_fusion_method)
         
         self.save_hyperparameters(ignore=["setvae"])
  
@@ -1066,6 +1045,9 @@ class SeqSetVAE(pl.LightningModule):
                 attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
                 enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
         
+        # Save features for uncertainty estimation
+        self._last_classification_features = enhanced_features
+        
         # Classification with enhanced features
         logits = self.cls_head(enhanced_features)
         
@@ -1170,137 +1152,103 @@ class SeqSetVAE(pl.LightningModule):
 
     def _fuse_vae_features(self, mu, logvar):
         """
-        Optimized VAE feature fusion for sequence-level prediction.
-        Based on recent research: concatenating mean and variance features 
-        works better than complex fusion for classification tasks.
+        Simplified but effective VAE feature fusion for medical data classification.
+        Based on empirical evidence that simple approaches often work best in medical domains.
         
         Args:
             mu: [B, latent_dim] - posterior mean
             logvar: [B, latent_dim] - posterior log variance
             
         Returns:
-            fused_features: [B, latent_dim * 2] - concatenated mean and variance features
+            fused_features: [B, feature_dim] - features for classification
         """
-        # Convert logvar to standard deviation for better numerical stability
-        std = torch.exp(0.5 * logvar.clamp(-10, 10))  # Clamp for numerical stability
+        # Numerical stability: clamp logvar to reasonable range
+        logvar_stable = logvar.clamp(-10, 10)
+        std = torch.exp(0.5 * logvar_stable)
         
-        # Simple concatenation works best for frozen backbone + simple classifier
-        # This allows the classifier to learn optimal combination of mean and uncertainty
-        fused_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
+        if self.vae_fusion_method == "simple_concat":
+            # Method 1: Simple concatenation (baseline)
+            fused_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
+            
+        elif self.vae_fusion_method == "enhanced_concat":
+            # Method 2: Enhanced with minimal but effective uncertainty features
+            # Only add the most informative uncertainty measures
+            basic_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
+            
+            # Add only 2 most effective uncertainty features (not 5)
+            total_var = torch.sum(std**2, dim=-1, keepdim=True)  # Total variance
+            mean_magnitude = torch.norm(mu, p=2, dim=-1, keepdim=True)  # Mean confidence
+            
+            uncertainty_features = torch.cat([total_var, mean_magnitude], dim=-1)  # [B, 2]
+            fused_features = torch.cat([basic_features, uncertainty_features], dim=-1)
+            
+        else:
+            # Default: Simple concatenation for robustness
+            fused_features = torch.cat([mu, std], dim=-1)
         
         return fused_features
 
-    # Helpers
-    def _split_sets(self, var, val, time, set_ids, padding_mask=None):
+    def _init_vae_fusion_components(self, latent_dim, fusion_method="simple_concat"):
+        """Initialize simplified fusion components - only essential ones."""
+        self.vae_fusion_method = fusion_method
+        
+        # Calculate output dimension based on fusion method (simplified)
+        if fusion_method == "enhanced_concat":
+            self.vae_feature_dim = latent_dim * 2 + 2  # mu + std + 2 uncertainty features
+        else:
+            self.vae_feature_dim = latent_dim * 2  # simple concatenation
+            
+        # Create simple but effective classifier head
+        self._create_simple_classifier(self.vae_feature_dim, self.num_classes)
+
+    def _create_simple_classifier(self, input_dim, num_classes):
         """
-        Split a concatenated patient sequence into list-of-set dicts.
-        Supports both single-patient and multi-patient batches.
-        
-        Args:
-            var: [B, N, D] Variable embeddings
-            val: [B, N, 1] Values
-            time: [B, N, 1] Time stamps
-            set_ids: [B, N, 1] Set identifiers
-            padding_mask: [B, N] Boolean mask where True indicates padding
-            
-        Returns:
-            List of set dictionaries for each patient in the batch
+        Create a simple but effective classifier head.
+        Research shows simpler heads work better for frozen backbones in medical data.
         """
-        batch_size = var.size(0)
-        all_sets = []
+        if self.estimate_uncertainty:
+            # Simple classifier with minimal dropout for light regularization
+            self.cls_head = nn.Sequential(
+                nn.Dropout(0.1),  # Light dropout
+                nn.Linear(input_dim, num_classes)
+            )
+        else:
+            # Even simpler: just linear layer
+            self.cls_head = nn.Linear(input_dim, num_classes)
         
-        for b in range(batch_size):
-            patient_sets = []
-            
-            # Get data for this patient
-            patient_var = var[b]  # [N, D]
-            patient_val = val[b]  # [N, 1]
-            patient_time = time[b]  # [N, 1]
-            patient_set_ids = set_ids[b]  # [N, 1]
-            
-            # Apply padding mask if provided
-            if padding_mask is not None:
-                patient_padding_mask = padding_mask[b]  # [N]
-                # Only keep non-padded positions
-                valid_indices = ~patient_padding_mask
-                if not valid_indices.any():
-                    # All positions are padded, create empty set
-                    patient_sets.append({
-                        "var": torch.empty(0, patient_var.size(-1), device=patient_var.device).unsqueeze(0),
-                        "val": torch.empty(0, 1, device=patient_val.device).unsqueeze(0),
-                        "minute": torch.empty(0, 1, device=patient_time.device).unsqueeze(0),
-                    })
-                    all_sets.append(patient_sets)
-                    continue
-                
-                patient_var = patient_var[valid_indices]
-                patient_val = patient_val[valid_indices]
-                patient_time = patient_time[valid_indices]
-                patient_set_ids = patient_set_ids[valid_indices]
-            
-            # Split into sets based on set_ids
-            if len(patient_set_ids) == 0:
-                # Empty patient, create empty set
-                patient_sets.append({
-                    "var": patient_var.unsqueeze(0),  # [1, N, D]
-                    "val": patient_val.unsqueeze(0),  # [1, N, 1]
-                    "minute": patient_time.unsqueeze(0),  # [1, N, 1]
-                })
-            else:
-                # Ensure set_ids is the right shape and type
-                if patient_set_ids.dim() > 1:
-                    patient_set_ids = patient_set_ids.squeeze(-1)
-                
-                # Convert to long if needed
-                if patient_set_ids.dtype != torch.long:
-                    patient_set_ids = patient_set_ids.long()
-                
-                # Find unique consecutive set IDs
-                try:
-                    # Check if torch.unique_consecutive is available
-                    if hasattr(torch, 'unique_consecutive'):
-                        unique_set_ids, counts = torch.unique_consecutive(patient_set_ids, return_counts=True)
-                    else:
-                        # Fallback implementation for older PyTorch versions
-                        unique_set_ids = torch.unique(patient_set_ids)
-                        counts = torch.tensor([(patient_set_ids == uid).sum().item() for uid in unique_set_ids])
-                    
-                    # Convert counts to list of integers
-                    counts_list = [int(c.item()) for c in counts]
-                    
-                    # Ensure counts_list is not empty and all values are positive
-                    if not counts_list or any(c <= 0 for c in counts_list):
-                        print(f"Warning: Invalid counts_list for patient {b}: {counts_list}. Treating as single set.")
-                        patient_sets.append({
-                            "var": patient_var.unsqueeze(0),  # [1, N, D]
-                            "val": patient_val.unsqueeze(0),  # [1, N, 1]
-                            "minute": patient_time.unsqueeze(0),  # [1, N, 1]
-                        })
-                    else:
-                        indices = torch.split(torch.arange(len(patient_set_ids), device=patient_set_ids.device), counts_list)
-                        
-                        for idx in indices:
-                            if len(idx) > 0:  # Only add non-empty sets
-                                patient_sets.append({
-                                    "var": patient_var[idx].unsqueeze(0),  # [1, set_size, D]
-                                    "val": patient_val[idx].unsqueeze(0),  # [1, set_size, 1]
-                                    "minute": patient_time[idx].unsqueeze(0),  # [1, set_size, 1]
-                                })
-                except Exception as e:
-                    # Fallback: treat all data as one set
-                    print(f"Warning: Error in set splitting for patient {b}: {e}. Treating as single set.")
-                    patient_sets.append({
-                        "var": patient_var.unsqueeze(0),  # [1, N, D]
-                        "val": patient_val.unsqueeze(0),  # [1, N, 1]
-                        "minute": patient_time.unsqueeze(0),  # [1, N, 1]
-                    })
-            
-            all_sets.append(patient_sets)
+        # Initialize with small weights to prevent early saturation
+        for module in self.cls_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
         
-        return all_sets
+        # Optional: Simple temperature scaling (single parameter)
+        if self.estimate_uncertainty:
+            self.temperature = nn.Parameter(torch.ones(1))
+
+    def get_uncertainty_estimate(self, batch):
+        """
+        Simple uncertainty estimation - just use VAE variance.
+        No complex MC dropout or separate heads.
+        """
+        if hasattr(self, '_last_z_list') and self._last_z_list:
+            _, mu, logvar = self._last_z_list[-1]
+            # Simple aleatoric uncertainty from VAE
+            aleatoric_uncertainty = torch.sum(torch.exp(logvar), dim=-1, keepdim=True)
+            return aleatoric_uncertainty
+        return None
+
+    def get_calibrated_predictions(self, logits):
+        """Simple temperature scaling if enabled."""
+        if hasattr(self, 'temperature'):
+            return logits / self.temperature
+        return logits
+
+
 
     def _step(self, batch, stage: str):
-        """Training/validation step with completely separated pretraining and finetuning"""
+        """Unified step with separated pretraining and finetuning, avoiding duplicate logging"""
         
         if self.classification_only:
             # Finetune mode: only classification, no reconstruction
@@ -1310,7 +1258,7 @@ class SeqSetVAE(pl.LightningModule):
             # Only use focal loss for classification
             total_loss = self.focal_loss_fn(logits, label)
             
-            # Set reconstruction losses to zero for logging
+            # Set reconstruction losses to zero for consistency
             recon_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=False)
             kl_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=False)
         else:
@@ -1321,7 +1269,7 @@ class SeqSetVAE(pl.LightningModule):
             current_beta = self.get_current_beta()
             total_loss = recon_loss + current_beta * kl_loss
 
-        # Metrics for validation stage (only in finetune mode)
+        # Validation metrics (only for finetune mode during validation)
         if stage == "val" and self.classification_only:
             label = batch.get("label")
             if self.num_classes == 2:
@@ -1333,10 +1281,10 @@ class SeqSetVAE(pl.LightningModule):
             preds = logits.argmax(dim=1)
             self.val_acc.update(preds, label)
 
-        # Compute latent statistics if available
+        # Compute latent statistics if available (only for training to avoid duplicate computation)
         mean_variance = None
         active_units_ratio = None
-        if hasattr(self, '_last_z_list') and self._last_z_list:
+        if stage == "train" and hasattr(self, '_last_z_list') and self._last_z_list:
             variances = []
             active_ratios = []
             for z_sample, mu, logvar in self._last_z_list:
@@ -1348,58 +1296,73 @@ class SeqSetVAE(pl.LightningModule):
                 mean_variance = torch.stack(variances).mean()
             if active_ratios:
                 active_units_ratio = torch.stack(active_ratios).mean()
-        # Completely separated logging for two modes
-        if self.classification_only:
-            # Finetune mode: only focal loss
-            log_payload = {
-                f"{stage}/focal_loss": total_loss,  # This is the focal loss
-                f"{stage}/total_loss": total_loss,
-            }
-            # Add VAE feature statistics for monitoring
-            if hasattr(self, '_last_z_list') and self._last_z_list:
-                try:
-                    _, mu, logvar = self._last_z_list[-1]
-                    mu_norm = torch.norm(mu, dim=-1).mean()
-                    std_mean = torch.exp(0.5 * logvar).mean()
-                    log_payload.update({
-                        f"{stage}/mu_norm": mu_norm,
-                        f"{stage}/std_mean": std_mean,
-                    })
-                except:
-                    pass
-        else:
-            # Pretraining mode: only reconstruction + KL (like SeqSetVAEPretrain)
-            current_beta = self.get_current_beta()
-            log_payload = {
-                f"{stage}/recon_loss": recon_loss,     # Reconstruction loss
-                f"{stage}/kl_loss": kl_loss,          # KL divergence loss  
-                f"{stage}/total_loss": total_loss,     # recon_loss + beta * kl_loss
-                f"{stage}/beta": current_beta,         # KL annealing factor
-            }
-            if mean_variance is not None:
-                log_payload[f"{stage}/variance"] = mean_variance
-            if active_units_ratio is not None:
-                log_payload[f"{stage}/active_units"] = active_units_ratio
-        self.log_dict(
-            log_payload,
-            prog_bar=True,
-            on_step=(stage == "train"),
-            on_epoch=True,
-        )
-        
-        # Store logged metrics for collapse detector (only in full training mode)
-        if stage == "train" and not self.classification_only:
-            self.logged_metrics = {
-                'train_kl': kl_loss,
-                'train_recon': recon_loss,
-                'train_variance': mean_variance if mean_variance is not None else torch.tensor(0.0, device=kl_loss.device),
-                'train_active_units': active_units_ratio if active_units_ratio is not None else torch.tensor(0.0, device=kl_loss.device),
-            }
-        
-        # Always update current step
+
+        # Separated logging for two modes - only log during training to avoid duplicates
         if stage == "train":
-            self.current_step += 1
+            if self.classification_only:
+                # Finetune mode: only focal loss
+                log_payload = {
+                    "train/focal_loss": total_loss,  # This is the focal loss
+                    "train/total_loss": total_loss,
+                }
+                # Add VAE feature statistics for monitoring
+                if hasattr(self, '_last_z_list') and self._last_z_list:
+                    try:
+                        _, mu, logvar = self._last_z_list[-1]
+                        mu_norm = torch.norm(mu, dim=-1).mean()
+                        std_mean = torch.exp(0.5 * logvar).mean()
+                        log_payload.update({
+                            "train/mu_norm": mu_norm,
+                            "train/std_mean": std_mean,
+                        })
+                    except:
+                        pass
+            else:
+                # Pretraining mode: only reconstruction + KL (like SeqSetVAEPretrain)
+                current_beta = self.get_current_beta()
+                log_payload = {
+                    "train/recon_loss": recon_loss,     # Reconstruction loss
+                    "train/kl_loss": kl_loss,          # KL divergence loss  
+                    "train/total_loss": total_loss,     # recon_loss + beta * kl_loss
+                    "train/beta": current_beta,         # KL annealing factor
+                }
+                if mean_variance is not None:
+                    log_payload["train/variance"] = mean_variance
+                if active_units_ratio is not None:
+                    log_payload["train/active_units"] = active_units_ratio
             
+            self.log_dict(
+                log_payload,
+                prog_bar=True,
+                on_step=True,
+                on_epoch=True,
+            )
+            
+            # Store logged metrics for collapse detector (only in pretraining mode)
+            if not self.classification_only:
+                self.logged_metrics = {
+                    'train_kl': kl_loss,
+                    'train_recon': recon_loss,
+                    'train_variance': mean_variance if mean_variance is not None else torch.tensor(0.0, device=kl_loss.device),
+                    'train_active_units': active_units_ratio if active_units_ratio is not None else torch.tensor(0.0, device=kl_loss.device),
+                }
+            
+            # Always update current step during training
+            self.current_step += 1
+        elif stage == "val":
+            # Only log validation loss (no detailed metrics to avoid confusion)
+            if self.classification_only:
+                self.log("val_loss", total_loss, prog_bar=True, on_epoch=True)
+            else:
+                # For pretraining mode, log validation reconstruction and KL
+                current_beta = self.get_current_beta()
+                self.log_dict({
+                    "val_loss": total_loss,
+                    "val_recon": recon_loss,
+                    "val_kl": kl_loss,
+                    "val_beta": current_beta,
+                }, prog_bar=True, on_epoch=True)
+                
         # Expose latent variables for collapse detector
         if hasattr(self, 'setvae') and hasattr(self.setvae, '_last_z_list'):
             self._last_z_list = self.setvae._last_z_list
@@ -1413,21 +1376,23 @@ class SeqSetVAE(pl.LightningModule):
         return self._step(batch, "val")
 
     def on_validation_epoch_end(self):
-        auc = self.val_auc.compute()
-        auprc = self.val_auprc.compute()
-        acc = self.val_acc.compute()
-        self.log_dict(
-            {
-                "val_auc": auc,
-                "val_auprc": auprc,
-                "val_accuracy": acc,
-            },
-            prog_bar=True,
-        )
-        # reset
-        self.val_auc.reset()
-        self.val_auprc.reset()
-        self.val_acc.reset()
+        """Only compute validation metrics in finetune mode"""
+        if self.classification_only:
+            auc = self.val_auc.compute()
+            auprc = self.val_auprc.compute()
+            acc = self.val_acc.compute()
+            self.log_dict(
+                {
+                    "val_auc": auc,
+                    "val_auprc": auprc,
+                    "val_accuracy": acc,
+                },
+                prog_bar=True,
+            )
+            # reset metrics
+            self.val_auc.reset()
+            self.val_auprc.reset()
+            self.val_acc.reset()
 
     def on_after_backward(self):
         # Log global gradient norm after backward

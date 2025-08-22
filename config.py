@@ -195,3 +195,13 @@ cls_head_betas = (0.9, 0.999)  # Optimized betas for classifier head
 cls_head_eps = 1e-8  # Optimized epsilon for classifier head
 cls_head_scheduler = "cosine"  # Use cosine annealing scheduler
 cls_head_scheduler_min_lr_factor = 1e-3  # Minimum LR factor for scheduler
+
+# Simplified VAE Feature Fusion Configuration
+# ============================================================================
+
+# VAE fusion method for classification (simplified options)
+# Options: "simple_concat" (baseline), "enhanced_concat" (recommended)
+vae_fusion_method = "simple_concat"  # Default: simple but effective
+
+# Minimal uncertainty quantification
+estimate_uncertainty = False  # Enable only if needed, adds minimal complexity
