@@ -75,7 +75,7 @@ class SetVAE(pl.LightningModule):
         recon_loss, kl = elbo_loss(recon, input_x, z_list)
         loss = recon_loss + self.beta * kl
         self.log_dict(
-            {"train_loss": loss, "train_recon": recon_loss, "train_kl": kl},
+            {"setvae_train_loss": loss, "setvae_train_recon": recon_loss, "setvae_train_kl": kl},
             prog_bar=True,
         )
         return loss
@@ -90,7 +90,7 @@ class SetVAE(pl.LightningModule):
         recon_loss, kl = elbo_loss(recon, input_x, z_list)  # noqa: F405
         loss = recon_loss + self.beta * kl
         self.log_dict(
-            {"val/loss": loss, "val/recon": recon_loss, "val/kl": kl}, prog_bar=True
+            {"setvae_val_loss": loss, "setvae_val_recon": recon_loss, "setvae_val_kl": kl}, prog_bar=True
         )
         return loss
 
@@ -461,14 +461,14 @@ class SeqSetVAEPretrain(pl.LightningModule):
         beta = self._current_beta()
         total = recon_loss + beta * kl_loss
         self.log_dict({
-            "train_loss": total,
-            "train_recon": recon_loss,
-            "train_kl": kl_loss,
-            "train_beta": beta,
+            "pretrain_train_loss": total,
+            "pretrain_train_recon": recon_loss,
+            "pretrain_train_kl": kl_loss,
+            "pretrain_train_beta": beta,
         }, prog_bar=True, on_step=True, on_epoch=True)
         self.logged_metrics = {
-            'train_kl': kl_loss,
-            'train_recon': recon_loss,
+            'pretrain_train_kl': kl_loss,
+            'pretrain_train_recon': recon_loss,
         }
         self.current_step += 1
         return total
@@ -478,10 +478,10 @@ class SeqSetVAEPretrain(pl.LightningModule):
         beta = self._current_beta()
         total = recon_loss + beta * kl_loss
         self.log_dict({
-            "val/loss": total,
-            "val/recon": recon_loss,
-            "val/kl": kl_loss,
-            "val/beta": beta,
+            "pretrain_val_loss": total,
+            "pretrain_val_recon": recon_loss,
+            "pretrain_val_kl": kl_loss,
+            "pretrain_val_beta": beta,
         }, prog_bar=True, on_step=False, on_epoch=True)
         return total
 
@@ -1380,9 +1380,9 @@ class SeqSetVAE(pl.LightningModule):
             if active_ratios:
                 active_units_ratio = torch.stack(active_ratios).mean()
         log_payload = {
-                f"{stage}_recon": recon_loss,
-                f"{stage}_kl": kl_loss,
-                f"{stage}_pred": pred_loss,
+                f"{stage}_recon_loss": recon_loss,
+                f"{stage}_kl_loss": kl_loss,
+                f"{stage}_pred_loss": pred_loss,
                 f"{stage}_beta": current_beta,
                 f"{stage}_recon_weight": recon_weight,
                 f"{stage}_pred_weight": pred_weight,
@@ -1394,15 +1394,16 @@ class SeqSetVAE(pl.LightningModule):
         self.log_dict(
             log_payload,
             prog_bar=True,
-            on_step=(stage == "train"),
+            on_step=False,
             on_epoch=True,
+            sync_dist=True,
         )
         
         # Store logged metrics for collapse detector
         if stage == "train":
             self.logged_metrics = {
-                'train_kl': kl_loss,
-                'train_recon': recon_loss,
+                'train_kl_loss': kl_loss,
+                'train_recon_loss': recon_loss,
                 'train_variance': mean_variance if mean_variance is not None else torch.tensor(0.0, device=kl_loss.device),
                 'train_active_units': active_units_ratio if active_units_ratio is not None else torch.tensor(0.0, device=kl_loss.device),
             }
@@ -1496,16 +1497,16 @@ class SeqSetVAE(pl.LightningModule):
             )
             monitor_metric = "val_auc"
         else:
-            # For full training mode, monitor loss
+            # For full training mode, monitor reconstruction loss
             scheduler = ReduceLROnPlateau(
                 optimizer, 
-                mode='min',  # Monitor training loss (lower is better)
+                mode='min',  # Monitor reconstruction loss (lower is better)
                 factor=0.7,  # Reduce LR by 30% when plateau
                 patience=200,  # Wait 200 steps before reducing LR
                 verbose=True,
                 min_lr=self.lr * 0.001  # Minimum learning rate
             )
-            monitor_metric = "val_loss"
+            monitor_metric = "val_recon_loss"
         
         return {
             "optimizer": optimizer,
