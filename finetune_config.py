@@ -15,7 +15,9 @@ cls_head_lr = 3e-4  # Increased classification head LR for better convergence
 lr = 1e-4  # Backbone LR (will be frozen, but used for initialization)
 
 # 2. Better regularization (compatible with VAE feature fusion)
-cls_head_weight_decay = 0.01  # Moderate weight decay, avoid over-regularizing VAE features
+cls_head_weight_decay = (
+    0.01  # Moderate weight decay, avoid over-regularizing VAE features
+)
 dropout_rate = 0.2  # Moderate dropout, allows VAE uncertainty information to flow
 
 # 3. Optimized training strategy
