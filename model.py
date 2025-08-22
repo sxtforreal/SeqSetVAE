@@ -80,20 +80,6 @@ class SetVAE(pl.LightningModule):
         )
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        var, val = batch["var"], batch["val"]
-        recon, z_list, _ = self(var, val)
-        reduced = (
-            self.setvae.dim_reducer(var) if self.setvae.dim_reducer is not None else var
-        )
-        input_x = reduced * val
-        recon_loss, kl = elbo_loss(recon, input_x, z_list)  # noqa: F405
-        loss = recon_loss + self.beta * kl
-        self.log_dict(
-            {"val/loss": loss, "val/recon": recon_loss, "val/kl": kl}, prog_bar=True
-        )
-        return loss
-
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)
         sch = get_linear_schedule_with_warmup(
@@ -473,18 +459,6 @@ class SeqSetVAEPretrain(pl.LightningModule):
         self.current_step += 1
         return total
 
-    def validation_step(self, batch, batch_idx):
-        recon_loss, kl_loss = self.forward(batch)
-        beta = self._current_beta()
-        total = recon_loss + beta * kl_loss
-        self.log_dict({
-            "val/loss": total,
-            "val/recon": recon_loss,
-            "val/kl": kl_loss,
-            "val/beta": beta,
-        }, prog_bar=True, on_step=False, on_epoch=True)
-        return total
-
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.02)
 
@@ -663,11 +637,7 @@ class SeqSetVAE(pl.LightningModule):
         # Simplified feature processing for efficiency (removed complex fusion modules)
         # Complex feature fusion modules removed to improve training speed and reduce overfitting
 
-        # Metrics
-        task_type = "binary" if num_classes == 2 else "multiclass"
-        self.val_auc = AUROC(task=task_type, num_classes=num_classes)
-        self.val_auprc = AveragePrecision(task=task_type, num_classes=num_classes)
-        self.val_acc = Accuracy(task=task_type, num_classes=num_classes)
+        # Store num_classes for reference
         self.num_classes = num_classes
 
         # Training hyperparameters
@@ -1299,8 +1269,8 @@ class SeqSetVAE(pl.LightningModule):
         
         return all_sets
 
-    def _step(self, batch, stage: str):
-        """Training/validation step with completely separated pretraining and finetuning"""
+    def training_step(self, batch, batch_idx):
+        """Training step with completely separated pretraining and finetuning"""
         
         if self.classification_only:
             # Finetune mode: only classification, no reconstruction
@@ -1321,18 +1291,6 @@ class SeqSetVAE(pl.LightningModule):
             current_beta = self.get_current_beta()
             total_loss = recon_loss + current_beta * kl_loss
 
-        # Metrics for validation stage (only in finetune mode)
-        if stage == "val" and self.classification_only:
-            label = batch.get("label")
-            if self.num_classes == 2:
-                probs = torch.softmax(logits, dim=1)[:, 1]
-            else:
-                probs = torch.softmax(logits, dim=1)
-            self.val_auc.update(probs, label)
-            self.val_auprc.update(probs, label)
-            preds = logits.argmax(dim=1)
-            self.val_acc.update(preds, label)
-
         # Compute latent statistics if available
         mean_variance = None
         active_units_ratio = None
@@ -1352,8 +1310,8 @@ class SeqSetVAE(pl.LightningModule):
         if self.classification_only:
             # Finetune mode: only focal loss
             log_payload = {
-                f"{stage}/focal_loss": total_loss,  # This is the focal loss
-                f"{stage}/total_loss": total_loss,
+                "train/focal_loss": total_loss,  # This is the focal loss
+                "train/total_loss": total_loss,
             }
             # Add VAE feature statistics for monitoring
             if hasattr(self, '_last_z_list') and self._last_z_list:
@@ -1362,8 +1320,8 @@ class SeqSetVAE(pl.LightningModule):
                     mu_norm = torch.norm(mu, dim=-1).mean()
                     std_mean = torch.exp(0.5 * logvar).mean()
                     log_payload.update({
-                        f"{stage}/mu_norm": mu_norm,
-                        f"{stage}/std_mean": std_mean,
+                        "train/mu_norm": mu_norm,
+                        "train/std_mean": std_mean,
                     })
                 except:
                     pass
@@ -1371,24 +1329,25 @@ class SeqSetVAE(pl.LightningModule):
             # Pretraining mode: only reconstruction + KL (like SeqSetVAEPretrain)
             current_beta = self.get_current_beta()
             log_payload = {
-                f"{stage}/recon_loss": recon_loss,     # Reconstruction loss
-                f"{stage}/kl_loss": kl_loss,          # KL divergence loss  
-                f"{stage}/total_loss": total_loss,     # recon_loss + beta * kl_loss
-                f"{stage}/beta": current_beta,         # KL annealing factor
+                "train/recon_loss": recon_loss,     # Reconstruction loss
+                "train/kl_loss": kl_loss,          # KL divergence loss  
+                "train/total_loss": total_loss,     # recon_loss + beta * kl_loss
+                "train/beta": current_beta,         # KL annealing factor
             }
             if mean_variance is not None:
-                log_payload[f"{stage}/variance"] = mean_variance
+                log_payload["train/variance"] = mean_variance
             if active_units_ratio is not None:
-                log_payload[f"{stage}/active_units"] = active_units_ratio
+                log_payload["train/active_units"] = active_units_ratio
+        
         self.log_dict(
             log_payload,
             prog_bar=True,
-            on_step=(stage == "train"),
+            on_step=True,
             on_epoch=True,
         )
         
-        # Store logged metrics for collapse detector (only in full training mode)
-        if stage == "train" and not self.classification_only:
+        # Store logged metrics for collapse detector (only in pretraining mode)
+        if not self.classification_only:
             self.logged_metrics = {
                 'train_kl': kl_loss,
                 'train_recon': recon_loss,
@@ -1397,8 +1356,7 @@ class SeqSetVAE(pl.LightningModule):
             }
         
         # Always update current step
-        if stage == "train":
-            self.current_step += 1
+        self.current_step += 1
             
         # Expose latent variables for collapse detector
         if hasattr(self, 'setvae') and hasattr(self.setvae, '_last_z_list'):
@@ -1406,28 +1364,7 @@ class SeqSetVAE(pl.LightningModule):
             
         return total_loss
 
-    def training_step(self, batch, batch_idx):
-        return self._step(batch, "train")
 
-    def validation_step(self, batch, batch_idx):
-        return self._step(batch, "val")
-
-    def on_validation_epoch_end(self):
-        auc = self.val_auc.compute()
-        auprc = self.val_auprc.compute()
-        acc = self.val_acc.compute()
-        self.log_dict(
-            {
-                "val_auc": auc,
-                "val_auprc": auprc,
-                "val_accuracy": acc,
-            },
-            prog_bar=True,
-        )
-        # reset
-        self.val_auc.reset()
-        self.val_auprc.reset()
-        self.val_acc.reset()
 
     def on_after_backward(self):
         # Log global gradient norm after backward
@@ -1486,7 +1423,7 @@ class SeqSetVAE(pl.LightningModule):
                 verbose=True,
                 min_lr=1e-6  # Minimum learning rate
             )
-            monitor_metric = "val_auc"
+            monitor_metric = "train/focal_loss"
         else:
             # For full training mode, monitor loss
             scheduler = ReduceLROnPlateau(
@@ -1497,7 +1434,7 @@ class SeqSetVAE(pl.LightningModule):
                 verbose=True,
                 min_lr=self.lr * 0.001  # Minimum learning rate
             )
-            monitor_metric = "val_loss"
+            monitor_metric = "train/total_loss"
         
         return {
             "optimizer": optimizer,
