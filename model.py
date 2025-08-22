@@ -1016,7 +1016,12 @@ class SeqSetVAE(pl.LightningModule):
             
             # Modern VAE feature extraction: use both mean and variance for richer representation
             if self.classification_only:
-                z_list, _ = self.setvae.setvae.encode_from_var_val(var, val)
+                setvae_inner = self.setvae.setvae
+                if hasattr(setvae_inner, "encode_from_var_val"):
+                    z_list, _ = setvae_inner.encode_from_var_val(var, val)
+                else:
+                    # Fallback for older checkpoints/modules without encode_from_var_val
+                    _, z_list, _ = setvae_inner(var, val)
             else:
                 _, z_list, _ = self.setvae.setvae(var, val)
             z_sample, mu, logvar = z_list[-1]
