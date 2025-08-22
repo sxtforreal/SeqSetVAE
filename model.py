@@ -1357,12 +1357,12 @@ class SeqSetVAE(pl.LightningModule):
                 mean_variance = torch.stack(variances).mean()
             if active_ratios:
                 active_units_ratio = torch.stack(active_ratios).mean()
-        # Simple logging: two modes only
+        # Logging for two training modes
         if self.classification_only:
-            # Finetune mode: only focal loss and total loss
+            # Finetune mode: only classification loss (no reconstruction)
             log_payload = {
                 f"{stage}/focal_loss": pred_loss,
-                f"{stage}/total_loss": total_loss,
+                f"{stage}/total_loss": total_loss,  # Same as focal_loss in finetune mode
             }
             # Add VAE feature statistics for monitoring
             if hasattr(self, '_last_z_list') and self._last_z_list:
@@ -1377,15 +1377,15 @@ class SeqSetVAE(pl.LightningModule):
                 except:
                     pass
         else:
-            # Pretraining mode: log all losses including reconstruction and KL
+            # Joint training mode: classification + reconstruction + KL regularization
             log_payload = {
-                f"{stage}/focal_loss": pred_loss,
-                f"{stage}/recon_loss": recon_loss,
-                f"{stage}/kl_loss": kl_loss,
-                f"{stage}/total_loss": total_loss,
-                f"{stage}/pred_weight": pred_weight,
-                f"{stage}/recon_weight": recon_weight,
-                f"{stage}/beta": current_beta,
+                f"{stage}/focal_loss": pred_loss,           # Classification loss
+                f"{stage}/recon_loss": recon_loss,          # Reconstruction loss  
+                f"{stage}/kl_loss": kl_loss,               # KL divergence loss
+                f"{stage}/total_loss": total_loss,          # Weighted combination
+                f"{stage}/pred_weight": pred_weight,        # Weight for classification
+                f"{stage}/recon_weight": recon_weight,      # Weight for reconstruction
+                f"{stage}/beta": current_beta,              # KL annealing factor
             }
             if mean_variance is not None:
                 log_payload[f"{stage}/variance"] = mean_variance
