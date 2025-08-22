@@ -1397,7 +1397,7 @@ class SeqSetVAE(pl.LightningModule):
         self.log_dict(
             log_payload,
             prog_bar=True,
-            on_step=(stage == "train"),
+            on_step=False,  # Always False for both train and val to avoid conflicts
             on_epoch=True,
         )
         
