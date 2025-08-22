@@ -510,6 +510,8 @@ class SeqSetVAE(pl.LightningModule):
         skip_pretrained_on_resume: bool = False,  # New parameter: whether to skip pretrained loading when resuming
         focal_gamma: float = 2.0,
         focal_alpha = None,
+        vae_fusion_method: str = "enhanced_concat",
+        estimate_uncertainty: bool = True,
     ):
 
         super().__init__()
@@ -626,13 +628,8 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # Simplified single-layer classification head (best practice for finetuning)
-        # Research shows that simpler heads work better when backbone is frozen
-        self.cls_head = nn.Linear(latent_dim * 2, num_classes)  # *2 for mean+var features
-        
-        # Initialize with small weights to prevent early saturation
-        nn.init.normal_(self.cls_head.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.cls_head.bias)
+        # Note: Classifier head will be created after VAE fusion components are initialized
+        # This is done in _init_vae_fusion_components to get the correct input dimension
         
         # Simplified feature processing for efficiency (removed complex fusion modules)
         # Complex feature fusion modules removed to improve training speed and reduce overfitting
@@ -654,11 +651,19 @@ class SeqSetVAE(pl.LightningModule):
         self.beta_warmup_steps = beta_warmup_steps
         self.kl_annealing = kl_annealing
         self.current_step = 0
+        
+        # VAE fusion and uncertainty parameters
+        self.vae_fusion_method = vae_fusion_method
+        self.estimate_uncertainty = estimate_uncertainty
+        
         # Always use focal loss for classification
         self.focal_loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean")
         # Finetune mode: classification only (skip recon/KL) and keep backbone eval
         self.classification_only = False
         self.cls_head_lr = None
+
+        # Initialize VAE fusion components
+        self._init_vae_fusion_components(latent_dim, vae_fusion_method)
         
         self.save_hyperparameters(ignore=["setvae"])
  
@@ -1040,6 +1045,9 @@ class SeqSetVAE(pl.LightningModule):
                 attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
                 enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
         
+        # Save features for uncertainty estimation
+        self._last_classification_features = enhanced_features
+        
         # Classification with enhanced features
         logits = self.cls_head(enhanced_features)
         
@@ -1144,25 +1152,266 @@ class SeqSetVAE(pl.LightningModule):
 
     def _fuse_vae_features(self, mu, logvar):
         """
-        Optimized VAE feature fusion for sequence-level prediction.
-        Based on recent research: concatenating mean and variance features 
-        works better than complex fusion for classification tasks.
+        Advanced VAE feature fusion for sequence-level prediction.
+        Based on latest research (2023-2024) on uncertainty-aware classification:
+        
+        1. Utilizes both mean and variance for richer representation
+        2. Incorporates uncertainty quantification (aleatoric + epistemic)
+        3. Multiple fusion strategies: concatenation, attention, gating
+        4. Numerical stability and calibration-aware design
         
         Args:
             mu: [B, latent_dim] - posterior mean
             logvar: [B, latent_dim] - posterior log variance
             
         Returns:
-            fused_features: [B, latent_dim * 2] - concatenated mean and variance features
+            fused_features: [B, feature_dim] - enhanced features for classification
         """
-        # Convert logvar to standard deviation for better numerical stability
-        std = torch.exp(0.5 * logvar.clamp(-10, 10))  # Clamp for numerical stability
+        # Numerical stability: clamp logvar to reasonable range
+        logvar_stable = logvar.clamp(-10, 10)
+        std = torch.exp(0.5 * logvar_stable)
         
-        # Simple concatenation works best for frozen backbone + simple classifier
-        # This allows the classifier to learn optimal combination of mean and uncertainty
-        fused_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
+        # Method 1: Enhanced Concatenation (Current + Improvements)
+        if self.vae_fusion_method == "enhanced_concat":
+            # Basic mean + std
+            basic_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
+            
+            # Add uncertainty quantification features
+            uncertainty_features = self._compute_uncertainty_features(mu, logvar_stable)
+            
+            # Concatenate all features
+            fused_features = torch.cat([basic_features, uncertainty_features], dim=-1)
+            
+        # Method 2: Attention-based Fusion
+        elif self.vae_fusion_method == "attention":
+            fused_features = self._attention_fusion(mu, std, logvar_stable)
+            
+        # Method 3: Gated Fusion (Learns optimal combination)
+        elif self.vae_fusion_method == "gated":
+            fused_features = self._gated_fusion(mu, std, logvar_stable)
+            
+        # Method 4: Uncertainty-Weighted Fusion
+        elif self.vae_fusion_method == "uncertainty_weighted":
+            fused_features = self._uncertainty_weighted_fusion(mu, std, logvar_stable)
+            
+        # Default: Simple concatenation (backward compatibility)
+        else:
+            fused_features = torch.cat([mu, std], dim=-1)
         
         return fused_features
+
+    def _compute_uncertainty_features(self, mu, logvar):
+        """
+        Compute additional uncertainty-related features based on recent research.
+        
+        Returns uncertainty quantification features including:
+        - Total variance (aleatoric uncertainty proxy)
+        - Mean magnitude (confidence proxy)
+        - KL divergence from prior (epistemic uncertainty proxy)
+        """
+        std = torch.exp(0.5 * logvar)
+        
+        # 1. Total variance per sample (aleatoric uncertainty)
+        total_var = torch.sum(std**2, dim=-1, keepdim=True)  # [B, 1]
+        
+        # 2. Mean magnitude (representation confidence)
+        mean_magnitude = torch.norm(mu, p=2, dim=-1, keepdim=True)  # [B, 1]
+        
+        # 3. KL divergence from standard normal (epistemic uncertainty)
+        kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1, keepdim=True)  # [B, 1]
+        
+        # 4. Coefficient of variation (relative uncertainty)
+        eps = 1e-8
+        coeff_var = torch.sum(std / (torch.abs(mu) + eps), dim=-1, keepdim=True)  # [B, 1]
+        
+        # 5. Entropy approximation (distribution spread)
+        entropy_approx = 0.5 * torch.sum(logvar + torch.log(2 * torch.pi * torch.e), dim=-1, keepdim=True)  # [B, 1]
+        
+        uncertainty_features = torch.cat([
+            total_var, mean_magnitude, kl_div, coeff_var, entropy_approx
+        ], dim=-1)  # [B, 5]
+        
+        return uncertainty_features
+
+    def _attention_fusion(self, mu, std, logvar):
+        """
+        Attention-based fusion of mean and variance features.
+        Learns to weight different components based on their importance.
+        """
+        # Stack features for attention
+        features = torch.stack([mu, std], dim=1)  # [B, 2, latent_dim]
+        
+        # Simple attention mechanism
+        attention_weights = torch.softmax(
+            torch.sum(features * self.attention_query.unsqueeze(0), dim=-1), dim=-1
+        )  # [B, 2]
+        
+        # Weighted combination
+        weighted_features = torch.sum(
+            features * attention_weights.unsqueeze(-1), dim=1
+        )  # [B, latent_dim]
+        
+        # Add uncertainty features
+        uncertainty_features = self._compute_uncertainty_features(mu, logvar)
+        
+        return torch.cat([weighted_features, uncertainty_features], dim=-1)
+
+    def _gated_fusion(self, mu, std, logvar):
+        """
+        Gated fusion mechanism that learns optimal combination of mean and variance.
+        Based on highway networks and gating mechanisms.
+        """
+        # Compute gates for mean and std
+        combined_input = torch.cat([mu, std], dim=-1)
+        
+        # Gate for mean features
+        gate_mu = torch.sigmoid(self.gate_mu(combined_input))
+        # Gate for std features  
+        gate_std = torch.sigmoid(self.gate_std(combined_input))
+        
+        # Gated features
+        gated_mu = gate_mu * mu
+        gated_std = gate_std * std
+        
+        # Combine with uncertainty features
+        uncertainty_features = self._compute_uncertainty_features(mu, logvar)
+        
+        return torch.cat([gated_mu, gated_std, uncertainty_features], dim=-1)
+
+    def _uncertainty_weighted_fusion(self, mu, std, logvar):
+        """
+        Weight features based on their uncertainty levels.
+        High-confidence features get higher weights.
+        """
+        # Compute confidence weights (inverse of variance)
+        confidence = 1.0 / (std + 1e-8)  # Higher confidence = lower variance
+        confidence_normalized = F.softmax(confidence, dim=-1)
+        
+        # Weight mean by confidence
+        weighted_mu = mu * confidence_normalized
+        
+        # Weight std by inverse confidence (highlight uncertain regions)
+        uncertainty_weights = std / (torch.sum(std, dim=-1, keepdim=True) + 1e-8)
+        weighted_std = std * uncertainty_weights
+        
+        # Add global uncertainty features
+        uncertainty_features = self._compute_uncertainty_features(mu, logvar)
+        
+        return torch.cat([weighted_mu, weighted_std, uncertainty_features], dim=-1)
+
+    def _init_vae_fusion_components(self, latent_dim, fusion_method="enhanced_concat"):
+        """Initialize components for different fusion methods."""
+        self.vae_fusion_method = fusion_method
+        
+        if fusion_method == "attention":
+            self.attention_query = nn.Parameter(torch.randn(latent_dim))
+            
+        elif fusion_method == "gated":
+            self.gate_mu = nn.Linear(latent_dim * 2, latent_dim)
+            self.gate_std = nn.Linear(latent_dim * 2, latent_dim)
+            
+        # Calculate output dimension based on fusion method
+        if fusion_method == "enhanced_concat":
+            self.vae_feature_dim = latent_dim * 2 + 5  # mu + std + 5 uncertainty features
+        elif fusion_method == "attention":
+            self.vae_feature_dim = latent_dim + 5  # weighted features + uncertainty
+        elif fusion_method == "gated":
+            self.vae_feature_dim = latent_dim * 2 + 5  # gated mu + gated std + uncertainty
+        elif fusion_method == "uncertainty_weighted":
+            self.vae_feature_dim = latent_dim * 2 + 5  # weighted features + uncertainty
+        else:
+            self.vae_feature_dim = latent_dim * 2  # simple concatenation
+            
+        # Create uncertainty-aware classifier head
+        self._create_uncertainty_aware_classifier(self.vae_feature_dim, self.num_classes)
+
+    def _create_uncertainty_aware_classifier(self, input_dim, num_classes):
+        """
+        Create an uncertainty-aware classifier head with multiple components:
+        1. Main classification head
+        2. Uncertainty estimation head (optional)
+        3. Calibration layers
+        """
+        # Main classifier with dropout for epistemic uncertainty
+        self.cls_head = nn.Sequential(
+            nn.Dropout(0.1),  # Epistemic uncertainty via dropout
+            nn.Linear(input_dim, input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(input_dim // 2, num_classes)
+        )
+        
+        # Optional: Separate uncertainty estimation head
+        if self.estimate_uncertainty:
+            self.uncertainty_head = nn.Sequential(
+                nn.Linear(input_dim, input_dim // 4),
+                nn.ReLU(), 
+                nn.Linear(input_dim // 4, 1),  # Single uncertainty score
+                nn.Softplus()  # Ensure positive uncertainty
+            )
+        
+        # Temperature scaling for calibration (learned parameter)
+        self.temperature = nn.Parameter(torch.ones(1))
+
+    def forward_with_uncertainty(self, batch):
+        """
+        Forward pass that returns both predictions and uncertainty estimates.
+        
+        Returns:
+            logits: [B, num_classes] - classification logits
+            uncertainty: [B, 1] - uncertainty estimates (if enabled)
+            aleatoric: [B, 1] - aleatoric uncertainty from VAE
+            epistemic: [B, 1] - epistemic uncertainty from dropout
+        """
+        # Get standard forward pass
+        logits, recon_loss, kl_loss = self(batch)
+        
+        uncertainties = {}
+        
+        if hasattr(self, '_last_z_list') and self._last_z_list:
+            # Extract aleatoric uncertainty from VAE
+            _, mu, logvar = self._last_z_list[-1]
+            aleatoric_uncertainty = torch.sum(torch.exp(logvar), dim=-1, keepdim=True)
+            uncertainties['aleatoric'] = aleatoric_uncertainty
+            
+            # Epistemic uncertainty via Monte Carlo dropout
+            if self.training or self.estimate_uncertainty:
+                epistemic_uncertainty = self._estimate_epistemic_uncertainty(batch)
+                uncertainties['epistemic'] = epistemic_uncertainty
+        
+        # Separate uncertainty head prediction
+        if hasattr(self, 'uncertainty_head'):
+            # Use the same features that went into classifier
+            if hasattr(self, '_last_classification_features'):
+                predicted_uncertainty = self.uncertainty_head(self._last_classification_features)
+                uncertainties['predicted'] = predicted_uncertainty
+        
+        return logits, uncertainties, recon_loss, kl_loss
+
+    def _estimate_epistemic_uncertainty(self, batch, n_samples=10):
+        """
+        Estimate epistemic uncertainty using Monte Carlo dropout.
+        """
+        self.train()  # Enable dropout
+        predictions = []
+        
+        for _ in range(n_samples):
+            with torch.no_grad():
+                logits, _, _ = self(batch)
+                predictions.append(F.softmax(logits, dim=-1))
+        
+        predictions = torch.stack(predictions)  # [n_samples, B, num_classes]
+        
+        # Epistemic uncertainty as prediction variance
+        epistemic = torch.var(predictions, dim=0).sum(dim=-1, keepdim=True)  # [B, 1]
+        
+        return epistemic
+
+    def get_calibrated_predictions(self, logits):
+        """
+        Apply temperature scaling for better calibration.
+        """
+        return logits / self.temperature
 
     # Helpers
     def _split_sets(self, var, val, time, set_ids, padding_mask=None):

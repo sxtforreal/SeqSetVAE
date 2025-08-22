@@ -213,6 +213,20 @@ def main():
         default=None,
         help="Alias of --output_root_dir; if provided, overrides output_root_dir",
     )
+    # Advanced VAE fusion options
+    parser.add_argument(
+        "--vae_fusion_method",
+        type=str,
+        choices=["simple_concat", "enhanced_concat", "attention", "gated", "uncertainty_weighted"],
+        default="enhanced_concat",
+        help="VAE feature fusion method for classification",
+    )
+    parser.add_argument(
+        "--estimate_uncertainty",
+        action="store_true",
+        default=True,
+        help="Enable uncertainty estimation",
+    )
 
     args = parser.parse_args()
 
@@ -360,6 +374,8 @@ def main():
             kl_annealing=active_config.kl_annealing,
             focal_alpha=active_config.focal_alpha,
             focal_gamma=active_config.focal_gamma,
+            vae_fusion_method=args.vae_fusion_method,
+            estimate_uncertainty=args.estimate_uncertainty,
         )
         checkpoint_name = "SeqSetVAE_finetune"
         monitor_metric = "val_auc"  # Monitor AUC for better finetune performance
