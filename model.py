@@ -512,6 +512,7 @@ class SeqSetVAE(pl.LightningModule):
         focal_alpha = None,
         vae_fusion_method: str = "enhanced_concat",
         estimate_uncertainty: bool = True,
+        transformer_dropout: float = 0.1,
     ):
 
         super().__init__()
@@ -598,7 +599,7 @@ class SeqSetVAE(pl.LightningModule):
             d_model=latent_dim,
             nhead=transformer_heads,
             dim_feedforward=ff_dim,
-            dropout=0.15,  # Increased dropout for better regularization
+            dropout=transformer_dropout,  # Use configurable dropout for better regularization
             activation='gelu',  # Use GELU activation function
             batch_first=True,
             norm_first=True,  # Pre-norm for better training stability
