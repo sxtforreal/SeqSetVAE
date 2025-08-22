@@ -293,8 +293,8 @@ class PosteriorMetricsMonitor(pl.Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         """Called at the end of each training batch."""
         # Fetch metrics from trainer/module, aligning with Lightning's naming
-        kl_loss = self._get_logged_value(trainer, pl_module, 'train_kl')
-        recon_loss = self._get_logged_value(trainer, pl_module, 'train_recon')
+        kl_loss = self._get_logged_value(trainer, pl_module, 'train_kl_loss')
+        recon_loss = self._get_logged_value(trainer, pl_module, 'train_recon_loss')
         
         # Fallback: try outputs dict if available
         if (kl_loss is None or recon_loss is None) and outputs is not None and isinstance(outputs, dict):

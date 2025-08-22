@@ -228,7 +228,7 @@ def main():
             except Exception as e:
                 print(f"⚠️  Failed to initialize pretrain model from checkpoint: {e}")
         checkpoint_name = "SeqSetVAE_pretrain"
-        monitor_metric = 'val_loss'
+        monitor_metric = 'pretrain_val_loss'
         monitor_mode = 'min'
     else:
         print("📋 Using SeqSetVAE - enhanced with modern VAE features and complete freezing for finetune")
