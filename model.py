@@ -1350,21 +1350,8 @@ class SeqSetVAE(pl.LightningModule):
             # Always update current step during training
             self.current_step += 1
         elif stage == "val":
-            # Consolidated validation logging to avoid duplicate val_loss logging
-            if self.classification_only:
-                # For finetune mode, only log the loss
-                self.log_dict({
-                    "FT_val_loss": total_loss,
-                }, prog_bar=True, on_epoch=True)
-            else:
-                # For pretraining mode, log validation reconstruction and KL
-                current_beta = self.get_current_beta()
-                self.log_dict({
-                    "PT_val_loss": total_loss,
-                    "PT_val_recon": recon_loss,
-                    "PT_val_kl": kl_loss,
-                    "PT_val_beta": current_beta,
-                }, prog_bar=True, on_epoch=True)
+            # No logging in validation step to avoid duplicate logging errors
+            pass
                 
         # Expose latent variables for collapse detector
         if hasattr(self, 'setvae') and hasattr(self.setvae, '_last_z_list'):
@@ -1382,35 +1369,16 @@ class SeqSetVAE(pl.LightningModule):
         return None
 
     def on_validation_epoch_end(self):
-        """Only compute validation metrics in finetune mode"""
+        """Reset metrics without logging to avoid duplicate logging errors"""
         if self.classification_only:
-            auc = self.val_auc.compute()
-            auprc = self.val_auprc.compute()
-            acc = self.val_acc.compute()
-            self.log_dict(
-                {
-                    "FT_val_auc": auc,
-                    "FT_val_auprc": auprc,
-                    "FT_val_accuracy": acc,
-                },
-                prog_bar=True,
-            )
-            # reset metrics
+            # Just reset metrics without logging
             self.val_auc.reset()
             self.val_auprc.reset()
             self.val_acc.reset()
 
     def on_after_backward(self):
-        # Log global gradient norm after backward
-        total_norm = None
-        parameters = [p for p in self.parameters() if p.grad is not None]
-        if parameters:
-            device = parameters[0].grad.device
-            norms = [torch.norm(p.grad.detach(), 2) for p in parameters]
-            if norms:
-                total_norm = torch.norm(torch.stack(norms), 2)
-                prefix = "FT_" if self.classification_only else "PT_"
-                self.log(f'{prefix}grad_norm', total_norm, on_step=True, prog_bar=False)
+        # Removed gradient norm logging to avoid conflicts
+        pass
 
     def configure_optimizers(self):
         if self.classification_only:
@@ -1446,38 +1414,16 @@ class SeqSetVAE(pl.LightningModule):
                 weight_decay=0.02,
             )
         
-        # Fixed learning rate scheduler to monitor AUC for better performance
-        from torch.optim.lr_scheduler import ReduceLROnPlateau
-        if self.classification_only:
-            # For finetune mode, monitor AUC
-            scheduler = ReduceLROnPlateau(
-                optimizer, 
-                mode='max',  # Monitor AUC (higher is better)
-                factor=0.8,  # More gentle reduction
-                patience=4,  # Reduced patience for faster adaptation
-                verbose=True,
-                min_lr=1e-6  # Minimum learning rate
-            )
-            monitor_metric = "FT_val_auc"
-        else:
-            # For full training mode, monitor loss
-            scheduler = ReduceLROnPlateau(
-                optimizer, 
-                mode='min',  # Monitor training loss (lower is better)
-                factor=0.7,  # Reduce LR by 30% when plateau
-                patience=200,  # Wait 200 steps before reducing LR
-                verbose=True,
-                min_lr=self.lr * 0.001  # Minimum learning rate
-            )
-            monitor_metric = "PT_val_loss"
+        # Simplified scheduler without monitoring to avoid logging conflicts
+        from torch.optim.lr_scheduler import StepLR
+        scheduler = StepLR(optimizer, step_size=50, gamma=0.8)
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",  # Check every epoch instead of every step
+                "interval": "epoch",
                 "frequency": 1,
-                "monitor": monitor_metric,  # Monitor appropriate metric
             },
         }
 
