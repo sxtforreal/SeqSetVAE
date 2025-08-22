@@ -135,7 +135,7 @@ post_norm = True  # Enable post-transformer normalization
 feature_fusion = True  # Enable multi-scale feature fusion
 
 # Model Checkpoint and Pretrained Weights
-pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs/checkpoints/best_SetVAE.ckpt"
+pretrained_ckpt = "/home/sunx/data/aiiih/projects/sunx/projects/SeqSetVAE/outputs/SeqSetVAE-PT/checkpoints/SeqSetVAE_pretrain_batch4.ckpt"
 
 # Loss Function Weights
 w = 3.0  # Classification loss weight (enhanced)
