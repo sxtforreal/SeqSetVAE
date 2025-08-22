@@ -90,7 +90,7 @@ class SetVAE(pl.LightningModule):
         recon_loss, kl = elbo_loss(recon, input_x, z_list)  # noqa: F405
         loss = recon_loss + self.beta * kl
         self.log_dict(
-            {"val_loss": loss, "val_recon": recon_loss, "val_kl": kl}, prog_bar=True
+            {"val/loss": loss, "val/recon": recon_loss, "val/kl": kl}, prog_bar=True
         )
         return loss
 
@@ -478,24 +478,26 @@ class SeqSetVAEPretrain(pl.LightningModule):
         beta = self._current_beta()
         total = recon_loss + beta * kl_loss
         self.log_dict({
-            "val_loss": total,
-            "val_recon": recon_loss,
-            "val_kl": kl_loss,
-            "val_beta": beta,
+            "val/loss": total,
+            "val/recon": recon_loss,
+            "val/kl": kl_loss,
+            "val/beta": beta,
         }, prog_bar=True, on_step=False, on_epoch=True)
         return total
 
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.02)
+
         from torch.optim.lr_scheduler import ReduceLROnPlateau
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=150, verbose=True, min_lr=self.lr * 0.001)
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "epoch",
                 "frequency": 1,
-                "monitor": "val_loss",
+                "monitor": "val/loss",
             },
         }
 
