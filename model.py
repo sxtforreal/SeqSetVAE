@@ -1300,37 +1300,30 @@ class SeqSetVAE(pl.LightningModule):
         return all_sets
 
     def _step(self, batch, stage: str):
-        """Optimized training/validation step using efficient forward pass"""
-        label = batch.get("label")
+        """Training/validation step with completely separated pretraining and finetuning"""
         
-        # OPTIMIZED: Use the efficient forward pass directly
-        logits, recon_loss, kl_loss = self(batch)
-        
-        # Loss calculation: always use focal loss for classification
-        pred_loss = self.focal_loss_fn(logits, label)
-
         if self.classification_only:
-            # OPTIMIZED: Pure focal loss for finetune mode - no reconstruction or KL loss
-            total_loss = pred_loss
-            # Set other losses to zero for logging (but don't compute them)
-            recon_loss = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
-            kl_loss = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
-            pred_weight = torch.tensor(1.0, device=pred_loss.device, requires_grad=False)
-            recon_weight = torch.tensor(0.0, device=pred_loss.device, requires_grad=False)
+            # Finetune mode: only classification, no reconstruction
+            label = batch.get("label")
+            logits, recon_loss, kl_loss = self(batch)
+            
+            # Only use focal loss for classification
+            total_loss = self.focal_loss_fn(logits, label)
+            
+            # Set reconstruction losses to zero for logging
+            recon_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=False)
+            kl_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=False)
         else:
-            # Full training mode with reconstruction
-            if stage == "train":
-                progress = min(1.0, self.current_step / 5000)
-                recon_weight = 0.8 * (1.0 - progress) + 0.3 * progress
-                pred_weight = self.w * (0.5 + 0.5 * progress)
-            else:
-                recon_weight = 0.5
-                pred_weight = self.w
+            # Pretraining mode: only reconstruction + KL, no classification
+            logits, recon_loss, kl_loss = self(batch)
+            
+            # Pure reconstruction loss like SeqSetVAEPretrain
             current_beta = self.get_current_beta()
-            total_loss = pred_weight * pred_loss + recon_weight * recon_loss + current_beta * kl_loss
+            total_loss = recon_loss + current_beta * kl_loss
 
-        # Metrics for validation stage
-        if stage == "val":
+        # Metrics for validation stage (only in finetune mode)
+        if stage == "val" and self.classification_only:
+            label = batch.get("label")
             if self.num_classes == 2:
                 probs = torch.softmax(logits, dim=1)[:, 1]
             else:
@@ -1340,8 +1333,6 @@ class SeqSetVAE(pl.LightningModule):
             preds = logits.argmax(dim=1)
             self.val_acc.update(preds, label)
 
-        # Log more useful metrics
-        current_beta = self.get_current_beta()
         # Compute latent statistics if available
         mean_variance = None
         active_units_ratio = None
@@ -1357,12 +1348,12 @@ class SeqSetVAE(pl.LightningModule):
                 mean_variance = torch.stack(variances).mean()
             if active_ratios:
                 active_units_ratio = torch.stack(active_ratios).mean()
-        # Logging for two training modes
+        # Completely separated logging for two modes
         if self.classification_only:
-            # Finetune mode: only classification loss (no reconstruction)
+            # Finetune mode: only focal loss
             log_payload = {
-                f"{stage}/focal_loss": pred_loss,
-                f"{stage}/total_loss": total_loss,  # Same as focal_loss in finetune mode
+                f"{stage}/focal_loss": total_loss,  # This is the focal loss
+                f"{stage}/total_loss": total_loss,
             }
             # Add VAE feature statistics for monitoring
             if hasattr(self, '_last_z_list') and self._last_z_list:
@@ -1377,15 +1368,13 @@ class SeqSetVAE(pl.LightningModule):
                 except:
                     pass
         else:
-            # Joint training mode: classification + reconstruction + KL regularization
+            # Pretraining mode: only reconstruction + KL (like SeqSetVAEPretrain)
+            current_beta = self.get_current_beta()
             log_payload = {
-                f"{stage}/focal_loss": pred_loss,           # Classification loss
-                f"{stage}/recon_loss": recon_loss,          # Reconstruction loss  
-                f"{stage}/kl_loss": kl_loss,               # KL divergence loss
-                f"{stage}/total_loss": total_loss,          # Weighted combination
-                f"{stage}/pred_weight": pred_weight,        # Weight for classification
-                f"{stage}/recon_weight": recon_weight,      # Weight for reconstruction
-                f"{stage}/beta": current_beta,              # KL annealing factor
+                f"{stage}/recon_loss": recon_loss,     # Reconstruction loss
+                f"{stage}/kl_loss": kl_loss,          # KL divergence loss  
+                f"{stage}/total_loss": total_loss,     # recon_loss + beta * kl_loss
+                f"{stage}/beta": current_beta,         # KL annealing factor
             }
             if mean_variance is not None:
                 log_payload[f"{stage}/variance"] = mean_variance
