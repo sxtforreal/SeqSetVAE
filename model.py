@@ -227,9 +227,10 @@ class SeqSetVAEPretrain(pl.LightningModule):
     def _relative_time_bucket_embedding(self, minutes: torch.Tensor):
         # minutes: [B, S] (float, minutes)
         B, S = minutes.shape
+        diffs = (minutes[:, 1:] - minutes[:, :-1]).clamp(min=0.0)
         deltas = torch.cat([
             torch.zeros(B, 1, device=minutes.device, dtype=minutes.dtype),
-            torch.diff(minutes, dim=1).clamp(min=0.0)
+            diffs
         ], dim=1)
         log_delta = torch.log1p(deltas)
         log_edges = torch.log1p(self.time_bucket_edges).to(log_delta.device)
@@ -738,6 +739,9 @@ class SeqSetVAE(pl.LightningModule):
             nn.Linear(latent_dim // 4, num_classes)
         )
         
+        # Learnable gate for pooling between last_token and attention pooling
+        self.pooling_gate = nn.Parameter(torch.tensor(0.7))
+        
         # Simplified feature extraction - no complex fusion modules for better stability
         # Use simple but effective pooling strategy
 
@@ -792,9 +796,10 @@ class SeqSetVAE(pl.LightningModule):
     def _relative_time_bucket_embedding(self, minutes: torch.Tensor):
         # minutes: [B, S] (float, minutes)
         B, S = minutes.shape
+        diffs = (minutes[:, 1:] - minutes[:, :-1]).clamp(min=0.0)
         deltas = torch.cat([
             torch.zeros(B, 1, device=minutes.device, dtype=minutes.dtype),
-            torch.diff(minutes, dim=1).clamp(min=0.0)
+            diffs
         ], dim=1)
         log_delta = torch.log1p(deltas)
         log_edges = torch.log1p(self.time_bucket_edges).to(log_delta.device)
@@ -1010,7 +1015,10 @@ class SeqSetVAE(pl.LightningModule):
             pos_list.append(minute_val)
             
             # Modern VAE feature extraction: use both mean and variance for richer representation
-            _, z_list, _ = self.setvae.setvae(var, val)
+            if self.classification_only:
+                z_list, _ = self.setvae.setvae.encode_from_var_val(var, val)
+            else:
+                _, z_list, _ = self.setvae.setvae(var, val)
             z_sample, mu, logvar = z_list[-1]
             
             # Extract and process mean and variance features
@@ -1025,14 +1033,19 @@ class SeqSetVAE(pl.LightningModule):
             # Collect latent variable information (for collapse detector)
             all_z_lists.append(z_list)
             
-            # KL calculation (still use mu/logvar for monitoring/loss if needed)
-            kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
-            min_kl = self.free_bits * self.latent_dim
-            kl_div = torch.clamp(kl_div, min=min_kl)
-            var_reg = -0.1 * torch.mean(logvar)
-            kl_total += kl_div.mean() + var_reg
-            
-        kl_total = kl_total / S
+            # KL calculation (skip entirely in classification-only finetune)
+            if not self.classification_only:
+                kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+                min_kl = self.free_bits * self.latent_dim
+                kl_div = torch.clamp(kl_div, min=min_kl)
+                var_reg = -0.1 * torch.mean(logvar)
+                kl_total += kl_div.mean() + var_reg
+        
+        if not self.classification_only:
+            kl_total = kl_total / S
+        else:
+            kl_total = torch.tensor(0.0, device=z_prims[0].device)
+        
         z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
         pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
         
@@ -1171,8 +1184,9 @@ class SeqSetVAE(pl.LightningModule):
         # Compute attention-pooled representation
         attn_pooled = torch.sum(h_t * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
         
-        # Simple combination: emphasize recent token with context
-        enhanced_features = 0.7 * last_token + 0.3 * attn_pooled
+        # Learnable gate g in [0,1]
+        g = torch.sigmoid(self.pooling_gate)
+        enhanced_features = g * last_token + (1.0 - g) * attn_pooled
         
         return enhanced_features
 
