@@ -1152,375 +1152,100 @@ class SeqSetVAE(pl.LightningModule):
 
     def _fuse_vae_features(self, mu, logvar):
         """
-        Advanced VAE feature fusion for sequence-level prediction.
-        Based on latest research (2023-2024) on uncertainty-aware classification:
-        
-        1. Utilizes both mean and variance for richer representation
-        2. Incorporates uncertainty quantification (aleatoric + epistemic)
-        3. Multiple fusion strategies: concatenation, attention, gating
-        4. Numerical stability and calibration-aware design
+        Simplified but effective VAE feature fusion for medical data classification.
+        Based on empirical evidence that simple approaches often work best in medical domains.
         
         Args:
             mu: [B, latent_dim] - posterior mean
             logvar: [B, latent_dim] - posterior log variance
             
         Returns:
-            fused_features: [B, feature_dim] - enhanced features for classification
+            fused_features: [B, feature_dim] - features for classification
         """
         # Numerical stability: clamp logvar to reasonable range
         logvar_stable = logvar.clamp(-10, 10)
         std = torch.exp(0.5 * logvar_stable)
         
-        # Method 1: Enhanced Concatenation (Current + Improvements)
-        if self.vae_fusion_method == "enhanced_concat":
-            # Basic mean + std
+        if self.vae_fusion_method == "simple_concat":
+            # Method 1: Simple concatenation (baseline)
+            fused_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
+            
+        elif self.vae_fusion_method == "enhanced_concat":
+            # Method 2: Enhanced with minimal but effective uncertainty features
+            # Only add the most informative uncertainty measures
             basic_features = torch.cat([mu, std], dim=-1)  # [B, latent_dim * 2]
             
-            # Add uncertainty quantification features
-            uncertainty_features = self._compute_uncertainty_features(mu, logvar_stable)
+            # Add only 2 most effective uncertainty features (not 5)
+            total_var = torch.sum(std**2, dim=-1, keepdim=True)  # Total variance
+            mean_magnitude = torch.norm(mu, p=2, dim=-1, keepdim=True)  # Mean confidence
             
-            # Concatenate all features
+            uncertainty_features = torch.cat([total_var, mean_magnitude], dim=-1)  # [B, 2]
             fused_features = torch.cat([basic_features, uncertainty_features], dim=-1)
             
-        # Method 2: Attention-based Fusion
-        elif self.vae_fusion_method == "attention":
-            fused_features = self._attention_fusion(mu, std, logvar_stable)
-            
-        # Method 3: Gated Fusion (Learns optimal combination)
-        elif self.vae_fusion_method == "gated":
-            fused_features = self._gated_fusion(mu, std, logvar_stable)
-            
-        # Method 4: Uncertainty-Weighted Fusion
-        elif self.vae_fusion_method == "uncertainty_weighted":
-            fused_features = self._uncertainty_weighted_fusion(mu, std, logvar_stable)
-            
-        # Default: Simple concatenation (backward compatibility)
         else:
+            # Default: Simple concatenation for robustness
             fused_features = torch.cat([mu, std], dim=-1)
         
         return fused_features
 
-    def _compute_uncertainty_features(self, mu, logvar):
-        """
-        Compute additional uncertainty-related features based on recent research.
-        
-        Returns uncertainty quantification features including:
-        - Total variance (aleatoric uncertainty proxy)
-        - Mean magnitude (confidence proxy)
-        - KL divergence from prior (epistemic uncertainty proxy)
-        """
-        std = torch.exp(0.5 * logvar)
-        
-        # 1. Total variance per sample (aleatoric uncertainty)
-        total_var = torch.sum(std**2, dim=-1, keepdim=True)  # [B, 1]
-        
-        # 2. Mean magnitude (representation confidence)
-        mean_magnitude = torch.norm(mu, p=2, dim=-1, keepdim=True)  # [B, 1]
-        
-        # 3. KL divergence from standard normal (epistemic uncertainty)
-        kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1, keepdim=True)  # [B, 1]
-        
-        # 4. Coefficient of variation (relative uncertainty)
-        eps = 1e-8
-        coeff_var = torch.sum(std / (torch.abs(mu) + eps), dim=-1, keepdim=True)  # [B, 1]
-        
-        # 5. Entropy approximation (distribution spread)
-        entropy_approx = 0.5 * torch.sum(logvar + torch.log(2 * torch.pi * torch.e), dim=-1, keepdim=True)  # [B, 1]
-        
-        uncertainty_features = torch.cat([
-            total_var, mean_magnitude, kl_div, coeff_var, entropy_approx
-        ], dim=-1)  # [B, 5]
-        
-        return uncertainty_features
-
-    def _attention_fusion(self, mu, std, logvar):
-        """
-        Attention-based fusion of mean and variance features.
-        Learns to weight different components based on their importance.
-        """
-        # Stack features for attention
-        features = torch.stack([mu, std], dim=1)  # [B, 2, latent_dim]
-        
-        # Simple attention mechanism
-        attention_weights = torch.softmax(
-            torch.sum(features * self.attention_query.unsqueeze(0), dim=-1), dim=-1
-        )  # [B, 2]
-        
-        # Weighted combination
-        weighted_features = torch.sum(
-            features * attention_weights.unsqueeze(-1), dim=1
-        )  # [B, latent_dim]
-        
-        # Add uncertainty features
-        uncertainty_features = self._compute_uncertainty_features(mu, logvar)
-        
-        return torch.cat([weighted_features, uncertainty_features], dim=-1)
-
-    def _gated_fusion(self, mu, std, logvar):
-        """
-        Gated fusion mechanism that learns optimal combination of mean and variance.
-        Based on highway networks and gating mechanisms.
-        """
-        # Compute gates for mean and std
-        combined_input = torch.cat([mu, std], dim=-1)
-        
-        # Gate for mean features
-        gate_mu = torch.sigmoid(self.gate_mu(combined_input))
-        # Gate for std features  
-        gate_std = torch.sigmoid(self.gate_std(combined_input))
-        
-        # Gated features
-        gated_mu = gate_mu * mu
-        gated_std = gate_std * std
-        
-        # Combine with uncertainty features
-        uncertainty_features = self._compute_uncertainty_features(mu, logvar)
-        
-        return torch.cat([gated_mu, gated_std, uncertainty_features], dim=-1)
-
-    def _uncertainty_weighted_fusion(self, mu, std, logvar):
-        """
-        Weight features based on their uncertainty levels.
-        High-confidence features get higher weights.
-        """
-        # Compute confidence weights (inverse of variance)
-        confidence = 1.0 / (std + 1e-8)  # Higher confidence = lower variance
-        confidence_normalized = F.softmax(confidence, dim=-1)
-        
-        # Weight mean by confidence
-        weighted_mu = mu * confidence_normalized
-        
-        # Weight std by inverse confidence (highlight uncertain regions)
-        uncertainty_weights = std / (torch.sum(std, dim=-1, keepdim=True) + 1e-8)
-        weighted_std = std * uncertainty_weights
-        
-        # Add global uncertainty features
-        uncertainty_features = self._compute_uncertainty_features(mu, logvar)
-        
-        return torch.cat([weighted_mu, weighted_std, uncertainty_features], dim=-1)
-
-    def _init_vae_fusion_components(self, latent_dim, fusion_method="enhanced_concat"):
-        """Initialize components for different fusion methods."""
+    def _init_vae_fusion_components(self, latent_dim, fusion_method="simple_concat"):
+        """Initialize simplified fusion components - only essential ones."""
         self.vae_fusion_method = fusion_method
         
-        if fusion_method == "attention":
-            self.attention_query = nn.Parameter(torch.randn(latent_dim))
-            
-        elif fusion_method == "gated":
-            self.gate_mu = nn.Linear(latent_dim * 2, latent_dim)
-            self.gate_std = nn.Linear(latent_dim * 2, latent_dim)
-            
-        # Calculate output dimension based on fusion method
+        # Calculate output dimension based on fusion method (simplified)
         if fusion_method == "enhanced_concat":
-            self.vae_feature_dim = latent_dim * 2 + 5  # mu + std + 5 uncertainty features
-        elif fusion_method == "attention":
-            self.vae_feature_dim = latent_dim + 5  # weighted features + uncertainty
-        elif fusion_method == "gated":
-            self.vae_feature_dim = latent_dim * 2 + 5  # gated mu + gated std + uncertainty
-        elif fusion_method == "uncertainty_weighted":
-            self.vae_feature_dim = latent_dim * 2 + 5  # weighted features + uncertainty
+            self.vae_feature_dim = latent_dim * 2 + 2  # mu + std + 2 uncertainty features
         else:
             self.vae_feature_dim = latent_dim * 2  # simple concatenation
             
-        # Create uncertainty-aware classifier head
-        self._create_uncertainty_aware_classifier(self.vae_feature_dim, self.num_classes)
+        # Create simple but effective classifier head
+        self._create_simple_classifier(self.vae_feature_dim, self.num_classes)
 
-    def _create_uncertainty_aware_classifier(self, input_dim, num_classes):
+    def _create_simple_classifier(self, input_dim, num_classes):
         """
-        Create an uncertainty-aware classifier head with multiple components:
-        1. Main classification head
-        2. Uncertainty estimation head (optional)
-        3. Calibration layers
+        Create a simple but effective classifier head.
+        Research shows simpler heads work better for frozen backbones in medical data.
         """
-        # Main classifier with dropout for epistemic uncertainty
-        self.cls_head = nn.Sequential(
-            nn.Dropout(0.1),  # Epistemic uncertainty via dropout
-            nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(input_dim // 2, num_classes)
-        )
-        
-        # Optional: Separate uncertainty estimation head
         if self.estimate_uncertainty:
-            self.uncertainty_head = nn.Sequential(
-                nn.Linear(input_dim, input_dim // 4),
-                nn.ReLU(), 
-                nn.Linear(input_dim // 4, 1),  # Single uncertainty score
-                nn.Softplus()  # Ensure positive uncertainty
+            # Simple classifier with minimal dropout for light regularization
+            self.cls_head = nn.Sequential(
+                nn.Dropout(0.1),  # Light dropout
+                nn.Linear(input_dim, num_classes)
             )
+        else:
+            # Even simpler: just linear layer
+            self.cls_head = nn.Linear(input_dim, num_classes)
         
-        # Temperature scaling for calibration (learned parameter)
-        self.temperature = nn.Parameter(torch.ones(1))
+        # Initialize with small weights to prevent early saturation
+        for module in self.cls_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # Optional: Simple temperature scaling (single parameter)
+        if self.estimate_uncertainty:
+            self.temperature = nn.Parameter(torch.ones(1))
 
-    def forward_with_uncertainty(self, batch):
+    def get_uncertainty_estimate(self, batch):
         """
-        Forward pass that returns both predictions and uncertainty estimates.
-        
-        Returns:
-            logits: [B, num_classes] - classification logits
-            uncertainty: [B, 1] - uncertainty estimates (if enabled)
-            aleatoric: [B, 1] - aleatoric uncertainty from VAE
-            epistemic: [B, 1] - epistemic uncertainty from dropout
+        Simple uncertainty estimation - just use VAE variance.
+        No complex MC dropout or separate heads.
         """
-        # Get standard forward pass
-        logits, recon_loss, kl_loss = self(batch)
-        
-        uncertainties = {}
-        
         if hasattr(self, '_last_z_list') and self._last_z_list:
-            # Extract aleatoric uncertainty from VAE
             _, mu, logvar = self._last_z_list[-1]
+            # Simple aleatoric uncertainty from VAE
             aleatoric_uncertainty = torch.sum(torch.exp(logvar), dim=-1, keepdim=True)
-            uncertainties['aleatoric'] = aleatoric_uncertainty
-            
-            # Epistemic uncertainty via Monte Carlo dropout
-            if self.training or self.estimate_uncertainty:
-                epistemic_uncertainty = self._estimate_epistemic_uncertainty(batch)
-                uncertainties['epistemic'] = epistemic_uncertainty
-        
-        # Separate uncertainty head prediction
-        if hasattr(self, 'uncertainty_head'):
-            # Use the same features that went into classifier
-            if hasattr(self, '_last_classification_features'):
-                predicted_uncertainty = self.uncertainty_head(self._last_classification_features)
-                uncertainties['predicted'] = predicted_uncertainty
-        
-        return logits, uncertainties, recon_loss, kl_loss
-
-    def _estimate_epistemic_uncertainty(self, batch, n_samples=10):
-        """
-        Estimate epistemic uncertainty using Monte Carlo dropout.
-        """
-        self.train()  # Enable dropout
-        predictions = []
-        
-        for _ in range(n_samples):
-            with torch.no_grad():
-                logits, _, _ = self(batch)
-                predictions.append(F.softmax(logits, dim=-1))
-        
-        predictions = torch.stack(predictions)  # [n_samples, B, num_classes]
-        
-        # Epistemic uncertainty as prediction variance
-        epistemic = torch.var(predictions, dim=0).sum(dim=-1, keepdim=True)  # [B, 1]
-        
-        return epistemic
+            return aleatoric_uncertainty
+        return None
 
     def get_calibrated_predictions(self, logits):
-        """
-        Apply temperature scaling for better calibration.
-        """
-        return logits / self.temperature
+        """Simple temperature scaling if enabled."""
+        if hasattr(self, 'temperature'):
+            return logits / self.temperature
+        return logits
 
-    # Helpers
-    def _split_sets(self, var, val, time, set_ids, padding_mask=None):
-        """
-        Split a concatenated patient sequence into list-of-set dicts.
-        Supports both single-patient and multi-patient batches.
-        
-        Args:
-            var: [B, N, D] Variable embeddings
-            val: [B, N, 1] Values
-            time: [B, N, 1] Time stamps
-            set_ids: [B, N, 1] Set identifiers
-            padding_mask: [B, N] Boolean mask where True indicates padding
-            
-        Returns:
-            List of set dictionaries for each patient in the batch
-        """
-        batch_size = var.size(0)
-        all_sets = []
-        
-        for b in range(batch_size):
-            patient_sets = []
-            
-            # Get data for this patient
-            patient_var = var[b]  # [N, D]
-            patient_val = val[b]  # [N, 1]
-            patient_time = time[b]  # [N, 1]
-            patient_set_ids = set_ids[b]  # [N, 1]
-            
-            # Apply padding mask if provided
-            if padding_mask is not None:
-                patient_padding_mask = padding_mask[b]  # [N]
-                # Only keep non-padded positions
-                valid_indices = ~patient_padding_mask
-                if not valid_indices.any():
-                    # All positions are padded, create empty set
-                    patient_sets.append({
-                        "var": torch.empty(0, patient_var.size(-1), device=patient_var.device).unsqueeze(0),
-                        "val": torch.empty(0, 1, device=patient_val.device).unsqueeze(0),
-                        "minute": torch.empty(0, 1, device=patient_time.device).unsqueeze(0),
-                    })
-                    all_sets.append(patient_sets)
-                    continue
-                
-                patient_var = patient_var[valid_indices]
-                patient_val = patient_val[valid_indices]
-                patient_time = patient_time[valid_indices]
-                patient_set_ids = patient_set_ids[valid_indices]
-            
-            # Split into sets based on set_ids
-            if len(patient_set_ids) == 0:
-                # Empty patient, create empty set
-                patient_sets.append({
-                    "var": patient_var.unsqueeze(0),  # [1, N, D]
-                    "val": patient_val.unsqueeze(0),  # [1, N, 1]
-                    "minute": patient_time.unsqueeze(0),  # [1, N, 1]
-                })
-            else:
-                # Ensure set_ids is the right shape and type
-                if patient_set_ids.dim() > 1:
-                    patient_set_ids = patient_set_ids.squeeze(-1)
-                
-                # Convert to long if needed
-                if patient_set_ids.dtype != torch.long:
-                    patient_set_ids = patient_set_ids.long()
-                
-                # Find unique consecutive set IDs
-                try:
-                    # Check if torch.unique_consecutive is available
-                    if hasattr(torch, 'unique_consecutive'):
-                        unique_set_ids, counts = torch.unique_consecutive(patient_set_ids, return_counts=True)
-                    else:
-                        # Fallback implementation for older PyTorch versions
-                        unique_set_ids = torch.unique(patient_set_ids)
-                        counts = torch.tensor([(patient_set_ids == uid).sum().item() for uid in unique_set_ids])
-                    
-                    # Convert counts to list of integers
-                    counts_list = [int(c.item()) for c in counts]
-                    
-                    # Ensure counts_list is not empty and all values are positive
-                    if not counts_list or any(c <= 0 for c in counts_list):
-                        print(f"Warning: Invalid counts_list for patient {b}: {counts_list}. Treating as single set.")
-                        patient_sets.append({
-                            "var": patient_var.unsqueeze(0),  # [1, N, D]
-                            "val": patient_val.unsqueeze(0),  # [1, N, 1]
-                            "minute": patient_time.unsqueeze(0),  # [1, N, 1]
-                        })
-                    else:
-                        indices = torch.split(torch.arange(len(patient_set_ids), device=patient_set_ids.device), counts_list)
-                        
-                        for idx in indices:
-                            if len(idx) > 0:  # Only add non-empty sets
-                                patient_sets.append({
-                                    "var": patient_var[idx].unsqueeze(0),  # [1, set_size, D]
-                                    "val": patient_val[idx].unsqueeze(0),  # [1, set_size, 1]
-                                    "minute": patient_time[idx].unsqueeze(0),  # [1, set_size, 1]
-                                })
-                except Exception as e:
-                    # Fallback: treat all data as one set
-                    print(f"Warning: Error in set splitting for patient {b}: {e}. Treating as single set.")
-                    patient_sets.append({
-                        "var": patient_var.unsqueeze(0),  # [1, N, D]
-                        "val": patient_val.unsqueeze(0),  # [1, N, 1]
-                        "minute": patient_time.unsqueeze(0),  # [1, N, 1]
-                    })
-            
-            all_sets.append(patient_sets)
-        
-        return all_sets
+
 
     def _step(self, batch, stage: str):
         """Unified step with separated pretraining and finetuning, avoiding duplicate logging"""

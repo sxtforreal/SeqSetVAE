@@ -213,19 +213,19 @@ def main():
         default=None,
         help="Alias of --output_root_dir; if provided, overrides output_root_dir",
     )
-    # Advanced VAE fusion options
+    # Simple VAE fusion options
     parser.add_argument(
         "--vae_fusion_method",
         type=str,
-        choices=["simple_concat", "enhanced_concat", "attention", "gated", "uncertainty_weighted"],
-        default="enhanced_concat",
-        help="VAE feature fusion method for classification",
+        choices=["simple_concat", "enhanced_concat"],
+        default="simple_concat",
+        help="VAE feature fusion: simple_concat (baseline) or enhanced_concat (+2 uncertainty features)",
     )
     parser.add_argument(
         "--estimate_uncertainty",
         action="store_true",
-        default=True,
-        help="Enable uncertainty estimation",
+        default=False,
+        help="Enable minimal uncertainty estimation (adds light dropout)",
     )
 
     args = parser.parse_args()

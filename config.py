@@ -196,57 +196,12 @@ cls_head_eps = 1e-8  # Optimized epsilon for classifier head
 cls_head_scheduler = "cosine"  # Use cosine annealing scheduler
 cls_head_scheduler_min_lr_factor = 1e-3  # Minimum LR factor for scheduler
 
-# VAE Feature Fusion Configuration (Enhanced for 2024)
+# Simplified VAE Feature Fusion Configuration
 # ============================================================================
 
-# VAE fusion method for classification
-# Options: "simple_concat", "enhanced_concat", "attention", "gated", "uncertainty_weighted"
-vae_fusion_method = "enhanced_concat"  # Default: enhanced concatenation with uncertainty features
+# VAE fusion method for classification (simplified options)
+# Options: "simple_concat" (baseline), "enhanced_concat" (recommended)
+vae_fusion_method = "simple_concat"  # Default: simple but effective
 
-# Uncertainty quantification settings
-estimate_uncertainty = True  # Enable uncertainty estimation
-uncertainty_methods = {
-    "aleatoric": True,     # Use VAE variance for aleatoric uncertainty
-    "epistemic": True,     # Use Monte Carlo dropout for epistemic uncertainty
-    "predicted": True,     # Use separate uncertainty head
-}
-
-# Monte Carlo dropout settings for epistemic uncertainty
-mc_dropout_samples = 10   # Number of samples for MC dropout
-mc_dropout_rate = 0.1     # Dropout rate for uncertainty estimation
-
-# Temperature scaling for calibration
-enable_temperature_scaling = True
-initial_temperature = 1.0
-
-# Advanced fusion method configurations
-fusion_configs = {
-    "enhanced_concat": {
-        "use_uncertainty_features": True,
-        "uncertainty_feature_count": 5,  # total_var, mean_mag, kl_div, coeff_var, entropy
-        "numerical_stability": True,
-    },
-    "attention": {
-        "attention_dim": 64,
-        "use_multi_head": False,
-        "num_heads": 4,
-    },
-    "gated": {
-        "gate_activation": "sigmoid",
-        "use_highway_connection": True,
-    },
-    "uncertainty_weighted": {
-        "confidence_threshold": 0.1,
-        "weight_normalization": "softmax",
-    }
-}
-
-# Uncertainty-aware classifier configuration
-uncertainty_classifier_config = {
-    "use_dropout": True,
-    "dropout_rate": 0.1,
-    "hidden_dim_ratio": 0.5,  # hidden_dim = input_dim * ratio
-    "uncertainty_head_ratio": 0.25,  # uncertainty_head_dim = input_dim * ratio
-    "activation": "relu",
-    "use_batch_norm": False,
-}
+# Minimal uncertainty quantification
+estimate_uncertainty = False  # Enable only if needed, adds minimal complexity
