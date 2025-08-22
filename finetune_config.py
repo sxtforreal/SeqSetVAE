@@ -10,9 +10,9 @@ from config import *  # Import base config
 
 # ====== Key Improvement Settings ======
 
-# 1. Conservative learning rate settings (for fully frozen backbone)
-cls_head_lr = 1e-4  # Further reduced classification head LR, works with fully frozen backbone
-lr = 1e-5  # Backbone LR (will be frozen, but used for initialization)
+# 1. Optimized learning rate settings (for fully frozen backbone)
+cls_head_lr = 3e-4  # Increased classification head LR for better convergence
+lr = 1e-4  # Backbone LR (will be frozen, but used for initialization)
 
 # 2. Better regularization (compatible with VAE feature fusion)
 cls_head_weight_decay = 0.01  # Moderate weight decay, avoid over-regularizing VAE features
@@ -29,9 +29,9 @@ focal_alpha = 0.25  # Adjusted focal loss parameters
 focal_gamma = 2.0
 label_smoothing = 0.05  # Added label smoothing
 
-# 5. Batch and validation settings
-batch_size = 4  # Moderate batch size
-val_check_interval = 0.2  # More frequent validation
+# 5. Optimized batch and validation settings
+batch_size = 8  # Increased batch size for better GPU utilization
+val_check_interval = 0.25  # Less frequent validation for speed
 limit_val_batches = 1.0  # Use all validation data
 
 # 6. Feature extraction optimization
