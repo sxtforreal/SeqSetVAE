@@ -358,7 +358,6 @@ def main():
             max_beta=model_max_beta,
             beta_warmup_steps=model_beta_warmup_steps,
             kl_annealing=active_config.kl_annealing,
-            use_focal_loss=getattr(active_config, "use_focal_loss", True),
             focal_alpha=active_config.focal_alpha,
             focal_gamma=active_config.focal_gamma,
         )

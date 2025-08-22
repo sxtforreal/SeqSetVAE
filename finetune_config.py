@@ -25,8 +25,7 @@ warmup_steps = 500  # Reduced warmup steps for faster effective training
 max_epochs = 15  # Increased maximum training epochs
 early_stopping_patience = 6  # Reduced early stopping patience to prevent overfitting
 
-# 4. More stable loss function settings
-use_focal_loss = True
+# 4. Focal loss settings (always enabled)
 focal_alpha = 0.25  # Adjusted focal loss parameters
 focal_gamma = 2.0
 label_smoothing = 0.05  # Added label smoothing

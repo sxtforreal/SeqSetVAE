@@ -183,8 +183,7 @@ accelerator = "gpu"  # Training accelerator type (gpu/cpu/tpu)
 devices = 1  # Number of devices to use for training
 precision = "16-mixed"  # Mixed precision training (16-bit float + 32-bit float)
 
-# Focal Loss Hyperparameters
-use_focal_loss = True
+# Focal Loss Hyperparameters (always enabled for classification)
 # alpha for positive class in binary classification (set None to disable balancing)
 # focal_alpha and focal_gamma are already set above in Loss Function Weights section
 
