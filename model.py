@@ -800,6 +800,11 @@ class SeqSetVAE(pl.LightningModule):
             )
             padding_mask = sets.get("padding_mask", None)
             
+            # In classification-only finetune mode, run full sequence-level path using set splitting
+            if self.classification_only:
+                all_patient_sets = self._split_sets(var, val, time, set_ids, padding_mask)
+                return self._forward_batch(all_patient_sets, padding_mask)
+            
             # OPTIMIZATION: Fast batch processing without patient-by-patient splitting
             batch_size = var.size(0)
             
@@ -982,14 +987,16 @@ class SeqSetVAE(pl.LightningModule):
             z_prims.append(combined_feat)
             
             # Collect latent variable information (for collapse detector)
-            all_z_lists.append(z_list)
+            if not self.classification_only:
+                all_z_lists.append(z_list)
             
             # KL calculation (still use mu/logvar for monitoring/loss if needed)
-            kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
-            min_kl = self.free_bits * self.latent_dim
-            kl_div = torch.clamp(kl_div, min=min_kl)
-            var_reg = -0.1 * torch.mean(logvar)
-            kl_total += kl_div.mean() + var_reg
+            if not self.classification_only:
+                kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+                min_kl = self.free_bits * self.latent_dim
+                kl_div = torch.clamp(kl_div, min=min_kl)
+                var_reg = -0.1 * torch.mean(logvar)
+                kl_total += kl_div.mean() + var_reg
             
         kl_total = kl_total / S
         z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
@@ -1367,7 +1374,7 @@ class SeqSetVAE(pl.LightningModule):
         # Compute latent statistics if available
         mean_variance = None
         active_units_ratio = None
-        if hasattr(self, '_last_z_list') and self._last_z_list:
+        if (not self.classification_only) and hasattr(self, '_last_z_list') and self._last_z_list:
             variances = []
             active_ratios = []
             for z_sample, mu, logvar in self._last_z_list:
