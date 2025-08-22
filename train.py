@@ -19,6 +19,7 @@ from model import SeqSetVAE, SeqSetVAEPretrain, load_checkpoint_weights
 from dataset import SeqSetVAEDataModule
 from posterior_collapse_detector import PosteriorMetricsMonitor
 import config
+import finetune_config
 
 
 def get_adaptive_training_config(args):
@@ -36,11 +37,11 @@ def get_adaptive_training_config(args):
             effective_batch_size = args.batch_size * args.gradient_accumulation_steps
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
         if gpu_memory >= 16:
-            num_workers = min(args.num_workers, 8)
+            num_workers = min(args.num_workers, 6)  # Optimized for better balance
         elif gpu_memory >= 8:
-            num_workers = min(args.num_workers, 6)
+            num_workers = min(args.num_workers, 4)  # Reduced for stability
         else:
-            num_workers = min(args.num_workers, 3)
+            num_workers = min(args.num_workers, 2)  # Conservative for low memory
         pin_memory = True
         compile_model = args.compile_model and hasattr(torch, 'compile')
     else:
@@ -98,8 +99,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train SeqSetVAE (pretrain/finetune)")
     # Basic training parameters
     parser.add_argument("--mode", type=str, choices=["pretrain", "finetune"], required=True, help="Training mode")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size (optimized for finetune efficiency)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps (optimized for larger batch sizes)")
     parser.add_argument("--max_epochs", type=int, default=100, help="Maximum epochs")
     parser.add_argument("--devices", type=int, default=None, help="Number of devices (auto-detect if not specified)")
     parser.add_argument("--strategy", type=str, default="auto", help="Training strategy")
@@ -158,13 +159,14 @@ def main():
     adaptive_config = get_adaptive_training_config(args)
 
     print("📊 Setting up data module...")
-    # Enforce batch policy: pretrain -> single patient; finetune -> multi-patient
+    # Optimized batch policy: pretrain -> single patient; finetune -> larger batches for efficiency
     if args.mode == 'pretrain':
         dm_batch_size = 1
     else:
-        dm_batch_size = args.batch_size if args.batch_size and args.batch_size > 1 else 2
-        if args.batch_size == 1:
-            print("⚠️  Finetune requires multi-patient batches; overriding batch_size to 2")
+        # Use larger batch sizes for better GPU utilization in finetune
+        dm_batch_size = max(args.batch_size, 4)  # Minimum batch size of 4 for finetune
+        if args.batch_size < 4:
+            print(f"⚠️  Finetune efficiency: increasing batch_size from {args.batch_size} to {dm_batch_size}")
     print(f" - DataModule batch_size: {dm_batch_size}")
     data_module = SeqSetVAEDataModule(
         saved_dir=args.data_dir,
@@ -177,16 +179,24 @@ def main():
         pin_memory=adaptive_config['pin_memory'],
     )
 
-    # Common model hyperparams from config
-    model_lr = config.lr
-    model_free_bits = config.free_bits
-    model_max_beta = config.max_beta
-    model_beta_warmup_steps = config.beta_warmup_steps
-    model_gradient_clip_val = config.gradient_clip_val
+    # Use optimized config for finetune mode
+    if args.mode == 'finetune':
+        active_config = finetune_config
+        print("📋 Using optimized finetune configuration")
+    else:
+        active_config = config
+        print("📋 Using base configuration for pretrain")
+    
+    # Model hyperparams from active config
+    model_lr = active_config.lr
+    model_free_bits = active_config.free_bits
+    model_max_beta = active_config.max_beta
+    model_beta_warmup_steps = active_config.beta_warmup_steps
+    model_gradient_clip_val = active_config.gradient_clip_val
 
-    ff_dim = config.ff_dim
-    transformer_heads = config.transformer_heads
-    transformer_layers = config.transformer_layers
+    ff_dim = active_config.ff_dim
+    transformer_heads = active_config.transformer_heads
+    transformer_layers = active_config.transformer_layers
 
     print("🧠 Building model...")
     if args.mode == 'pretrain':
@@ -223,31 +233,31 @@ def main():
     else:
         print("📋 Using SeqSetVAE - enhanced with modern VAE features and complete freezing for finetune")
         model = SeqSetVAE(
-            input_dim=config.input_dim,
-            reduced_dim=config.reduced_dim,
-            latent_dim=config.latent_dim,
-            levels=config.levels,
-            heads=config.heads,
-            m=config.m,
-            beta=config.beta,
+            input_dim=active_config.input_dim,
+            reduced_dim=active_config.reduced_dim,
+            latent_dim=active_config.latent_dim,
+            levels=active_config.levels,
+            heads=active_config.heads,
+            m=active_config.m,
+            beta=active_config.beta,
             lr=model_lr,
-            num_classes=config.num_classes,
+            num_classes=active_config.num_classes,
             ff_dim=ff_dim,
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
             pretrained_ckpt=None,
-            w=config.w,
+            w=active_config.w,
             free_bits=model_free_bits,
-            warmup_beta=config.warmup_beta,
+            warmup_beta=active_config.warmup_beta,
             max_beta=model_max_beta,
             beta_warmup_steps=model_beta_warmup_steps,
-            kl_annealing=config.kl_annealing,
-            use_focal_loss=getattr(config, 'use_focal_loss', True),
-            focal_alpha=config.focal_alpha,
-            focal_gamma=config.focal_gamma,
+            kl_annealing=active_config.kl_annealing,
+            use_focal_loss=getattr(active_config, 'use_focal_loss', True),
+            focal_alpha=active_config.focal_alpha,
+            focal_gamma=active_config.focal_gamma,
         )
         checkpoint_name = "SeqSetVAE_finetune"
-        monitor_metric = 'val_auc'
+        monitor_metric = 'val_auc'  # Monitor AUC for better finetune performance
         monitor_mode = 'max'
 
         # Load pretrained weights if provided
@@ -275,7 +285,7 @@ def main():
                 param.requires_grad = False
                 frozen_params += param.numel()
         
-        model.enable_classification_only_mode(cls_head_lr=getattr(config, 'cls_head_lr', None))
+        model.enable_classification_only_mode(cls_head_lr=getattr(active_config, 'cls_head_lr', None))
         print("🧊 Finetune freeze applied and backbone set to eval; classification-only loss enabled.")
         print(f"   - Frozen parameters: {frozen_params:,}")
         print(f"   - Trainable parameters: {trainable_params:,}")
@@ -286,7 +296,8 @@ def main():
     print(f" - Transformer heads: {transformer_heads}")
     print(f" - Transformer layers: {transformer_layers}")
     if args.mode == 'finetune':
-        print(f" - Classification head layers: {config.cls_head_layers}")
+        print(f" - Classification head LR: {getattr(active_config, 'cls_head_lr', 'default')}")
+        print(f" - Using simplified architecture for better efficiency")
 
     print("⚙️ Trainer setup...")
     os.makedirs(checkpoints_root_dir, exist_ok=True)
@@ -308,9 +319,9 @@ def main():
 
     early_stopping = EarlyStopping(
         monitor=monitor_metric,
-        patience=config.early_stopping_patience,
+        patience=max(config.early_stopping_patience, 6),  # Ensure minimum patience for finetune
         mode=monitor_mode,
-        min_delta=config.early_stopping_min_delta,
+        min_delta=0.001,  # More lenient min_delta for AUC monitoring
         verbose=True,
     )
     callbacks.append(early_stopping)
@@ -347,9 +358,9 @@ def main():
         logger=logger,
         gradient_clip_val=model_gradient_clip_val,
         accumulate_grad_batches=args.gradient_accumulation_steps,
-        val_check_interval=0.1,
+        val_check_interval=0.25,  # Reduced validation frequency for speed
         limit_val_batches=config.limit_val_batches,
-        log_every_n_steps=50,
+        log_every_n_steps=25,  # More frequent logging for better monitoring
         deterministic=args.deterministic,
         enable_progress_bar=True,
         enable_model_summary=True,
@@ -359,8 +370,8 @@ def main():
     )
 
     if adaptive_config['compile_model']:
-        print("🔧 Compiling model...")
-        model = torch.compile(model)
+        print("🔧 Compiling model for better performance...")
+        model = torch.compile(model, mode='default')  # Use default mode for stability
 
     print("🚀 Start training...")
     trainer.fit(model, data_module)
