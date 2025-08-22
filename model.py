@@ -459,6 +459,7 @@ class SeqSetVAEPretrain(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         recon_loss, kl_loss = self.forward(batch)
         beta = self._current_beta()
+        # PRETRAIN MODE: Only reconstruction + KL loss, NO focal loss
         total = recon_loss + beta * kl_loss
         self.log_dict({
             "train_loss": total,
@@ -476,6 +477,7 @@ class SeqSetVAEPretrain(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         recon_loss, kl_loss = self.forward(batch)
         beta = self._current_beta()
+        # PRETRAIN MODE: Only reconstruction + KL loss, NO focal loss
         total = recon_loss + beta * kl_loss
         self.log_dict({
             "val_loss": total,
@@ -607,14 +609,14 @@ class SeqSetVAE(pl.LightningModule):
                 
                 if len(loaded_params) == 0:
                     print("❌ WARNING: No parameters were loaded! Check checkpoint compatibility.")
+                    raise ValueError("No pretrained parameters were loaded - this will hurt performance!")
                     
             except Exception as e:
                 print(f"❌ Failed to load pretrained weights: {e}")
                 print("❌ This will significantly hurt performance!")
                 raise e  # Don't continue with random initialization
         else:
-            print("⚠️ WARNING: No pretrained checkpoint provided - using random initialization!")
-            print("⚠️ This will significantly hurt finetune performance!")
+            raise ValueError("❌ Pretrained checkpoint is required for finetune mode!")
 
         # Enhanced Transformer encoder with improved configuration for better AUC/AUPRC
         enc_layer = TransformerEncoderLayer(
@@ -675,41 +677,8 @@ class SeqSetVAE(pl.LightningModule):
             nn.Linear(latent_dim // 4, num_classes)
         )
         
-        # Alternative: Multi-scale feature fusion for better representation
-        self.feature_fusion = nn.ModuleDict({
-            'global_pool': nn.AdaptiveAvgPool1d(1),
-            'max_pool': nn.AdaptiveMaxPool1d(1),
-            'attention_pool': nn.MultiheadAttention(
-                embed_dim=latent_dim, 
-                num_heads=4, 
-                batch_first=True,
-                dropout=0.1
-            )
-        })
-        
-        # Feature projection for fusion
-        self.feature_projection = nn.Sequential(
-            nn.Linear(latent_dim * 3, latent_dim),  # 3 pooling methods
-            nn.LayerNorm(latent_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
-        # Modern VAE feature fusion module - learnable combination of mean and variance
-        self.vae_feature_fusion = nn.ModuleDict({
-            'mean_projection': nn.Linear(latent_dim, latent_dim),
-            'var_projection': nn.Linear(latent_dim, latent_dim),
-            'fusion_gate': nn.Sequential(
-                nn.Linear(latent_dim * 2, latent_dim),
-                nn.Sigmoid()
-            ),
-            'uncertainty_calibration': nn.Sequential(
-                nn.Linear(latent_dim, latent_dim // 4),
-                nn.ReLU(),
-                nn.Linear(latent_dim // 4, 1),
-                nn.Sigmoid()
-            )
-        })
+        # Simplified feature extraction - no complex fusion modules for better stability
+        # Use simple but effective pooling strategy
 
         # Metrics
         task_type = "binary" if num_classes == 2 else "multiclass"
@@ -1123,58 +1092,33 @@ class SeqSetVAE(pl.LightningModule):
 
     def _extract_enhanced_features(self, h_t):
         """
-        Extract enhanced features using multi-scale pooling and fusion
-        for better AUC/AUPRC performance
+        Simple and effective feature extraction for sequence-level classification.
+        Uses attention-weighted pooling for better representation.
         """
         B, S, D = h_t.shape
         
-        # For classification-only mode, use simpler and more stable feature extraction
-        if self.classification_only:
-            # Use last token (most recent) with attention-weighted pooling
-            last_token = h_t[:, -1, :]  # [B, D] - most recent representation
-            
-            # Attention-weighted pooling over all tokens
-            attn_weights = F.softmax(
-                torch.matmul(h_t, last_token.unsqueeze(-1)).squeeze(-1), 
-                dim=1
-            )  # [B, S]
-            attn_pooled = torch.sum(h_t * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
-            
-            # Combine last token and attention pooling
-            enhanced_features = 0.7 * last_token + 0.3 * attn_pooled
-            return enhanced_features
+        # Use last token (most recent) as primary representation
+        last_token = h_t[:, -1, :]  # [B, D] - most recent representation
         
-        # For full training mode, use multi-scale pooling
-        # Global average pooling
-        global_avg = self.feature_fusion['global_pool'](h_t.transpose(1, 2)).squeeze(-1)  # [B, D]
+        # Attention-weighted pooling over all tokens for context
+        # Compute attention weights using last token as query
+        attn_weights = F.softmax(
+            torch.matmul(h_t, last_token.unsqueeze(-1)).squeeze(-1), 
+            dim=1
+        )  # [B, S]
         
-        # Global max pooling
-        global_max = self.feature_fusion['max_pool'](h_t.transpose(1, 2)).squeeze(-1)  # [B, D]
+        # Compute attention-pooled representation
+        attn_pooled = torch.sum(h_t * attn_weights.unsqueeze(-1), dim=1)  # [B, D]
         
-        # Attention-based pooling
-        # Use mean pooling as query for attention
-        query = h_t.mean(dim=1, keepdim=True)  # [B, 1, D]
-        attn_output, _ = self.feature_fusion['attention_pool'](
-            query, h_t, h_t, 
-            attn_mask=None
-        )
-        attention_pool = attn_output.squeeze(1)  # [B, D]
-        
-        # Concatenate all pooling results
-        combined_features = torch.cat([global_avg, global_max, attention_pool], dim=1)  # [B, 3*D]
-        
-        # Project to original dimension
-        enhanced_features = self.feature_projection(combined_features)  # [B, D]
+        # Simple combination: emphasize recent token with context
+        enhanced_features = 0.7 * last_token + 0.3 * attn_pooled
         
         return enhanced_features
 
     def _fuse_vae_features(self, mu, logvar):
         """
-        Advanced VAE feature fusion for FINETUNE MODEL ONLY.
-        Uses both mean and variance information for better classification performance.
-        
-        NOTE: This method is only used in SeqSetVAE (finetune model).
-        SeqSetVAEPretrain maintains the original simple design using only mu.
+        Simple and effective VAE feature fusion for sequence-level classification.
+        Combines mean and variance information for better representation learning.
         
         Args:
             mu: [B, latent_dim] - posterior mean
@@ -1183,43 +1127,27 @@ class SeqSetVAE(pl.LightningModule):
         Returns:
             fused_features: [B, latent_dim] - enhanced features combining mean and uncertainty
         """
-        # Convert logvar to std for more interpretable variance features
-        std = torch.exp(0.5 * logvar)  # [B, latent_dim]
+        # Convert logvar to variance for interpretability
+        var = torch.exp(logvar)  # [B, latent_dim]
         
-        # Method 1: Learnable gated fusion (for full training mode)
-        if hasattr(self, 'vae_feature_fusion') and not self.classification_only:
-            # Project mean and variance to same space
-            mu_proj = self.vae_feature_fusion['mean_projection'](mu)
-            var_proj = self.vae_feature_fusion['var_projection'](std)
-            
-            # Learn fusion gate based on both mean and variance
-            concat_features = torch.cat([mu_proj, var_proj], dim=-1)
-            fusion_gate = self.vae_feature_fusion['fusion_gate'](concat_features)
-            
-            # Gated combination
-            fused = fusion_gate * mu_proj + (1 - fusion_gate) * var_proj
-            
-            # Uncertainty calibration - use variance to modulate confidence
-            uncertainty_score = self.vae_feature_fusion['uncertainty_calibration'](std.mean(dim=-1, keepdim=True))
-            fused = fused * (1.0 + 0.1 * uncertainty_score)  # Slight modulation based on uncertainty
-            
-            return fused
+        # Simple but effective fusion strategy:
+        # 1. Use mean as the primary representation
+        # 2. Modulate with variance information for uncertainty awareness
         
-        # Method 2: Simple but effective fusion for classification-only finetune mode
-        else:
-            # Uncertainty-aware feature weighting for stable finetune performance
-            uncertainty = torch.mean(std, dim=-1, keepdim=True)  # [B, 1] - average uncertainty
-            uncertainty_weight = torch.sigmoid(-uncertainty + 1.0)  # Higher certainty -> higher weight
-            
-            # Variance-modulated mean features
-            # High variance -> more exploration, low variance -> more exploitation
-            variance_modulation = 1.0 + 0.05 * torch.tanh(std)  # Small modulation to avoid instability
-            modulated_mu = mu * variance_modulation
-            
-            # Combine with uncertainty weighting
-            fused = uncertainty_weight * modulated_mu + (1 - uncertainty_weight) * mu
-            
-            return fused
+        # Compute uncertainty score (higher variance = higher uncertainty)
+        uncertainty = torch.mean(var, dim=-1, keepdim=True)  # [B, 1]
+        
+        # Normalize uncertainty to [0, 1] range for stable training
+        uncertainty_normalized = torch.sigmoid(uncertainty - 1.0)
+        
+        # Create variance-aware features
+        # High uncertainty -> rely more on mean, low uncertainty -> allow variance modulation
+        variance_scale = 1.0 + 0.1 * (1.0 - uncertainty_normalized) * torch.tanh(var)
+        
+        # Final fused features: mean modulated by variance information
+        fused_features = mu * variance_scale
+        
+        return fused_features
 
     # Helpers
     def _split_sets(self, var, val, time, set_ids, padding_mask=None):
@@ -1376,27 +1304,22 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # Loss calculation (classification-only finetune: use pure classification loss)
-        if self.use_focal_loss and self.focal_loss_fn is not None:
+        # Loss calculation: FINETUNE MODE - only focal loss
+        # Use focal loss for classification (required for finetune mode)
+        if self.focal_loss_fn is not None:
             pred_loss = self.focal_loss_fn(logits, label)
         else:
+            # Fallback to cross entropy if focal loss not available
             pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
 
-        if self.classification_only:
-            total_loss = pred_loss
-            recon_loss = torch.tensor(0.0, device=pred_loss.device)
-            kl_loss = torch.tensor(0.0, device=pred_loss.device)
-            pred_weight = torch.tensor(1.0, device=pred_loss.device)
-            recon_weight = torch.tensor(0.0, device=pred_loss.device)
-        else:
-            if stage == "train":
-                progress = min(1.0, self.current_step / 5000)
-                recon_weight = 0.8 * (1.0 - progress) + 0.3 * progress
-                pred_weight = self.w * (0.5 + 0.5 * progress)
-            else:
-                recon_weight = 0.5
-                pred_weight = self.w
-            total_loss = pred_weight * pred_loss + recon_weight * recon_loss + kl_loss
+        # FINETUNE MODE: Only classification loss, no recon/KL loss
+        total_loss = pred_loss
+        pred_weight = torch.tensor(1.0, device=pred_loss.device)
+        recon_weight = torch.tensor(0.0, device=pred_loss.device)
+        
+        # Zero out recon and KL losses for finetune mode
+        recon_loss = torch.tensor(0.0, device=pred_loss.device)
+        kl_loss = torch.tensor(0.0, device=pred_loss.device)
 
         # Metrics for validation stage
         if stage == "val":
@@ -1560,17 +1483,11 @@ class SeqSetVAE(pl.LightningModule):
         self.set_backbone_eval()
 
     def set_backbone_eval(self):
+        """Set all backbone components to eval mode for finetune"""
         self.setvae.eval()
         self.transformer.eval()
         self.post_transformer_norm.eval()
         self.decoder.eval()
-        # Ensure all backbone components are in eval mode
-        if hasattr(self, 'feature_fusion'):
-            self.feature_fusion.eval()
-        if hasattr(self, 'feature_projection'):
-            self.feature_projection.eval()
-        if hasattr(self, 'vae_feature_fusion'):
-            self.vae_feature_fusion.eval()
  
     def on_train_start(self):
         if self.classification_only:

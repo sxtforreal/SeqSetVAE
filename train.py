@@ -221,7 +221,7 @@ def main():
         monitor_metric = 'val_loss'
         monitor_mode = 'min'
     else:
-        print("📋 Using SeqSetVAE - enhanced with modern VAE features and complete freezing for finetune")
+        print("📋 Using SeqSetVAE - FINETUNE MODE with simplified VAE feature fusion")
         model = SeqSetVAE(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,
@@ -235,14 +235,14 @@ def main():
             ff_dim=ff_dim,
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
-            pretrained_ckpt=None,
+            pretrained_ckpt=None,  # Will be loaded separately
             w=config.w,
             free_bits=model_free_bits,
             warmup_beta=config.warmup_beta,
             max_beta=model_max_beta,
             beta_warmup_steps=model_beta_warmup_steps,
             kl_annealing=config.kl_annealing,
-            use_focal_loss=getattr(config, 'use_focal_loss', True),
+            use_focal_loss=True,  # Always use focal loss in finetune mode
             focal_alpha=config.focal_alpha,
             focal_gamma=config.focal_gamma,
         )
@@ -263,7 +263,7 @@ def main():
         # Re-initialize classifier head with Xavier for finetune
         model.init_classifier_head_xavier()
 
-        # Freeze everything except classifier head - COMPLETE FREEZE for better stability
+        # FINETUNE MODE: Freeze ALL pretrained parameters, only train classifier head
         frozen_params = 0
         trainable_params = 0
         for name, param in model.named_parameters():
@@ -275,11 +275,14 @@ def main():
                 param.requires_grad = False
                 frozen_params += param.numel()
         
+        # Enable classification-only mode (no recon/KL loss, backbone in eval mode)
         model.enable_classification_only_mode(cls_head_lr=getattr(config, 'cls_head_lr', None))
-        print("🧊 Finetune freeze applied and backbone set to eval; classification-only loss enabled.")
+        print("🧊 FINETUNE MODE: Complete freeze applied - only classifier head trainable")
         print(f"   - Frozen parameters: {frozen_params:,}")
         print(f"   - Trainable parameters: {trainable_params:,}")
         print(f"   - Trainable ratio: {trainable_params/(frozen_params+trainable_params)*100:.2f}%")
+        print("   - Loss: ONLY Focal Loss (no recon/KL loss)")
+        print("   - Backbone: Set to eval mode (frozen)")
 
     print("📊 Model Architecture:")
     print(f" - FF dimension: {ff_dim}")
