@@ -177,6 +177,35 @@ def main():
         pin_memory=adaptive_config['pin_memory'],
     )
 
+    # Compute adaptive class frequencies for FocalLoss alpha using training labels
+    adaptive_alpha = None
+    try:
+        # Ensure datasets are set up
+        data_module.setup()
+        # Iterate a subset of train loader to estimate frequencies
+        from collections import Counter
+        label_counter = Counter()
+        sample_batches = 0
+        for batch in data_module.train_dataloader():
+            labels = batch.get('label')
+            if labels is not None:
+                label_counter.update(labels.view(-1).tolist())
+            sample_batches += 1
+            if sample_batches >= 50:  # cap to avoid long scans
+                break
+        if len(label_counter) > 0:
+            # Build alpha as inverse frequency normalized
+            total = sum(label_counter.values())
+            freqs = [label_counter.get(c, 0) / max(1, total) for c in range(getattr(config, 'num_classes', 2))]
+            inv = [1.0 / max(f, 1e-6) for f in freqs]
+            s = sum(inv)
+            alpha_vec = [v / s for v in inv]
+            adaptive_alpha = alpha_vec if getattr(config, 'num_classes', 2) > 2 else alpha_vec[1]
+            print(f"🔧 Adaptive focal alpha computed from labels: {adaptive_alpha}")
+    except Exception as e:
+        print(f"⚠️  Failed to compute adaptive alpha; fallback to config: {e}")
+        adaptive_alpha = None
+
     # Common model hyperparams from config
     model_lr = config.lr
     model_free_bits = config.free_bits
@@ -242,8 +271,8 @@ def main():
             max_beta=model_max_beta,
             beta_warmup_steps=model_beta_warmup_steps,
             kl_annealing=config.kl_annealing,
-            use_focal_loss=True,  # Always use focal loss in finetune mode
-            focal_alpha=config.focal_alpha,
+            use_focal_loss=True,
+            focal_alpha=(adaptive_alpha if adaptive_alpha is not None else config.focal_alpha),
             focal_gamma=config.focal_gamma,
         )
         checkpoint_name = "SeqSetVAE_finetune"
