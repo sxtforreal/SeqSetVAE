@@ -119,6 +119,11 @@ def main():
         help="Training mode",
     )
     parser.add_argument(
+        "--finetune",
+        action="store_true",
+        help="Alias to set mode=finetune",
+    )
+    parser.add_argument(
         "--batch_size",
         type=int,
         default=8,
@@ -197,6 +202,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Alias handling: --finetune sets mode to finetune
+    if getattr(args, "finetune", False):
+        args.mode = "finetune"
 
     # Prepare unified output dirs
     base_output_dir = (args.output_dir or args.output_root_dir).rstrip("/")
@@ -345,9 +354,13 @@ def main():
         monitor_mode = "max"
 
         # Load pretrained weights if provided
-        if args.pretrained_ckpt is not None:
+        # Determine pretrained checkpoint path
+        ckpt_path = args.pretrained_ckpt or getattr(active_config, "pretrained_ckpt", None)
+        if ckpt_path is None:
+            raise ValueError("Finetune requires a pretrained checkpoint. Provide via --pretrained_ckpt or config.pretrained_ckpt.")
+        if ckpt_path is not None:
             try:
-                state = load_checkpoint_weights(args.pretrained_ckpt, device="cpu")
+                state = load_checkpoint_weights(ckpt_path, device="cpu")
                 remapped = remap_pretrain_to_finetune_keys(state)
                 missing, unexpected = model.load_state_dict(remapped, strict=False)
                 print(
@@ -392,6 +405,7 @@ def main():
             f" - Classification head LR: {getattr(active_config, 'cls_head_lr', 'default')}"
         )
         print(f" - Using simplified architecture for better efficiency")
+        print(" - Finetune computes focal loss only; recon/KL and their logs are disabled")
 
     print("⚙️ Trainer setup...")
     os.makedirs(checkpoints_root_dir, exist_ok=True)
@@ -414,7 +428,7 @@ def main():
     early_stopping = EarlyStopping(
         monitor=monitor_metric,
         patience=max(
-            config.early_stopping_patience, 6
+            getattr(active_config, "early_stopping_patience", config.early_stopping_patience), 6
         ),  # Ensure minimum patience for finetune
         mode=monitor_mode,
         min_delta=0.001,  # More lenient min_delta for AUC monitoring
@@ -425,17 +439,17 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks.append(lr_monitor)
 
-    # Posterior/metrics monitoring -> keep only latest under monitor_root_dir
-    # Clean previous monitor directory to only keep latest run
-    import shutil
-
-    try:
-        if os.path.isdir(monitor_root_dir):
-            shutil.rmtree(monitor_root_dir)
-    except Exception:
-        pass
-    os.makedirs(monitor_root_dir, exist_ok=True)
-    callbacks.append(setup_metrics_monitor(args, monitor_root_dir))
+    # Posterior/metrics monitoring -> only enable during pretraining
+    if args.mode == "pretrain":
+        # Clean previous monitor directory to only keep latest run
+        import shutil
+        try:
+            if os.path.isdir(monitor_root_dir):
+                shutil.rmtree(monitor_root_dir)
+        except Exception:
+            pass
+        os.makedirs(monitor_root_dir, exist_ok=True)
+        callbacks.append(setup_metrics_monitor(args, monitor_root_dir))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = TensorBoardLogger(
@@ -455,9 +469,9 @@ def main():
         logger=logger,
         gradient_clip_val=model_gradient_clip_val,
         accumulate_grad_batches=args.gradient_accumulation_steps,
-        val_check_interval=0.25,  # Reduced validation frequency for speed
-        limit_val_batches=config.limit_val_batches,
-        log_every_n_steps=25,  # More frequent logging for better monitoring
+        val_check_interval=getattr(active_config, "val_check_interval", 0.25),
+        limit_val_batches=getattr(active_config, "limit_val_batches", config.limit_val_batches),
+        log_every_n_steps=getattr(active_config, "log_every_n_steps", 25),
         deterministic=args.deterministic,
         enable_progress_bar=True,
         enable_model_summary=True,
