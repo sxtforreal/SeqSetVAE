@@ -1302,8 +1302,8 @@ class SeqSetVAE(pl.LightningModule):
             if self.classification_only:
                 # Finetune mode: only focal loss
                 log_payload = {
-                    "train/focal_loss": total_loss,  # This is the focal loss
-                    "train/total_loss": total_loss,
+                    "FT_train/focal_loss": total_loss,  # This is the focal loss
+                    "FT_train/total_loss": total_loss,
                 }
                 # Add VAE feature statistics for monitoring
                 if hasattr(self, '_last_z_list') and self._last_z_list:
@@ -1312,8 +1312,8 @@ class SeqSetVAE(pl.LightningModule):
                         mu_norm = torch.norm(mu, dim=-1).mean()
                         std_mean = torch.exp(0.5 * logvar).mean()
                         log_payload.update({
-                            "train/mu_norm": mu_norm,
-                            "train/std_mean": std_mean,
+                            "FT_train/mu_norm": mu_norm,
+                            "FT_train/std_mean": std_mean,
                         })
                     except:
                         pass
@@ -1321,15 +1321,15 @@ class SeqSetVAE(pl.LightningModule):
                 # Pretraining mode: only reconstruction + KL (like SeqSetVAEPretrain)
                 current_beta = self.get_current_beta()
                 log_payload = {
-                    "train/recon_loss": recon_loss,     # Reconstruction loss
-                    "train/kl_loss": kl_loss,          # KL divergence loss  
-                    "train/total_loss": total_loss,     # recon_loss + beta * kl_loss
-                    "train/beta": current_beta,         # KL annealing factor
+                    "PT_train/recon_loss": recon_loss,     # Reconstruction loss
+                    "PT_train/kl_loss": kl_loss,          # KL divergence loss  
+                    "PT_train/total_loss": total_loss,     # recon_loss + beta * kl_loss
+                    "PT_train/beta": current_beta,         # KL annealing factor
                 }
                 if mean_variance is not None:
-                    log_payload["train/variance"] = mean_variance
+                    log_payload["PT_train/variance"] = mean_variance
                 if active_units_ratio is not None:
-                    log_payload["train/active_units"] = active_units_ratio
+                    log_payload["PT_train/active_units"] = active_units_ratio
             
             self.log_dict(
                 log_payload,
@@ -1354,16 +1354,16 @@ class SeqSetVAE(pl.LightningModule):
             if self.classification_only:
                 # For finetune mode, only log the loss
                 self.log_dict({
-                    "val_loss": total_loss,
+                    "FT_val_loss": total_loss,
                 }, prog_bar=True, on_epoch=True)
             else:
                 # For pretraining mode, log validation reconstruction and KL
                 current_beta = self.get_current_beta()
                 self.log_dict({
-                    "val_loss": total_loss,
-                    "val_recon": recon_loss,
-                    "val_kl": kl_loss,
-                    "val_beta": current_beta,
+                    "PT_val_loss": total_loss,
+                    "PT_val_recon": recon_loss,
+                    "PT_val_kl": kl_loss,
+                    "PT_val_beta": current_beta,
                 }, prog_bar=True, on_epoch=True)
                 
         # Expose latent variables for collapse detector
@@ -1386,9 +1386,9 @@ class SeqSetVAE(pl.LightningModule):
             acc = self.val_acc.compute()
             self.log_dict(
                 {
-                    "val_auc": auc,
-                    "val_auprc": auprc,
-                    "val_accuracy": acc,
+                    "FT_val_auc": auc,
+                    "FT_val_auprc": auprc,
+                    "FT_val_accuracy": acc,
                 },
                 prog_bar=True,
             )
@@ -1406,7 +1406,8 @@ class SeqSetVAE(pl.LightningModule):
             norms = [torch.norm(p.grad.detach(), 2) for p in parameters]
             if norms:
                 total_norm = torch.norm(torch.stack(norms), 2)
-                self.log('grad_norm', total_norm, on_step=True, prog_bar=False)
+                prefix = "FT_" if self.classification_only else "PT_"
+                self.log(f'{prefix}grad_norm', total_norm, on_step=True, prog_bar=False)
 
     def configure_optimizers(self):
         if self.classification_only:
@@ -1454,7 +1455,7 @@ class SeqSetVAE(pl.LightningModule):
                 verbose=True,
                 min_lr=1e-6  # Minimum learning rate
             )
-            monitor_metric = "val_auc"
+            monitor_metric = "FT_val_auc"
         else:
             # For full training mode, monitor loss
             scheduler = ReduceLROnPlateau(
@@ -1465,7 +1466,7 @@ class SeqSetVAE(pl.LightningModule):
                 verbose=True,
                 min_lr=self.lr * 0.001  # Minimum learning rate
             )
-            monitor_metric = "val_loss"
+            monitor_metric = "PT_val_loss"
         
         return {
             "optimizer": optimizer,
