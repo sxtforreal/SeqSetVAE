@@ -523,6 +523,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
 
         self.params_map: Optional[Dict[str, Dict[str, float]]] = None
         self.label_map: Optional[Dict[str, int]] = None
+        # We will compute per-class sampling weights for imbalanced datasets
+        self.train_sampler_weights: Optional[torch.Tensor] = None
 
     def setup(self, stage=None):
         """
@@ -550,6 +552,21 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         self.val_dataset = SeqSetVAEDataset("valid", self.saved_dir)
         self.test_dataset = SeqSetVAEDataset("test", self.saved_dir)
 
+        # Compute class-balanced sampling weights for training
+        try:
+            # Map each training file to its label
+            labels = []
+            for p in self.train_dataset.parquet_files:
+                tsid = int(float(os.path.splitext(os.path.basename(p))[0]))
+                labels.append(self.label_map.get(tsid, 0))
+            if len(labels) > 0:
+                labels_t = torch.tensor(labels, dtype=torch.long)
+                class_counts = torch.bincount(labels_t, minlength=2).clamp(min=1)
+                class_weights = 1.0 / class_counts.float()
+                self.train_sampler_weights = class_weights[labels_t]
+        except Exception:
+            self.train_sampler_weights = None
+
     def _create_loader(self, ds, shuffle=False):
         """
         Create a data loader with appropriate collate function and optimized settings.
@@ -574,15 +591,23 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         num_workers = self.num_workers
         pin_memory = self.pin_memory
         
+        # Use WeightedRandomSampler for training if weights are available
+        sampler = None
+        if shuffle and self.train_sampler_weights is not None and ds is self.train_dataset:
+            from torch.utils.data import WeightedRandomSampler
+            sampler = WeightedRandomSampler(self.train_sampler_weights, num_samples=len(self.train_sampler_weights), replacement=True)
+            shuffle = False
+
         return DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=shuffle,
+            sampler=sampler,
             num_workers=num_workers,
             collate_fn=collate_fn,
             pin_memory=pin_memory,
-            drop_last=False,  # Don't drop the last incomplete batch
-            persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+            drop_last=False,
+            persistent_workers=True if num_workers > 0 else False,
         )
 
     def _dynamic_collate_fn(self, batch: List[Tuple[pd.DataFrame, str]]) -> Dict[str, Any]:

@@ -770,7 +770,13 @@ class SeqSetVAE(pl.LightningModule):
         )
         # Finetune mode: classification only (skip recon/KL) and keep backbone eval
         self.classification_only = False
+        # Whether to force backbone modules to eval() during classification-only finetune
+        self.backbone_eval_mode = True
         self.cls_head_lr = None
+        # Learning rate for any partially unfrozen backbone parameters
+        self.backbone_finetune_lr = None
+        # Track how many transformer layers are unfrozen for partial finetune
+        self.partial_unfreeze_n = 0
         
         self.save_hyperparameters(ignore=["setvae"])
  
@@ -1502,16 +1508,26 @@ class SeqSetVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.classification_only:
-            # Optimize classifier head only with more conservative LR
+            # Optimize classifier head and any partially unfrozen backbone params
             cls_params = [p for p in self.cls_head.parameters() if p.requires_grad]
-            # Use more conservative learning rate for better stability
-            cls_lr = self.cls_head_lr or (self.lr * 3.0)  # Reduced from 10x to 3x
+            cls_lr = self.cls_head_lr or (self.lr * 3.0)
+
+            # Any additional trainable params outside cls_head (partial unfreeze)
+            backbone_trainable = [
+                p for n, p in self.named_parameters()
+                if p.requires_grad and not n.startswith('cls_head')
+            ]
+            param_groups = [{'params': cls_params, 'lr': cls_lr, 'name': 'cls_head'}]
+            if len(backbone_trainable) > 0:
+                bb_lr = self.backbone_finetune_lr or max(cls_lr * 0.1, self.lr * 0.5)
+                param_groups.append({'params': backbone_trainable, 'lr': bb_lr, 'name': 'partial_backbone'})
+
             optimizer = AdamW(
-                [{'params': cls_params, 'lr': cls_lr, 'name': 'cls_head'}],
+                param_groups,
                 lr=cls_lr,
-                betas=(0.9, 0.98),  # Slightly adjusted beta2 for better stability
+                betas=(0.9, 0.98),
                 eps=1e-8,
-                weight_decay=0.01,  # Increased weight decay for better regularization
+                weight_decay=0.01,
             )
         else:
             # Set different learning rates for different parts
@@ -1534,33 +1550,51 @@ class SeqSetVAE(pl.LightningModule):
                 weight_decay=0.02,
             )
         
-        # Improved learning rate scheduler for better AUC/AUPRC
-        from torch.optim.lr_scheduler import ReduceLROnPlateau
-        scheduler = ReduceLROnPlateau(
-            optimizer, 
-            mode='min',  # Monitor training loss (lower is better)
-            factor=0.7,  # Reduce LR by 30% when plateau
-            patience=200,  # Wait 200 steps before reducing LR
-            verbose=True,
-            min_lr=self.lr * 0.001  # Minimum learning rate
-        )
-        
+        # Learning rate scheduler selection
+        scheduler_cfg = getattr(self, 'scheduler_preference', 'plateau')
+        if scheduler_cfg in {"cosine", "cosine_with_restarts"}:
+            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+            # Use cosine annealing with warm restarts for smooth convergence of the head
+            T_0 = 5
+            T_mult = 2
+            eta_min = max(getattr(self, 'scheduler_min_lr', None) or (self.lr * 1e-3), 1e-6)
+            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min)
+            scheduler_dict = {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            }
+        else:
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.7,
+                patience=200,
+                verbose=True,
+                min_lr=self.lr * 0.001
+            )
+            scheduler_dict = {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+                "monitor": "val_loss",
+            }
+
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",  # Check every epoch instead of every step
-                "frequency": 1,
-                "monitor": "val_loss",  # Monitor validation loss for scheduling
-            },
+            "lr_scheduler": scheduler_dict,
         }
 
     # -------- Finetune helpers --------
-    def enable_classification_only_mode(self, cls_head_lr: Optional[float] = None):
+    def enable_classification_only_mode(self, cls_head_lr: Optional[float] = None, backbone_eval: bool = True):
         self.classification_only = True
         if cls_head_lr is not None:
             self.cls_head_lr = cls_head_lr
-        self.set_backbone_eval()
+        # Control whether backbone is forced to eval() during training
+        self.backbone_eval_mode = backbone_eval
+        if self.backbone_eval_mode:
+            self.set_backbone_eval()
 
     def set_backbone_eval(self):
         """Set all backbone components to eval mode for finetune"""
@@ -1570,8 +1604,31 @@ class SeqSetVAE(pl.LightningModule):
         self.decoder.eval()
  
     def on_train_start(self):
-        if self.classification_only:
+        if self.classification_only and self.backbone_eval_mode:
             self.set_backbone_eval()
+
+    def enable_partial_unfreeze(self, num_transformer_layers: int = 1, backbone_lr: Optional[float] = None):
+        """Enable partial fine-tuning by unfreezing last K transformer layers and related norms.
+
+        Args:
+            num_transformer_layers: Number of last transformer encoder layers to unfreeze
+            backbone_lr: Optional LR for unfrozen backbone params
+        """
+        if num_transformer_layers <= 0:
+            return
+        self.partial_unfreeze_n = min(num_transformer_layers, len(self.transformer.layers))
+        # Unfreeze last K layers
+        for layer in list(self.transformer.layers)[-self.partial_unfreeze_n:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+            layer.train()
+        # Also unfreeze post-transformer norm
+        for p in self.post_transformer_norm.parameters():
+            p.requires_grad = True
+        self.post_transformer_norm.train()
+        # Set backbone LR used in optimizer param group
+        if backbone_lr is not None:
+            self.backbone_finetune_lr = backbone_lr
  
     def init_classifier_head_xavier(self):
         """Initialize classifier head Linear layers with Xavier uniform and zero biases."""

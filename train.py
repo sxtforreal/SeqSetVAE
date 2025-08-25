@@ -121,6 +121,22 @@ def main():
 
     args = parser.parse_args()
 
+    # If finetune mode, import finetune-specific overrides
+    if args.mode == 'finetune':
+        try:
+            import finetune_config as ftcfg
+            # Override selected configs when present
+            for key in [
+                'cls_head_lr','cls_head_weight_decay','focal_alpha','focal_gamma',
+                'early_stopping_patience','val_check_interval','limit_val_batches',
+                'gradient_clip_val','accumulate_grad_batches','scheduler_patience',
+                'scheduler_factor','scheduler_min_lr','batch_size'
+            ]:
+                if hasattr(ftcfg, key):
+                    setattr(config, key, getattr(ftcfg, key))
+        except Exception as e:
+            print(f"⚠️  Could not import finetune_config overrides: {e}")
+
     # Prepare unified output dirs
     base_output_dir = (args.output_dir or args.output_root_dir).rstrip("/")
     model_name = getattr(config, 'model_name', getattr(config, 'name', 'SeqSetVAE'))
@@ -283,20 +299,44 @@ def main():
         # Re-initialize classifier head with Xavier for finetune
         model.init_classifier_head_xavier()
 
-        # FINETUNE MODE: Freeze ALL pretrained parameters, only train classifier head
+        # Pass scheduler preferences to the model if provided by config/finetune_config
+        if hasattr(config, 'scheduler_type'):
+            model.scheduler_preference = 'cosine' if 'cosine' in str(getattr(config, 'scheduler_type')).lower() else 'plateau'
+        if hasattr(config, 'scheduler_min_lr'):
+            model.scheduler_min_lr = getattr(config, 'scheduler_min_lr')
+
+        # FINETUNE MODE: Freeze ALL parameters first
         frozen_params = 0
         trainable_params = 0
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            frozen_params += param.numel()
+
+        # Unfreeze classifier head
         for name, param in model.named_parameters():
             if name.startswith('cls_head'):
                 param.requires_grad = True
                 trainable_params += param.numel()
                 print(f"   ✅ Trainable: {name} ({param.numel():,} params)")
-            else:
-                param.requires_grad = False
-                frozen_params += param.numel()
-        
-        # Enable classification-only mode (no recon/KL loss, backbone in eval mode)
-        model.enable_classification_only_mode(cls_head_lr=getattr(config, 'cls_head_lr', None))
+
+        # Optional: partially unfreeze top transformer layers for representation adaptation
+        partial_layers = int(os.environ.get('PARTIAL_UNFREEZE_LAYERS', '2'))
+        if partial_layers > 0:
+            model.enable_partial_unfreeze(num_transformer_layers=partial_layers, backbone_lr=getattr(config, 'lr', 1e-4))
+            # recount
+            frozen_params = 0
+            trainable_params = 0
+            for _, p in model.named_parameters():
+                if p.requires_grad:
+                    trainable_params += p.numel()
+                else:
+                    frozen_params += p.numel()
+
+        # Enable classification-only mode (no recon/KL loss). Keep backbone in eval if no partial unfreeze.
+        model.enable_classification_only_mode(
+            cls_head_lr=getattr(config, 'cls_head_lr', None),
+            backbone_eval=(partial_layers <= 0)
+        )
         print("🧊 FINETUNE MODE: Complete freeze applied - only classifier head trainable")
         print(f"   - Frozen parameters: {frozen_params:,}")
         print(f"   - Trainable parameters: {trainable_params:,}")
@@ -369,10 +409,10 @@ def main():
         callbacks=callbacks,
         logger=logger,
         gradient_clip_val=model_gradient_clip_val,
-        accumulate_grad_batches=args.gradient_accumulation_steps,
-        val_check_interval=0.1,
-        limit_val_batches=config.limit_val_batches,
-        log_every_n_steps=50,
+        accumulate_grad_batches=getattr(config, 'accumulate_grad_batches', args.gradient_accumulation_steps),
+        val_check_interval=getattr(config, 'val_check_interval', 0.1),
+        limit_val_batches=getattr(config, 'limit_val_batches', 1.0),
+        log_every_n_steps=getattr(config, 'log_every_n_steps', 50),
         deterministic=args.deterministic,
         enable_progress_bar=True,
         enable_model_summary=True,
