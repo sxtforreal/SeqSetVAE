@@ -49,7 +49,8 @@ scheduler_factor = 0.7
 scheduler_min_lr = 1e-6
 
 # ====== Monitoring and Logging ======
-monitor_metric = "val_auc"
+# Prefer AUPRC for imbalanced classification
+monitor_metric = "val_auprc"
 monitor_mode = "max"
 log_every_n_steps = 50
 
