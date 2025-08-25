@@ -276,7 +276,8 @@ def main():
             focal_gamma=config.focal_gamma,
         )
         checkpoint_name = "SeqSetVAE_finetune"
-        monitor_metric = 'val_auc'
+        # Use AUPRC as the primary monitor for imbalanced classification
+        monitor_metric = 'val_auprc'
         monitor_mode = 'max'
 
         # Note: Pretrained weights are now loaded automatically in SeqSetVAE constructor
@@ -287,7 +288,13 @@ def main():
         frozen_params = 0
         trainable_params = 0
         for name, param in model.named_parameters():
-            if name.startswith('cls_head'):
+            # Finetune lightweight sequence components in addition to the classifier head
+            if (
+                name.startswith('cls_head') or
+                name.startswith('transformer') or
+                name.startswith('post_transformer_norm') or
+                name == 'pooling_gate'
+            ):
                 param.requires_grad = True
                 trainable_params += param.numel()
                 print(f"   ✅ Trainable: {name} ({param.numel():,} params)")

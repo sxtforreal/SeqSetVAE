@@ -1502,16 +1502,33 @@ class SeqSetVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.classification_only:
-            # Optimize classifier head only with more conservative LR
+            # Optimize classifier head and light sequence modules (transformer, norm, pooling)
             cls_params = [p for p in self.cls_head.parameters() if p.requires_grad]
-            # Use more conservative learning rate for better stability
-            cls_lr = self.cls_head_lr or (self.lr * 3.0)  # Reduced from 10x to 3x
+            transf_params = [p for p in self.transformer.parameters() if p.requires_grad]
+            post_norm_params = [p for p in self.post_transformer_norm.parameters() if p.requires_grad]
+            # pooling_gate is an nn.Parameter
+            pooling_params = [self.pooling_gate] if getattr(self.pooling_gate, 'requires_grad', False) else []
+
+            # Discriminative learning rates: higher for head, lower for feature refiner
+            cls_lr = self.cls_head_lr or (self.lr * 3.0)
+            transf_lr = min(self.lr, cls_lr) * 0.1
+
+            param_groups = []
+            if cls_params:
+                param_groups.append({'params': cls_params, 'lr': cls_lr, 'name': 'cls_head'})
+            if transf_params:
+                param_groups.append({'params': transf_params, 'lr': transf_lr, 'name': 'transformer'})
+            if post_norm_params:
+                param_groups.append({'params': post_norm_params, 'lr': transf_lr, 'name': 'post_transformer_norm'})
+            if pooling_params:
+                param_groups.append({'params': pooling_params, 'lr': transf_lr, 'name': 'pooling_gate'})
+
             optimizer = AdamW(
-                [{'params': cls_params, 'lr': cls_lr, 'name': 'cls_head'}],
+                param_groups,
                 lr=cls_lr,
-                betas=(0.9, 0.98),  # Slightly adjusted beta2 for better stability
+                betas=(0.9, 0.98),
                 eps=1e-8,
-                weight_decay=0.01,  # Increased weight decay for better regularization
+                weight_decay=0.01,
             )
         else:
             # Set different learning rates for different parts
@@ -1534,15 +1551,15 @@ class SeqSetVAE(pl.LightningModule):
                 weight_decay=0.02,
             )
         
-        # Improved learning rate scheduler for better AUC/AUPRC
+        # Reduce LR on plateau of validation AUPRC (maximize)
         from torch.optim.lr_scheduler import ReduceLROnPlateau
         scheduler = ReduceLROnPlateau(
-            optimizer, 
-            mode='min',  # Monitor training loss (lower is better)
-            factor=0.7,  # Reduce LR by 30% when plateau
-            patience=200,  # Wait 200 steps before reducing LR
+            optimizer,
+            mode='max',
+            factor=0.6,
+            patience=3,
             verbose=True,
-            min_lr=self.lr * 0.001  # Minimum learning rate
+            min_lr=self.lr * 0.001,
         )
         
         return {
@@ -1551,7 +1568,7 @@ class SeqSetVAE(pl.LightningModule):
                 "scheduler": scheduler,
                 "interval": "epoch",  # Check every epoch instead of every step
                 "frequency": 1,
-                "monitor": "val_loss",  # Monitor validation loss for scheduling
+                "monitor": "val_auprc",  # Drive LR by AUPRC for imbalanced tasks
             },
         }
 
