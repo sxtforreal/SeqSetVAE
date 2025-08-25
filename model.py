@@ -715,29 +715,8 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # Enhanced classification head for better AUC/AUPRC performance
-        self.cls_head = nn.Sequential(
-            # First layer with normalization and residual connection
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            # Second layer with normalization
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.LayerNorm(latent_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            # Third layer with normalization
-            nn.Linear(latent_dim // 2, latent_dim // 4),
-            nn.LayerNorm(latent_dim // 4),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            # Final classification layer
-            nn.Linear(latent_dim // 4, num_classes)
-        )
+        # Advanced classification head for better AUC/AUPRC performance
+        self.cls_head = self._build_advanced_classifier(latent_dim, num_classes)
         
         # Learnable gate for pooling between last_token and attention pooling
         self.pooling_gate = nn.Parameter(torch.tensor(0.7))
@@ -774,6 +753,112 @@ class SeqSetVAE(pl.LightningModule):
         
         self.save_hyperparameters(ignore=["setvae"])
  
+    def _build_advanced_classifier(self, latent_dim: int, num_classes: int):
+        """
+        Build an advanced classification head with attention mechanisms and residual connections
+        for improved AUC/AUPRC performance on medical data.
+        """
+        hidden_dim = latent_dim
+        intermediate_dim = latent_dim // 2
+        
+        return nn.ModuleDict({
+            # Feature enhancement layers
+            'feature_enhancer': nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.15),
+            ),
+            
+            # Self-attention for feature refinement
+            'self_attention': nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            ),
+            
+            # Residual connections and normalization
+            'attention_norm': nn.LayerNorm(hidden_dim),
+            'attention_dropout': nn.Dropout(0.1),
+            
+            # Advanced feature fusion with multiple pathways
+            'pathway1': nn.Sequential(
+                nn.Linear(hidden_dim, intermediate_dim),
+                nn.LayerNorm(intermediate_dim),
+                nn.GELU(),
+                nn.Dropout(0.2),
+            ),
+            
+            'pathway2': nn.Sequential(
+                nn.Linear(hidden_dim, intermediate_dim),
+                nn.LayerNorm(intermediate_dim),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+            ),
+            
+            # Feature gate for pathway combination
+            'gate': nn.Sequential(
+                nn.Linear(hidden_dim, 2),
+                nn.Softmax(dim=-1)
+            ),
+            
+            # Final classification layers with residual connection
+            'pre_classifier': nn.Sequential(
+                nn.Linear(intermediate_dim, intermediate_dim // 2),
+                nn.LayerNorm(intermediate_dim // 2),
+                nn.GELU(),
+                nn.Dropout(0.15),
+            ),
+            
+            'classifier': nn.Linear(intermediate_dim // 2, num_classes),
+            
+            # Auxiliary prediction head for better gradient flow
+            'aux_classifier': nn.Linear(hidden_dim, num_classes),
+        })
+    
+    def _forward_advanced_classifier(self, features):
+        """Forward pass through the advanced classifier"""
+        # Feature enhancement
+        enhanced_features = self.cls_head['feature_enhancer'](features)
+        
+        # Self-attention for feature refinement
+        # Add batch and sequence dimensions for attention
+        if enhanced_features.dim() == 2:
+            attn_input = enhanced_features.unsqueeze(1)  # [B, 1, D]
+        else:
+            attn_input = enhanced_features
+            
+        attn_output, _ = self.cls_head['self_attention'](
+            attn_input, attn_input, attn_input
+        )
+        
+        # Residual connection + normalization
+        attn_output = attn_output.squeeze(1) if attn_output.dim() == 3 else attn_output
+        enhanced_features = self.cls_head['attention_norm'](
+            enhanced_features + self.cls_head['attention_dropout'](attn_output)
+        )
+        
+        # Multi-pathway feature processing
+        pathway1_out = self.cls_head['pathway1'](enhanced_features)
+        pathway2_out = self.cls_head['pathway2'](enhanced_features)
+        
+        # Gated feature combination
+        gate_weights = self.cls_head['gate'](enhanced_features)
+        combined_features = (
+            gate_weights[:, 0:1] * pathway1_out + 
+            gate_weights[:, 1:2] * pathway2_out
+        )
+        
+        # Final classification
+        pre_logits = self.cls_head['pre_classifier'](combined_features)
+        main_logits = self.cls_head['classifier'](pre_logits)
+        
+        # Auxiliary prediction for better gradient flow during training
+        aux_logits = self.cls_head['aux_classifier'](enhanced_features)
+        
+        return main_logits, aux_logits
+
     def get_current_beta(self):
         """Calculate current beta value with support for warmup and annealing"""
         if not self.warmup_beta:
@@ -1114,15 +1199,17 @@ class SeqSetVAE(pl.LightningModule):
             attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
             enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
         
-        # Classification with enhanced features
-        logits = self.cls_head(enhanced_features)
+        # Classification with advanced classifier
+        main_logits, aux_logits = self._forward_advanced_classifier(enhanced_features)
+        # Use main logits for primary predictions
+        logits = main_logits
         
         # Save latent variable information for collapse detector
         if all_z_lists:
             # Merge latent variable information from all sets (use first set as representative)
             self._last_z_list = all_z_lists[0] if all_z_lists else None
         
-        return logits, recon_loss_total, (torch.tensor(0.0, device=h_seq.device) if self.classification_only else kl_total * current_beta)
+        return logits, recon_loss_total, (torch.tensor(0.0, device=h_seq.device) if self.classification_only else kl_total * current_beta), aux_logits
 
     def _forward_batch(self, all_patient_sets, padding_mask=None):
         """
@@ -1355,6 +1442,7 @@ class SeqSetVAE(pl.LightningModule):
         
         # Process each patient separately and collect results
         all_logits = []
+        all_aux_logits = []
         total_recon_loss = 0.0
         total_kl_loss = 0.0
         valid_patients = 0
@@ -1365,8 +1453,9 @@ class SeqSetVAE(pl.LightningModule):
                 continue
                 
             # Process this patient's sets
-            logits, recon_loss, kl_loss = self(patient_sets)
+            logits, recon_loss, kl_loss, aux_logits = self(patient_sets)
             all_logits.append(logits)
+            all_aux_logits.append(aux_logits)
             total_recon_loss += recon_loss
             total_kl_loss += kl_loss
             valid_patients += 1
@@ -1376,21 +1465,29 @@ class SeqSetVAE(pl.LightningModule):
             batch_size = var.size(0)
             device = var.device
             logits = torch.zeros(batch_size, self.num_classes, device=device)
+            aux_logits = torch.zeros(batch_size, self.num_classes, device=device)
             recon_loss = torch.tensor(0.0, device=device)
             kl_loss = torch.tensor(0.0, device=device)
         else:
             # Average losses across patients
             logits = torch.cat(all_logits, dim=0)  # [B, num_classes]
+            aux_logits = torch.cat(all_aux_logits, dim=0)  # [B, num_classes]
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # Loss calculation: FINETUNE MODE - only focal loss
-        # Use focal loss for classification (required for finetune mode)
+        # Loss calculation: FINETUNE MODE - enhanced focal loss + auxiliary loss
+        # Main prediction loss
         if self.focal_loss_fn is not None:
-            pred_loss = self.focal_loss_fn(logits, label)
+            main_pred_loss = self.focal_loss_fn(logits, label)
+            # Auxiliary loss with reduced weight for better gradient flow
+            aux_pred_loss = self.focal_loss_fn(aux_logits, label)
         else:
             # Fallback to cross entropy if focal loss not available
-            pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
+            main_pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
+            aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.1)
+
+        # Combined loss: main prediction + auxiliary prediction
+        pred_loss = main_pred_loss + 0.3 * aux_pred_loss  # 30% weight for auxiliary loss
 
         # FINETUNE MODE: Only classification loss, no recon/KL loss
         total_loss = pred_loss
@@ -1502,16 +1599,41 @@ class SeqSetVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.classification_only:
-            # Optimize classifier head only with more conservative LR
-            cls_params = [p for p in self.cls_head.parameters() if p.requires_grad]
-            # Use more conservative learning rate for better stability
-            cls_lr = self.cls_head_lr or (self.lr * 3.0)  # Reduced from 10x to 3x
+            # Enhanced optimizer for advanced classifier architecture
+            cls_params = []
+            
+            # Collect parameters from advanced classifier with different LR groups
+            attention_params = []
+            classifier_params = []
+            
+            for name, module in self.cls_head.items():
+                if 'attention' in name:
+                    attention_params.extend(list(module.parameters()))
+                else:
+                    classifier_params.extend(list(module.parameters()))
+            
+            # Use differentiated learning rates for different components
+            cls_lr = self.cls_head_lr or (self.lr * 4.0)  # Higher LR for complex architecture
+            
+            param_groups = [
+                {
+                    'params': attention_params, 
+                    'lr': cls_lr * 0.8,  # Slightly lower LR for attention layers
+                    'weight_decay': 0.005,
+                    'name': 'attention'
+                },
+                {
+                    'params': classifier_params, 
+                    'lr': cls_lr,
+                    'weight_decay': 0.01,
+                    'name': 'classifier'
+                }
+            ]
+            
             optimizer = AdamW(
-                [{'params': cls_params, 'lr': cls_lr, 'name': 'cls_head'}],
-                lr=cls_lr,
-                betas=(0.9, 0.98),  # Slightly adjusted beta2 for better stability
+                param_groups,
+                betas=(0.9, 0.999),  # Standard AdamW betas
                 eps=1e-8,
-                weight_decay=0.01,  # Increased weight decay for better regularization
             )
         else:
             # Set different learning rates for different parts
@@ -1534,24 +1656,36 @@ class SeqSetVAE(pl.LightningModule):
                 weight_decay=0.02,
             )
         
-        # Improved learning rate scheduler for better AUC/AUPRC
-        from torch.optim.lr_scheduler import ReduceLROnPlateau
-        scheduler = ReduceLROnPlateau(
-            optimizer, 
-            mode='min',  # Monitor training loss (lower is better)
-            factor=0.7,  # Reduce LR by 30% when plateau
-            patience=200,  # Wait 200 steps before reducing LR
-            verbose=True,
-            min_lr=self.lr * 0.001  # Minimum learning rate
-        )
+        # Enhanced learning rate scheduler for advanced architecture
+        if self.classification_only:
+            # Use cosine annealing with warm restarts for better convergence
+            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=500,  # Initial restart period
+                T_mult=2,  # Multiply restart period by this factor
+                eta_min=cls_lr * 0.001,  # Minimum learning rate
+                verbose=True
+            )
+        else:
+            # Standard scheduler for pretraining
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+            scheduler = ReduceLROnPlateau(
+                optimizer, 
+                mode='min',
+                factor=0.7,
+                patience=200,
+                verbose=True,
+                min_lr=self.lr * 0.001
+            )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",  # Check every epoch instead of every step
+                "interval": "step" if self.classification_only else "epoch",  # Step-wise for advanced training
                 "frequency": 1,
-                "monitor": "val_loss",  # Monitor validation loss for scheduling
+                "monitor": "val_auc" if self.classification_only else "val_loss",  # Monitor AUC for finetune
             },
         }
 
@@ -1575,8 +1709,19 @@ class SeqSetVAE(pl.LightningModule):
  
     def init_classifier_head_xavier(self):
         """Initialize classifier head Linear layers with Xavier uniform and zero biases."""
-        for module in self.cls_head.modules():
+        def init_linear_layers(module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        
+        # Initialize all linear layers in the advanced classifier
+        for key, module in self.cls_head.items():
+            if isinstance(module, nn.Sequential):
+                for sub_module in module:
+                    init_linear_layers(sub_module)
+            elif isinstance(module, (nn.Linear, nn.MultiheadAttention)):
+                init_linear_layers(module)
+            elif hasattr(module, 'modules'):
+                for sub_module in module.modules():
+                    init_linear_layers(sub_module)
