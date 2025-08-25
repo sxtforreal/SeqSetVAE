@@ -1475,19 +1475,40 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # Loss calculation: FINETUNE MODE - enhanced focal loss + auxiliary loss
-        # Main prediction loss
+        # Loss calculation: FINETUNE MODE - diversified loss strategy
+        # 🎯 改进的多样化损失策略：主辅助头使用不同损失函数
+        
+        # 主损失：Focal Loss (处理类别不平衡 + 困难样本挖掘)
         if self.focal_loss_fn is not None:
             main_pred_loss = self.focal_loss_fn(logits, label)
-            # Auxiliary loss with reduced weight for better gradient flow
-            aux_pred_loss = self.focal_loss_fn(aux_logits, label)
         else:
-            # Fallback to cross entropy if focal loss not available
             main_pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
-            aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.1)
+            
+        # 辅助损失：标签平滑交叉熵 (不同于主损失的策略)
+        # ✅ 为什么不用Focal Loss：
+        # 1. 避免两个头都过度关注困难样本
+        # 2. 标签平滑促进更好的概率校准
+        # 3. 提供互补的学习信号
+        aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.15)
+        
+        # 一致性损失：鼓励两个头学习相似但不完全相同的表示
+        # 这有助于知识蒸馏和模型集成效果
+        main_probs = F.softmax(logits, dim=1)
+        consistency_loss = F.kl_div(
+            F.log_softmax(aux_logits, dim=1), 
+            main_probs.detach(),  # 不通过主头反向传播
+            reduction='batchmean'
+        )
 
-        # Combined loss: main prediction + auxiliary prediction
-        pred_loss = main_pred_loss + 0.3 * aux_pred_loss  # 30% weight for auxiliary loss
+        # 🔧 平衡的损失组合策略：
+        # - 主损失 (70%): Focal Loss 专注困难样本和类别不平衡
+        # - 辅助损失 (25%): 平滑CE 提供稳定的基础学习信号  
+        # - 一致性损失 (5%): 保持两个头的协调性
+        pred_loss = (
+            0.7 * main_pred_loss + 
+            0.25 * aux_pred_loss + 
+            0.05 * consistency_loss
+        )
 
         # FINETUNE MODE: Only classification loss, no recon/KL loss
         total_loss = pred_loss
@@ -1536,6 +1557,16 @@ class SeqSetVAE(pl.LightningModule):
                 f"{stage}_recon_weight": recon_weight,
                 f"{stage}_pred_weight": pred_weight,
             }
+        
+        # Add detailed loss breakdown for better monitoring
+        if hasattr(self, 'classification_only') and self.classification_only:
+            # Extract individual loss components for monitoring
+            if 'main_pred_loss' in locals():
+                log_payload[f"{stage}_main_loss"] = main_pred_loss
+            if 'aux_pred_loss' in locals():
+                log_payload[f"{stage}_aux_loss"] = aux_pred_loss  
+            if 'consistency_loss' in locals():
+                log_payload[f"{stage}_consistency_loss"] = consistency_loss
         if mean_variance is not None:
             log_payload[f"{stage}_variance"] = mean_variance
         if active_units_ratio is not None:
