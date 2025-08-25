@@ -538,6 +538,7 @@ class SeqSetVAE(pl.LightningModule):
         use_focal_loss: bool = False,
         focal_gamma: float = 2.0,
         focal_alpha = None,
+        medical_scenario: str = "multi_condition_screening",  # SOTA: Medical scenario for loss strategy
     ):
 
         super().__init__()
@@ -750,6 +751,7 @@ class SeqSetVAE(pl.LightningModule):
         # Finetune mode: classification only (skip recon/KL) and keep backbone eval
         self.classification_only = False
         self.cls_head_lr = None
+        self.medical_scenario = medical_scenario  # Store for SOTA loss strategy
         
         self.save_hyperparameters(ignore=["setvae"])
  
@@ -1475,40 +1477,81 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # Loss calculation: FINETUNE MODE - diversified loss strategy
-        # 🎯 改进的多样化损失策略：主辅助头使用不同损失函数
+        # 🏆 SOTA Loss Strategy: 基于2024年最新学术研究
+        # 集成多项前沿技术：SoftAdapt, Asymmetric Loss, Self-Distillation, Gradient Adaptation
         
-        # 主损失：Focal Loss (处理类别不平衡 + 困难样本挖掘)
-        if self.focal_loss_fn is not None:
-            main_pred_loss = self.focal_loss_fn(logits, label)
-        else:
-            main_pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
+        # 初始化SOTA损失策略 (懒加载，仅在第一次调用时创建)
+        if not hasattr(self, '_sota_loss_strategy'):
+            from sota_loss_strategies import get_sota_loss_strategy
+            # 根据医疗场景选择最优策略
+            medical_scenario = getattr(self, 'medical_scenario', 'multi_condition_screening')
+            self._sota_loss_strategy = get_sota_loss_strategy(
+                medical_scenario=medical_scenario,
+                num_classes=self.num_classes
+            )
+            print(f"🔬 Initialized SOTA loss strategy for: {medical_scenario}")
+        
+        # 获取当前训练步骤作为epoch近似
+        current_epoch = getattr(self, 'current_step', 0) // 100  # 假设每100步为一个epoch
+        
+        # 收集主头和辅助头的参数用于梯度分析
+        main_params = list(self.cls_head['classifier'].parameters()) + list(self.cls_head['pre_classifier'].parameters())
+        aux_params = list(self.cls_head['aux_classifier'].parameters())
+        
+        try:
+            # 🚀 使用SOTA损失策略计算损失
+            pred_loss, loss_breakdown = self._sota_loss_strategy.compute_loss(
+                main_logits=logits,
+                aux_logits=aux_logits,
+                labels=label,
+                epoch=current_epoch,
+                main_params=main_params,
+                aux_params=aux_params
+            )
             
-        # 辅助损失：标签平滑交叉熵 (不同于主损失的策略)
-        # ✅ 为什么不用Focal Loss：
-        # 1. 避免两个头都过度关注困难样本
-        # 2. 标签平滑促进更好的概率校准
-        # 3. 提供互补的学习信号
-        aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.15)
-        
-        # 一致性损失：鼓励两个头学习相似但不完全相同的表示
-        # 这有助于知识蒸馏和模型集成效果
-        main_probs = F.softmax(logits, dim=1)
-        consistency_loss = F.kl_div(
-            F.log_softmax(aux_logits, dim=1), 
-            main_probs.detach(),  # 不通过主头反向传播
-            reduction='batchmean'
-        )
-
-        # 🔧 平衡的损失组合策略：
-        # - 主损失 (70%): Focal Loss 专注困难样本和类别不平衡
-        # - 辅助损失 (25%): 平滑CE 提供稳定的基础学习信号  
-        # - 一致性损失 (5%): 保持两个头的协调性
-        pred_loss = (
-            0.7 * main_pred_loss + 
-            0.25 * aux_pred_loss + 
-            0.05 * consistency_loss
-        )
+            # 存储详细的损失分解用于监控
+            if stage == "train":
+                for key, value in loss_breakdown.items():
+                    if isinstance(value, torch.Tensor):
+                        setattr(self, f'_last_{key}', value.detach())
+            
+        except Exception as e:
+            # 降级到简化策略（确保训练不会中断）
+            print(f"⚠️ SOTA loss computation failed, falling back to simplified strategy: {e}")
+            
+            # 主损失：Focal Loss
+            if self.focal_loss_fn is not None:
+                main_pred_loss = self.focal_loss_fn(logits, label)
+            else:
+                main_pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
+                
+            # 辅助损失：不对称损失 (处理极端不平衡)
+            try:
+                from sota_loss_strategies import AsymmetricLoss
+                if not hasattr(self, '_asymmetric_loss'):
+                    self._asymmetric_loss = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05)
+                aux_pred_loss = self._asymmetric_loss(aux_logits, label)
+            except:
+                aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.15)
+            
+            # EMA自蒸馏损失
+            if not hasattr(self, '_ema_teacher'):
+                self._ema_teacher = F.softmax(logits.detach(), dim=1)
+            else:
+                self._ema_teacher = 0.999 * self._ema_teacher + 0.001 * F.softmax(logits.detach(), dim=1)
+            
+            distill_loss = F.kl_div(
+                F.log_softmax(aux_logits / 3.0, dim=1),
+                self._ema_teacher / 3.0,
+                reduction='batchmean'
+            ) * 9.0  # temperature^2 scaling
+            
+            # 动态权重组合
+            main_weight = 0.6
+            aux_weight = 0.3  
+            distill_weight = 0.1
+            
+            pred_loss = main_weight * main_pred_loss + aux_weight * aux_pred_loss + distill_weight * distill_loss
 
         # FINETUNE MODE: Only classification loss, no recon/KL loss
         total_loss = pred_loss
