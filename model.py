@@ -1482,7 +1482,7 @@ class SeqSetVAE(pl.LightningModule):
         
         # 初始化SOTA损失策略 (懒加载，仅在第一次调用时创建)
         if not hasattr(self, '_sota_loss_strategy'):
-            from sota_loss_strategies import get_sota_loss_strategy
+            from losses import get_sota_loss_strategy
             # 根据医疗场景选择最优策略
             medical_scenario = getattr(self, 'medical_scenario', 'multi_condition_screening')
             self._sota_loss_strategy = get_sota_loss_strategy(
@@ -1527,7 +1527,7 @@ class SeqSetVAE(pl.LightningModule):
                 
             # 辅助损失：不对称损失 (处理极端不平衡)
             try:
-                from sota_loss_strategies import AsymmetricLoss
+                from losses import AsymmetricLoss
                 if not hasattr(self, '_asymmetric_loss'):
                     self._asymmetric_loss = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05)
                 aux_pred_loss = self._asymmetric_loss(aux_logits, label)
