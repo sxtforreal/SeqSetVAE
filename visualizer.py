@@ -672,9 +672,164 @@ def create_dashboard(log_dir: str, update_interval: int = 1000):
     visualizer.start_monitoring()
 
 
+def _collect_mu_var_with_labels(model, dataloader, max_samples=100):
+    """Collect posterior mean and variance per patient with labels.
+    Assumes dataloader yields batches where each batch corresponds to a single patient
+    (batch_size=1). Uses model._last_z_list to read mu/logvar from the VAE for the
+    first set of the patient, taking the last latent level.
+    Returns a list of dicts with keys: 'mu' (np.ndarray[D]), 'var' (np.ndarray[D]), 'label' (int).
+    """
+    model.eval()
+    device = next(model.parameters()).device if list(model.parameters()) else torch.device('cpu')
+    results = []
+    with torch.no_grad():
+        for batch in dataloader:
+            # Ensure batch tensors on device
+            batch_on_device = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch_on_device[k] = v.to(device)
+                else:
+                    batch_on_device[k] = v
+
+            # Forward pass; model accepts dict batch
+            try:
+                _ = model(batch_on_device)
+            except Exception:
+                # Some models may require tuple signature; try fallback paths
+                if {'var', 'val'}.issubset(batch_on_device.keys()):
+                    _ = model(batch_on_device['var'].to(device), batch_on_device['val'].to(device))
+                else:
+                    continue
+
+            # Read mu/logvar list stored on model
+            if not hasattr(model, '_last_z_list') or model._last_z_list is None:
+                continue
+            try:
+                # Take last latent level from first set: (z_sample, mu, logvar)
+                z_sample, mu, logvar = model._last_z_list[-1]
+                # Shapes: [B, 1, D]; squeeze set dim
+                mu = mu.squeeze(1)
+                logvar = logvar.squeeze(1)
+                # Expect B == 1
+                mu_np = mu[0].detach().cpu().numpy()
+                var_np = torch.exp(logvar[0]).detach().cpu().numpy()
+            except Exception:
+                continue
+
+            label = int(batch_on_device.get('label', torch.tensor([0], device=device))[0].item())
+            results.append({'mu': mu_np, 'var': var_np, 'label': label})
+            if len(results) >= max_samples:
+                break
+    return results
+
+
+def _plot_mu_var_per_sample_grid(samples, num_pos=4, num_neg=4, save_path=None):
+    """Plot per-sample 2D scatter (x=mu_d, y=var_d) for a grid of pos/neg examples."""
+    # Select examples
+    pos_examples = [s for s in samples if s['label'] == 1][:num_pos]
+    neg_examples = [s for s in samples if s['label'] == 0][:num_neg]
+    total = len(pos_examples) + len(neg_examples)
+    if total == 0:
+        print("No samples to plot.")
+        return
+
+    rows = 2 if (pos_examples and neg_examples) else 1
+    cols = max(len(pos_examples), len(neg_examples))
+    cols = max(cols, 1)
+    fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows), squeeze=False)
+
+    # Helper to plot a single panel
+    def _plot_panel(ax, sample, title):
+        mu = sample['mu']
+        var = sample['var']
+        ax.scatter(mu, var, s=12, alpha=0.8, c='tab:orange' if sample['label'] == 1 else 'tab:blue')
+        ax.axvline(0.0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+        ax.set_xlabel('mean (mu)')
+        ax.set_ylabel('variance (exp(logvar))')
+        ax.set_title(title)
+        # Optional: show summary stats in corner
+        try:
+            corr = np.corrcoef(mu, var)[0, 1]
+            ax.text(0.02, 0.98, f"r={corr:.2f}", transform=ax.transAxes, va='top', ha='left', fontsize=9)
+        except Exception:
+            pass
+
+    # Plot pos row
+    for j in range(cols):
+        ax = axes[0, j]
+        if j < len(pos_examples):
+            _plot_panel(ax, pos_examples[j], f"pos sample #{j}")
+        else:
+            ax.axis('off')
+
+    # Plot neg row if present
+    if rows == 2:
+        for j in range(cols):
+            ax = axes[1, j]
+            if j < len(neg_examples):
+                _plot_panel(ax, neg_examples[j], f"neg sample #{j}")
+            else:
+                ax.axis('off')
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved per-sample mean-var grid to: {save_path}")
+    plt.show()
+
+
+def _plot_mu_var_aggregate(samples, save_path=None):
+    """Aggregate all dimensions from all samples and plot mean-vs-variance distribution by label."""
+    if not samples:
+        print("No samples to aggregate.")
+        return
+    mu_pos = []
+    var_pos = []
+    mu_neg = []
+    var_neg = []
+    for s in samples:
+        if s['label'] == 1:
+            mu_pos.append(s['mu'])
+            var_pos.append(s['var'])
+        else:
+            mu_neg.append(s['mu'])
+            var_neg.append(s['var'])
+    if mu_pos:
+        mu_pos = np.concatenate(mu_pos)
+        var_pos = np.concatenate(var_pos)
+    else:
+        mu_pos = np.array([])
+        var_pos = np.array([])
+    if mu_neg:
+        mu_neg = np.concatenate(mu_neg)
+        var_neg = np.concatenate(var_neg)
+    else:
+        mu_neg = np.array([])
+        var_neg = np.array([])
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    if mu_neg.size > 0:
+        ax.scatter(mu_neg, var_neg, s=6, alpha=0.25, c='tab:blue', label='neg dims')
+    if mu_pos.size > 0:
+        ax.scatter(mu_pos, var_pos, s=6, alpha=0.25, c='tab:orange', label='pos dims')
+    ax.axvline(0.0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.set_xlabel('mean (mu)')
+    ax.set_ylabel('variance (exp(logvar))')
+    ax.set_title('Aggregate mean vs variance by label (dims pooled)')
+    ax.legend()
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved aggregate mean-var distribution to: {save_path}")
+    plt.show()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Comprehensive Model Visualization')
-    parser.add_argument('--mode', type=str, choices=['static', 'realtime'], default='static',
+    parser.add_argument('--mode', type=str, choices=['static', 'realtime', 'meanvar'], default='static',
                        help='Visualization mode: static analysis or real-time monitoring')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
@@ -735,6 +890,34 @@ def main():
         # Real-time monitoring mode
         print("🔍 Running real-time monitoring mode...")
         create_dashboard(args.log_dir, args.update_interval)
+    elif args.mode == 'meanvar':
+        print("🔍 Running mean/variance scatter visualization...")
+        # Load model
+        model_config = Config()
+        model = load_model(args.checkpoint, model_config, checkpoint_type=args.checkpoint_type)
+        # Load data (batch_size=1 for per-patient extraction)
+        data_module = SeqSetVAEDataModule(
+            saved_dir=args.data_dir,
+            params_map_path=args.params_map_path,
+            label_path=args.label_path,
+            batch_size=1
+        )
+        data_module.num_workers = 0
+        data_module.pin_memory = False
+        data_module.setup()
+        dl = data_module.train_dataloader()
+        # Collect mu/var
+        samples = _collect_mu_var_with_labels(model, dl, max_samples=200)
+        if not samples:
+            print("⚠️ No mu/var samples collected. Check dataloader and checkpoint compatibility.")
+            return
+        # Plot per-sample grid
+        os.makedirs(args.save_dir, exist_ok=True)
+        grid_path = os.path.join(args.save_dir, 'meanvar_grid.png')
+        _plot_mu_var_per_sample_grid(samples, num_pos=6, num_neg=6, save_path=grid_path)
+        # Plot aggregated distribution
+        agg_path = os.path.join(args.save_dir, 'meanvar_aggregate.png')
+        _plot_mu_var_aggregate(samples, save_path=agg_path)
 
 
 if __name__ == "__main__":
