@@ -17,6 +17,117 @@ import math
 from typing import Optional
 
 
+class GaussianMILHead(nn.Module):
+    """
+    Gaussian discriminant head with MIL-style gated aggregation.
+
+    - Per set posterior: q(z) = N(mu, diag(var)) with inputs mu, logvar
+    - Class prototypes: p(z|c) = N(mu_c, diag(tau_c^2)) with learnable mu_c, tau_c
+    - Per-set logit is the expected log-likelihood ratio between classes
+    - Instance gating a_i in [0,1] is predicted from [mu, logvar, s_i, time]
+    - Aggregate evidence across sets by a convex combination of weighted-sum
+      and Noisy-OR, controlled by learnable alpha
+    """
+
+    def __init__(self, latent_dim: int, num_classes: int = 2, use_time: bool = True, gate_hidden_dim: int = 128):
+        super().__init__()
+        assert num_classes == 2, "GaussianMILHead currently supports binary classification only"
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+        self.use_time = use_time
+
+        # Gaussian class prototypes
+        self.mu = nn.Parameter(torch.zeros(num_classes, latent_dim))  # [2, D]
+        self.log_tau2 = nn.Parameter(torch.zeros(num_classes, latent_dim))  # [2, D]
+        self.log_prior = nn.Parameter(torch.zeros(num_classes))  # [2]
+
+        # Gating network for MIL
+        in_dim = 2 * latent_dim + 1 + (1 if use_time else 0)  # mu, logvar, s_i, optional time
+        self.gate = nn.Sequential(
+            nn.Linear(in_dim, gate_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(gate_hidden_dim, 1),
+        )
+
+        # Mixture weight between additive evidence and Noisy-OR
+        self.alpha_logits = nn.Parameter(torch.tensor(0.5).logit())
+
+    @staticmethod
+    def _expected_loglik(mu: torch.Tensor, logvar: torch.Tensor, mu_c: torch.Tensor, log_tau2_c: torch.Tensor) -> torch.Tensor:
+        """Compute E_q[log N(z; mu_c, tau_c^2 I)] for diagonal case.
+
+        Args:
+            mu: [B, S, D]
+            logvar: [B, S, D]
+            mu_c: [D]
+            log_tau2_c: [D]
+        Returns:
+            ell: [B, S]
+        """
+        var = logvar.exp()  # [B, S, D]
+        tau2 = log_tau2_c.exp()  # [D]
+        # Broadcast to [B, S, D]
+        diff2 = (mu - mu_c) ** 2
+        term = (var + diff2) / tau2  # [B, S, D]
+        # Constant terms cancel in differences but we keep log_tau2 to learn scale
+        ell = -0.5 * (term + log_tau2_c).sum(dim=-1)  # [B, S]
+        return ell
+
+    def per_set_logit(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Return per-set binary logit s_i for each set.
+
+        Args:
+            mu: [B, S, D]
+            logvar: [B, S, D]
+        Returns:
+            s: [B, S]
+        """
+        ell1 = self._expected_loglik(mu, logvar, self.mu[1], self.log_tau2[1]) + self.log_prior[1]
+        ell0 = self._expected_loglik(mu, logvar, self.mu[0], self.log_tau2[0]) + self.log_prior[0]
+        s = ell1 - ell0
+        return s
+
+    def forward(self, mu: torch.Tensor, logvar: torch.Tensor, minutes: Optional[torch.Tensor] = None):
+        """Compute patient-level logits via MIL aggregation.
+
+        Args:
+            mu: [B, S, D]
+            logvar: [B, S, D]
+            minutes: [B, S] or None
+        Returns:
+            logits: [B, 2]
+            s_per_set: [B, S] per-set logits
+            a: [B, S] gating weights
+        """
+        s = self.per_set_logit(mu, logvar)  # [B, S]
+
+        # Build gating inputs: [mu, logvar, s, t]
+        B, S, D = mu.shape
+        gate_feats = [mu, logvar, s.unsqueeze(-1)]
+        if self.use_time and minutes is not None:
+            gate_feats.append(minutes.unsqueeze(-1))
+        gate_in = torch.cat(gate_feats, dim=-1)  # [B, S, 2D+1(+1)]
+        a = torch.sigmoid(self.gate(gate_in)).squeeze(-1)  # [B, S]
+
+        # Weighted-sum evidence
+        s_sum = (a * s).sum(dim=1)  # [B]
+
+        # Noisy-OR style aggregation
+        p_i = torch.sigmoid(s) * a  # [B, S]
+        p_i = p_i.clamp(1e-6, 1 - 1e-6)
+        log1m = torch.log1p(-p_i).sum(dim=1)  # log prod(1-p_i)
+        p_or = 1 - torch.exp(log1m)  # [B]
+        s_or = torch.logit(p_or.clamp(1e-6, 1 - 1e-6))
+
+        # Mixture
+        alpha = torch.sigmoid(self.alpha_logits)
+        s_total = alpha * s_sum + (1 - alpha) * s_or  # [B]
+
+        # Return 2-class logits for compatibility
+        logits = torch.stack([-s_total, s_total], dim=1)  # [B, 2]
+        return logits, s, a
+
+
 def load_checkpoint_weights(checkpoint_path, device='cpu'):
     """
     Load weights from checkpoint - handles both full PyTorch Lightning checkpoints 
@@ -539,6 +650,8 @@ class SeqSetVAE(pl.LightningModule):
         focal_gamma: float = 2.0,
         focal_alpha = None,
         medical_scenario: str = "multi_condition_screening",  # SOTA: Medical scenario for loss strategy
+        head_type: str = "advanced",  # "advanced" | "gaussian_mil"
+        gaussian_use_time: bool = True,
     ):
 
         super().__init__()
@@ -716,10 +829,15 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # Advanced classification head for better AUC/AUPRC performance
-        self.cls_head = self._build_advanced_classifier(latent_dim, num_classes)
+        # Classification head
+        self.head_type = head_type
+        if head_type == "gaussian_mil":
+            self.cls_head = GaussianMILHead(latent_dim=latent_dim, num_classes=num_classes, use_time=gaussian_use_time)
+        else:
+            # Advanced classification head for better AUC/AUPRC performance
+            self.cls_head = self._build_advanced_classifier(latent_dim, num_classes)
         
-        # Learnable gate for pooling between last_token and attention pooling
+        # Learnable gate for pooling between last_token and attention pooling (advanced head only)
         self.pooling_gate = nn.Parameter(torch.tensor(0.7))
         
         # Simplified feature extraction - no complex fusion modules for better stability
@@ -1193,18 +1311,46 @@ class SeqSetVAE(pl.LightningModule):
                 self._last_recon_cat = None
                 self._last_target_cat = None
         
-        # Enhanced feature extraction using multi-scale pooling
-        enhanced_features = self._extract_enhanced_features(h_seq)
-        
-        # Alternative: Use attention-based pooling as fallback (deterministic)
-        if enhanced_features is None:
-            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
-            enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
-        
-        # Classification with advanced classifier
-        main_logits, aux_logits = self._forward_advanced_classifier(enhanced_features)
-        # Use main logits for primary predictions
-        logits = main_logits
+        if self.head_type == "gaussian_mil":
+            # For Gaussian MIL: form per-set mu/logvar features before transformer
+            # We already used fused features for z_seq; but Gaussian head expects posterior mu/logvar per set.
+            # To supply them, we recompute per-set latent stats collected above.
+            # Re-encode each set to obtain mu/logvar tensors in order.
+            mu_list = []
+            logvar_list = []
+            minutes_list = []
+            for s_dict in sets:
+                var_t, val_t, time_t = s_dict["var"], s_dict["val"], s_dict["minute"]
+                if self.classification_only:
+                    setvae_inner = self.setvae.setvae
+                    if hasattr(setvae_inner, "encode_from_var_val"):
+                        z_list_tmp, _ = setvae_inner.encode_from_var_val(var_t, val_t)
+                    else:
+                        _, z_list_tmp, _ = setvae_inner(var_t, val_t)
+                else:
+                    _, z_list_tmp, _ = self.setvae.setvae(var_t, val_t)
+                _, mu_tmp, logvar_tmp = z_list_tmp[-1]
+                mu_list.append(mu_tmp.squeeze(1))
+                logvar_list.append(logvar_tmp.squeeze(1))
+                minutes_list.append(time_t.unique().float())
+            mu_seq = torch.stack(mu_list, dim=1)  # [B, S, D]
+            logvar_seq = torch.stack(logvar_list, dim=1)  # [B, S, D]
+            minutes_vec = torch.stack(minutes_list, dim=1).squeeze(-1) if minutes_list[0].dim() == 2 else torch.stack(minutes_list, dim=1)
+            logits, _, _ = self.cls_head(mu_seq, logvar_seq, minutes_vec)
+            aux_logits = logits.detach()  # placeholder, not used
+        else:
+            # Enhanced feature extraction using multi-scale pooling
+            enhanced_features = self._extract_enhanced_features(h_seq)
+            
+            # Alternative: Use attention-based pooling as fallback (deterministic)
+            if enhanced_features is None:
+                attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
+                enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
+            
+            # Classification with advanced classifier
+            main_logits, aux_logits = self._forward_advanced_classifier(enhanced_features)
+            # Use main logits for primary predictions
+            logits = main_logits
         
         # Save latent variable information for collapse detector
         if all_z_lists:
@@ -1494,9 +1640,13 @@ class SeqSetVAE(pl.LightningModule):
         # 获取当前训练步骤作为epoch近似
         current_epoch = getattr(self, 'current_step', 0) // 100  # 假设每100步为一个epoch
         
-        # 收集主头和辅助头的参数用于梯度分析
-        main_params = list(self.cls_head['classifier'].parameters()) + list(self.cls_head['pre_classifier'].parameters())
-        aux_params = list(self.cls_head['aux_classifier'].parameters())
+        # 收集主头和辅助头的参数用于梯度分析（兼容不同 head）
+        if self.head_type == "gaussian_mil":
+            main_params = [self.cls_head.mu, self.cls_head.log_tau2, self.cls_head.log_prior]
+            aux_params = list(self.cls_head.gate.parameters())
+        else:
+            main_params = list(self.cls_head['classifier'].parameters()) + list(self.cls_head['pre_classifier'].parameters())
+            aux_params = list(self.cls_head['aux_classifier'].parameters())
         
         try:
             # 🚀 使用SOTA损失策略计算损失
@@ -1673,40 +1823,54 @@ class SeqSetVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.classification_only:
-            # Enhanced optimizer for advanced classifier architecture
-            cls_params = []
-            
-            # Collect parameters from advanced classifier with different LR groups
-            attention_params = []
-            classifier_params = []
-            
-            for name, module in self.cls_head.items():
-                if 'attention' in name:
-                    attention_params.extend(list(module.parameters()))
-                else:
-                    classifier_params.extend(list(module.parameters()))
-            
-            # Use differentiated learning rates for different components
-            cls_lr = self.cls_head_lr or (self.lr * 4.0)  # Higher LR for complex architecture
-            
-            param_groups = [
-                {
-                    'params': attention_params, 
-                    'lr': cls_lr * 0.8,  # Slightly lower LR for attention layers
-                    'weight_decay': 0.005,
-                    'name': 'attention'
-                },
-                {
-                    'params': classifier_params, 
-                    'lr': cls_lr,
-                    'weight_decay': 0.01,
-                    'name': 'classifier'
-                }
-            ]
-            
+            # Enhanced optimizer for classifier-only finetune
+            cls_lr = self.cls_head_lr or (self.lr * 4.0)
+
+            if self.head_type == "gaussian_mil":
+                # Separate param groups: prototypes vs gate
+                proto_params = [self.cls_head.mu, self.cls_head.log_tau2, self.cls_head.log_prior]
+                gate_params = list(self.cls_head.gate.parameters())
+                param_groups = [
+                    {
+                        'params': gate_params,
+                        'lr': cls_lr,
+                        'weight_decay': 0.01,
+                        'name': 'gaussian_gate'
+                    },
+                    {
+                        'params': proto_params,
+                        'lr': cls_lr * 0.5,
+                        'weight_decay': 0.0,
+                        'name': 'gaussian_prototypes'
+                    },
+                ]
+            else:
+                # Advanced classifier: split attention vs classifier blocks
+                attention_params = []
+                classifier_params = []
+                for name, module in self.cls_head.items():
+                    if 'attention' in name:
+                        attention_params.extend(list(module.parameters()))
+                    else:
+                        classifier_params.extend(list(module.parameters()))
+                param_groups = [
+                    {
+                        'params': attention_params,
+                        'lr': cls_lr * 0.8,
+                        'weight_decay': 0.005,
+                        'name': 'attention'
+                    },
+                    {
+                        'params': classifier_params,
+                        'lr': cls_lr,
+                        'weight_decay': 0.01,
+                        'name': 'classifier'
+                    }
+                ]
+
             optimizer = AdamW(
                 param_groups,
-                betas=(0.9, 0.999),  # Standard AdamW betas
+                betas=(0.9, 0.999),
                 eps=1e-8,
             )
         else:
@@ -1736,9 +1900,9 @@ class SeqSetVAE(pl.LightningModule):
             from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=500,  # Initial restart period
-                T_mult=2,  # Multiply restart period by this factor
-                eta_min=cls_lr * 0.001,  # Minimum learning rate
+                T_0=500,
+                T_mult=2,
+                eta_min=(self.cls_head_lr or (self.lr * 4.0)) * 0.001,
                 verbose=True
             )
         else:
@@ -1790,12 +1954,22 @@ class SeqSetVAE(pl.LightningModule):
                     nn.init.zeros_(module.bias)
         
         # Initialize all linear layers in the advanced classifier
-        for key, module in self.cls_head.items():
-            if isinstance(module, nn.Sequential):
-                for sub_module in module:
-                    init_linear_layers(sub_module)
-            elif isinstance(module, (nn.Linear, nn.MultiheadAttention)):
-                init_linear_layers(module)
-            elif hasattr(module, 'modules'):
-                for sub_module in module.modules():
-                    init_linear_layers(sub_module)
+        if self.head_type == "gaussian_mil":
+            # Initialize gating network
+            for sub_module in self.cls_head.gate.modules():
+                init_linear_layers(sub_module)
+            # Initialize prototypes with small noise
+            with torch.no_grad():
+                self.cls_head.mu.normal_(mean=0.0, std=0.02)
+                self.cls_head.log_tau2.fill_(0.0)
+                self.cls_head.log_prior.fill_(0.0)
+        else:
+            for key, module in self.cls_head.items():
+                if isinstance(module, nn.Sequential):
+                    for sub_module in module:
+                        init_linear_layers(sub_module)
+                elif isinstance(module, (nn.Linear, nn.MultiheadAttention)):
+                    init_linear_layers(module)
+                elif hasattr(module, 'modules'):
+                    for sub_module in module.modules():
+                        init_linear_layers(sub_module)

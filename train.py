@@ -123,6 +123,10 @@ def main():
     parser.add_argument("--output_root_dir", type=str, default="/home/sunx/data/aiiih/projects/sunx/projects/TEEMR/PT/outputs", help="Root directory to save logs, checkpoints, and outputs")
     parser.add_argument("--output_dir", type=str, default=None, help="Alias of --output_root_dir; if provided, overrides output_root_dir")
     
+    # Classification head selection
+    parser.add_argument("--head_type", type=str, default="advanced", choices=["advanced", "gaussian_mil"], help="Classification head type")
+    parser.add_argument("--gaussian_use_time", action="store_true", help="Use time feature in Gaussian-MIL gate")
+
     # SOTA specific parameters
     parser.add_argument("--medical_scenario", type=str, default="auto", 
                        choices=["auto"] + list(MEDICAL_SOTA_CONFIGS.keys()),
@@ -351,6 +355,8 @@ def main():
             focal_alpha=focal_alpha_final,
             focal_gamma=focal_gamma_final,
             medical_scenario=medical_scenario_param,  # SOTA parameter
+            head_type=args.head_type,
+            gaussian_use_time=args.gaussian_use_time,
         )
         monitor_metric = 'val_auc'
         monitor_mode = 'max'
