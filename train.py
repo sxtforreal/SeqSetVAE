@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Unified SeqSetVAE Training Script with SOTA Integration
-Modes: 
+Unified SeqSetVAE Training Script
+Modes:
 - pretrain: reconstruction+KL only
-- finetune: freeze backbone + SOTA loss strategies for medical classification
-- finetune-sota: advanced medical optimization with academic research integration
+- finetune: freeze backbone + classification head (supports Gaussian-MIL)
 """
 
 import os
@@ -21,7 +20,6 @@ from datetime import datetime
 from model import SeqSetVAE, SeqSetVAEPretrain, load_checkpoint_weights
 from dataset import SeqSetVAEDataModule
 from posterior_collapse_detector import PosteriorMetricsMonitor
-from losses import MEDICAL_SOTA_CONFIGS, get_recommended_strategy
 import config
 
 
@@ -101,7 +99,7 @@ def remap_pretrain_to_finetune_keys(state_dict):
 def main():
     parser = argparse.ArgumentParser(description="Train SeqSetVAE (pretrain/finetune)")
     # Basic training parameters
-    parser.add_argument("--mode", type=str, choices=["pretrain", "finetune", "finetune-sota"], required=True, help="Training mode")
+    parser.add_argument("--mode", type=str, choices=["pretrain", "finetune"], required=True, help="Training mode")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--max_epochs", type=int, default=100, help="Maximum epochs")
@@ -127,12 +125,7 @@ def main():
     parser.add_argument("--head_type", type=str, default="advanced", choices=["advanced", "gaussian_mil"], help="Classification head type")
     parser.add_argument("--gaussian_use_time", action="store_true", help="Use time feature in Gaussian-MIL gate")
 
-    # SOTA specific parameters
-    parser.add_argument("--medical_scenario", type=str, default="auto", 
-                       choices=["auto"] + list(MEDICAL_SOTA_CONFIGS.keys()),
-                       help="Medical scenario for SOTA loss strategy")
-    parser.add_argument("--target_auc", type=float, default=0.90, help="Target AUC score for SOTA mode")
-    parser.add_argument("--target_auprc", type=float, default=0.50, help="Target AUPRC score for SOTA mode")
+    # (Removed SOTA finetune mode and related arguments)
 
     args = parser.parse_args()
 
@@ -163,11 +156,6 @@ def main():
     # Print basic config
     print("🚀 Training Configuration:")
     print(f" - Mode: {args.mode}")
-    if args.mode == "finetune-sota":
-        print(f" - 🏆 SOTA Medical Classification Mode")
-        print(f" - Target AUC: {args.target_auc}")
-        print(f" - Target AUPRC: {args.target_auprc}")
-        print(f" - Medical Scenario: {args.medical_scenario}")
     print(f" - Batch size: {args.batch_size}")
     print(f" - Grad accumulation: {args.gradient_accumulation_steps}")
     print(f" - Max epochs: {args.max_epochs}")
@@ -187,11 +175,6 @@ def main():
             print("⚠️  Finetune requires multi-patient batches; overriding batch_size to 2")
     print(f" - DataModule batch_size: {dm_batch_size}")
     
-    # SOTA mode: Auto-detect medical scenario if needed
-    medical_scenario = None
-    if args.mode == "finetune-sota" and args.medical_scenario == "auto":
-        print("🔍 Auto-detecting optimal medical scenario...")
-        medical_scenario = "multi_condition_screening"  # Default, will be refined after data analysis
     data_module = SeqSetVAEDataModule(
         saved_dir=args.data_dir,
         params_map_path=args.params_map_path,
@@ -243,46 +226,6 @@ def main():
     transformer_heads = config.transformer_heads
     transformer_layers = config.transformer_layers
 
-    # SOTA mode: Finalize medical scenario selection
-    if args.mode == "finetune-sota":
-        if args.medical_scenario != "auto":
-            medical_scenario = args.medical_scenario
-        else:
-            # Try to detect from data characteristics
-            try:
-                data_module.setup()
-                from collections import Counter
-                label_counter = Counter()
-                sample_count = 0
-                
-                for batch in data_module.train_dataloader():
-                    labels = batch.get('label')
-                    if labels is not None:
-                        label_counter.update(labels.view(-1).tolist())
-                        sample_count += len(labels)
-                    if sample_count >= 1000:  # Sample enough data
-                        break
-                
-                # Calculate imbalance ratio
-                if len(label_counter) >= 2:
-                    sorted_counts = sorted(label_counter.values())
-                    imbalance_ratio = sorted_counts[0] / sorted_counts[-1] if sorted_counts[-1] > 0 else 1.0
-                    medical_scenario = get_recommended_strategy(imbalance_ratio)
-                    print(f"🎯 Detected imbalance ratio: {imbalance_ratio:.3f}")
-                    print(f"🏥 Selected medical scenario: {medical_scenario}")
-                else:
-                    medical_scenario = "multi_condition_screening"
-            except Exception as e:
-                print(f"⚠️ Auto-detection failed: {e}")
-                medical_scenario = "multi_condition_screening"
-        
-        print(f"📋 SOTA Configuration:")
-        sota_config = MEDICAL_SOTA_CONFIGS[medical_scenario]
-        print(f"   - Scenario: {medical_scenario}")
-        print(f"   - Description: {sota_config['description']}")
-        print(f"   - Focal α: {sota_config['focal_alpha']}, γ: {sota_config['focal_gamma']}")
-        print(f"   - EMA decay: {sota_config['ema_decay']}")
-
     print("🧠 Building model...")
     if args.mode == 'pretrain':
         print("📋 Using SeqSetVAEPretrain - maintains original design for representation learning")
@@ -316,21 +259,12 @@ def main():
         monitor_metric = 'val_loss'
         monitor_mode = 'min'
     else:
-        # Finetune mode (both regular and SOTA)
-        if args.mode == "finetune-sota":
-            print("🏆 Using SeqSetVAE - SOTA MODE with advanced medical optimization")
-            sota_config = MEDICAL_SOTA_CONFIGS[medical_scenario]
-            focal_alpha_final = adaptive_alpha if adaptive_alpha is not None else sota_config['focal_alpha']
-            focal_gamma_final = sota_config['focal_gamma']
-            medical_scenario_param = medical_scenario
-            checkpoint_name = f"SeqSetVAE_sota_{medical_scenario}"
-        else:
-            print("📋 Using SeqSetVAE - FINETUNE MODE with simplified VAE feature fusion")
-            focal_alpha_final = adaptive_alpha if adaptive_alpha is not None else config.focal_alpha
-            focal_gamma_final = config.focal_gamma
-            medical_scenario_param = "multi_condition_screening"  # Default
-            checkpoint_name = "SeqSetVAE_finetune"
-            
+        # Finetune mode (single path)
+        print("📋 Using SeqSetVAE - FINETUNE MODE (classifier-only)")
+        focal_alpha_final = adaptive_alpha if adaptive_alpha is not None else config.focal_alpha
+        focal_gamma_final = config.focal_gamma
+        checkpoint_name = "SeqSetVAE_finetune"
+
         model = SeqSetVAE(
             input_dim=config.input_dim,
             reduced_dim=config.reduced_dim,
@@ -354,7 +288,7 @@ def main():
             use_focal_loss=True,
             focal_alpha=focal_alpha_final,
             focal_gamma=focal_gamma_final,
-            medical_scenario=medical_scenario_param,  # SOTA parameter
+            medical_scenario="multi_condition_screening",
             head_type=args.head_type,
             gaussian_use_time=args.gaussian_use_time,
         )
