@@ -109,8 +109,10 @@ class GaussianMILHead(nn.Module):
         gate_in = torch.cat(gate_feats, dim=-1)  # [B, S, 2D+1(+1)]
         a = torch.sigmoid(self.gate(gate_in)).squeeze(-1)  # [B, S]
 
-        # Weighted-sum evidence
+        # Weighted-mean evidence (length normalization by effective active sets)
         s_sum = (a * s).sum(dim=1)  # [B]
+        eff = a.sum(dim=1).clamp(min=1e-6)  # [B]
+        s_mean = s_sum / eff  # [B]
 
         # Noisy-OR style aggregation
         p_i = torch.sigmoid(s) * a  # [B, S]
@@ -121,7 +123,7 @@ class GaussianMILHead(nn.Module):
 
         # Mixture
         alpha = torch.sigmoid(self.alpha_logits)
-        s_total = alpha * s_sum + (1 - alpha) * s_or  # [B]
+        s_total = alpha * s_mean + (1 - alpha) * s_or  # [B]
 
         # Return 2-class logits for compatibility
         logits = torch.stack([-s_total, s_total], dim=1)  # [B, 2]
