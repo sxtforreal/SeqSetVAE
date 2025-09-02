@@ -544,6 +544,11 @@ class SeqSetVAE(pl.LightningModule):
         cls_head_type: str = "advanced",       # "advanced" | "mlp" | "linear"
         loss_mode: str = "focal",              # "focal" | "sota"
         poe_use_logvar: bool = False,
+        poe_weight_mode: str = "precision_softmax",
+        poe_temp: float = 1.0,
+        poe_clip_min: float = 1e-6,
+        poe_clip_max: float = 1e6,
+        poe_learn_temp: bool = False,
     ):
 
         super().__init__()
@@ -726,6 +731,13 @@ class SeqSetVAE(pl.LightningModule):
         self.cls_head_type = cls_head_type
         self.loss_mode = loss_mode
         self.poe_use_logvar = poe_use_logvar
+        self.poe_weight_mode = poe_weight_mode
+        self.poe_clip_min = poe_clip_min
+        self.poe_clip_max = poe_clip_max
+        self.poe_temperature = nn.Parameter(torch.tensor(float(poe_temp)), requires_grad=bool(poe_learn_temp))
+
+        # For PoE feature normalization when number of sets varies
+        self.poe_norm = nn.LayerNorm(latent_dim * (2 if poe_use_logvar else 1)) if aggregator_type == "poe" else None
 
         # Determine classifier input dim depending on aggregator
         if self.aggregator_type == "poe":
@@ -898,21 +910,41 @@ class SeqSetVAE(pl.LightningModule):
             aux_logits = torch.zeros_like(logits)
             return logits, aux_logits
 
-    @staticmethod
-    def _poe_aggregate(mu_list, logvar_list, prior_var: float = 1.0, eps: float = 1e-8):
-        """Product-of-Experts for diagonal Gaussians.
+    def _poe_aggregate(self, mu_list, logvar_list, prior_var: float = 1.0, eps: float = 1e-8):
+        """Weighted PoE in precision domain with temperature and clipping.
         Args:
             mu_list: list of [B, D]
             logvar_list: list of [B, D]
-        Returns:
-            mu_poe, var_poe  (both [B, D])
+        Returns: mu_poe, var_poe  (both [B, D])
         """
-        var_list = [torch.exp(lv).clamp_min(eps) for lv in logvar_list]
-        precisions = [1.0 / v for v in var_list]
-        sum_prec = torch.stack(precisions, dim=0).sum(dim=0) + (1.0 / max(prior_var, eps))
-        var_poe = 1.0 / sum_prec
-        weighted_mu = torch.stack([p * m for p, m in zip(precisions, mu_list)], dim=0).sum(dim=0)
-        mu_poe = var_poe * weighted_mu
+        var_list = [torch.exp(lv).clamp_min(eps) for lv in logvar_list]  # [B,D]
+        prec_list = [v.reciprocal() for v in var_list]                    # τ_i = 1/σ²
+
+        # Compute weights w_i
+        if self.poe_weight_mode == "precision_softmax":
+            # confidence ~ mean precision per set, temperature T controls sharpness
+            conf = torch.stack([p.mean(dim=-1) for p in prec_list], dim=0)  # [S,B]
+            T = torch.clamp(self.poe_temperature, min=1e-3).to(conf.device)
+            w = torch.softmax(conf / T, dim=0)  # [S,B]
+            # expand to [S,B,1] and broadcast over D
+            w_exp = w.unsqueeze(-1)
+        else:
+            # uniform
+            S = len(prec_list)
+            w_exp = torch.ones((S, prec_list[0].size(0), 1), device=prec_list[0].device) / float(S)
+
+        # weighted precision sum with clipping
+        stacked_prec = torch.stack(prec_list, dim=0)                        # [S,B,D]
+        sum_prec = (w_exp * stacked_prec).sum(dim=0)                        # [B,D]
+        sum_prec = sum_prec.clamp(min=self.poe_clip_min, max=self.poe_clip_max)
+        # add prior precision
+        sum_prec = sum_prec + (1.0 / max(prior_var, eps))
+        var_poe = sum_prec.reciprocal()
+
+        # weighted numerator for mean
+        stacked_mu = torch.stack(mu_list, dim=0)                             # [S,B,D]
+        num = (w_exp * stacked_prec * stacked_mu).sum(dim=0)                # [B,D]
+        mu_poe = var_poe * num
         return mu_poe, var_poe
 
     def get_current_beta(self):
