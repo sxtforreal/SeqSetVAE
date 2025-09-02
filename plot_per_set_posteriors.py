@@ -21,9 +21,11 @@ PARAMS_MAP = \
 LABELS_PATH = \
     "/home/sunx/data/aiiih/data/mimic/processed/oc.csv"
 
-# 输出图像
-OUT_FIG_MEAN = "per_set_posteriors_mean_5pos5neg.png"
-OUT_FIG_VAR = "per_set_posteriors_var_5pos5neg.png"
+# 输出图像（正/负样本 × mean/var）
+OUT_POS_MEAN = "heatmap_pos_mean.png"
+OUT_POS_VAR = "heatmap_pos_var.png"
+OUT_NEG_MEAN = "heatmap_neg_mean.png"
+OUT_NEG_VAR = "heatmap_neg_var.png"
 
 
 def build_model(device: torch.device) -> SeqSetVAEPretrain:
@@ -97,106 +99,89 @@ def encode_sets_batch(set_encoder, sets, device: torch.device):
     return mu.squeeze(1), logvar.squeeze(1)  # [S,D]
 
 
-def collect_patients_points(model: SeqSetVAEPretrain, dl, device: torch.device,
-                            num_pos: int = 5, num_neg: int = 5):
-    """从测试集中收集 5 个正样本和 5 个负样本。
-    对每个被选中的病人，提取其每个 set 的后验分布均值（mu）的“逐维平均值”。
-
-    返回一个列表，每个元素为 dict：
-        {"label": 0/1, "x": np.ndarray[S], "y_mean": np.ndarray[S], "y_var": np.ndarray[S]}
-    其中 x 为 set 的索引（0..S-1），y_mean 为 mean(mu)（按特征维求平均），y_var 为 mean(var)。
+def collect_one_pos_one_neg_matrices(model: SeqSetVAEPretrain, dl, device: torch.device):
     """
-    pos_cnt, neg_cnt = 0, 0
-    selected = []
+    选择一个正样本和一个负样本；对每个样本提取每个 set 的后验（最后一层）mu 与 var，
+    返回形如：
+        pos = {"label":1, "mu": np.ndarray[D,S], "var": np.ndarray[D,S]}
+        neg = {"label":0, "mu": np.ndarray[D,S], "var": np.ndarray[D,S]}
+    其中 D=config.latent_dim，S=该病人的 set 数；矩阵按 [维度×set] 排列，方便画热图。
+    """
+    pos_rec, neg_rec = None, None
     amp = torch.cuda.is_available()
 
     with torch.inference_mode(), torch.cuda.amp.autocast(
         enabled=amp, dtype=(torch.float16 if amp else torch.float32)
     ):
-        for bidx, batch in enumerate(dl):
+        for batch in dl:
+            # 移动到设备
             for k, v in list(batch.items()):
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
 
+            # 拆分为该 batch（通常为 1 个病人）的 set 列表
             pats = model._split_sets(
-                batch["var"],
-                batch["val"],
-                batch["minute"],
-                batch["set_id"],
-                batch.get("padding_mask"),
+                batch["var"], batch["val"], batch["minute"], batch["set_id"], batch.get("padding_mask")
             )
 
             for i, sets in enumerate(pats):
                 label = int(batch["label"][i].item())
-                need_pos = (label == 1 and pos_cnt < num_pos)
-                need_neg = (label == 0 and neg_cnt < num_neg)
-                if not (need_pos or need_neg):
-                    continue
-
                 mu_b, logvar_b = encode_sets_batch(model.set_encoder, sets, device)
                 if mu_b is None:
                     continue
+                var_b = torch.exp(logvar_b)  # [S, D]
 
-                # 逐 set 的均值/方差（对特征维做平均）并以 set 索引为横坐标
-                var_b = torch.exp(logvar_b)
-                S = mu_b.shape[0]
-                x_vals = np.arange(S)
-                y_mean_vals = mu_b.mean(dim=-1).float().cpu().numpy()  # [S]
-                y_var_vals = var_b.mean(dim=-1).float().cpu().numpy()   # [S]
+                # 转置为 [D, S] 便于以 y=维度, x=set 作图
+                mu_mat = mu_b.float().T.cpu().numpy()
+                var_mat = var_b.float().T.cpu().numpy()
 
-                selected.append({
-                    "label": label,
-                    "x": x_vals,
-                    "y_mean": y_mean_vals,
-                    "y_var": y_var_vals,
-                })
+                rec = {"label": label, "mu": mu_mat, "var": var_mat}
+                if label == 1 and pos_rec is None:
+                    pos_rec = rec
+                if label == 0 and neg_rec is None:
+                    neg_rec = rec
+                if pos_rec is not None and neg_rec is not None:
+                    return pos_rec, neg_rec
 
-                if label == 1:
-                    pos_cnt += 1
-                else:
-                    neg_cnt += 1
-
-                if pos_cnt >= num_pos and neg_cnt >= num_neg:
-                    break
-
-            if pos_cnt >= num_pos and neg_cnt >= num_neg:
-                break
-
-    print(f"Selected patients: pos={pos_cnt}, neg={neg_cnt}")
-    if pos_cnt < num_pos or neg_cnt < num_neg:
-        print("Warning: dataset did not contain enough positives/negatives to meet the request.")
-    return selected
+    return pos_rec, neg_rec
 
 
-def plot_patients_sets(selected, out_file: str, y_key: str = "y_mean", y_axis_label: str = "mean"):
-    plt.figure(figsize=(8, 7))
-    legend_pos_added = False
-    legend_neg_added = False
+def plot_heatmap(matrix: np.ndarray, title: str, out_file: str, value_type: str = "mean"):
+    """
+    画单个样本的热图：matrix 形状为 [D, S]，y=维度(0..D-1)，x=set index(0..S-1)。
+    value_type: "mean" 使用对称色轴；"var" 使用非负色轴并做分位裁剪。
+    """
+    plt.figure(figsize=(10, 6))
 
-    for rec in selected:
-        color = "tab:orange" if rec["label"] == 1 else "tab:blue"
-        label_name = "pos" if rec["label"] == 1 else "neg"
-        show_label = (rec["label"] == 1 and not legend_pos_added) or \
-                     (rec["label"] == 0 and not legend_neg_added)
-
-        plt.plot(
-            rec["x"], rec[y_key],
-            "-o",
-            color=color,
-            linewidth=1.2,
-            markersize=4,
-            alpha=0.9,
-            label=(label_name if show_label else None),
-        )
-
-        if rec["label"] == 1:
-            legend_pos_added = True
+    # 色轴范围
+    if value_type == "mean":
+        vmax = float(np.nanmax(np.abs(matrix))) if matrix.size > 0 else 1.0
+        vmax = vmax if vmax > 1e-6 else 1.0
+        vmin = -vmax
+        cmap = "RdBu_r"
+    else:
+        # 方差：0..p95，避免极端值拉伸
+        if matrix.size == 0:
+            vmin, vmax = 0.0, 1.0
         else:
-            legend_neg_added = True
+            vmin = 0.0
+            vmax = float(np.percentile(matrix, 95))
+            vmax = vmax if vmax > 1e-6 else float(np.nanmax(matrix) + 1e-6)
+        cmap = "viridis"
 
-    plt.xlabel("set idx")
-    plt.ylabel(y_axis_label)
-    plt.legend()
+    im = plt.imshow(
+        matrix,
+        aspect="auto",
+        origin="lower",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xlabel("set index")
+    plt.ylabel("latent dimension")
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(out_file, dpi=240)
     print(f"Saved {out_file}")
@@ -206,13 +191,23 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(device)
     dl = build_dataloader()
-    selected = collect_patients_points(model, dl, device, num_pos=5, num_neg=5)
-    if len(selected) == 0:
-        print("No patients selected; nothing to plot.")
+    pos_rec, neg_rec = collect_one_pos_one_neg_matrices(model, dl, device)
+
+    if pos_rec is None and neg_rec is None:
+        print("No positive or negative sample found; nothing to plot.")
         return
-    # 保存两张图：一张 y=mean(mu)，一张 y=mean(var)
-    plot_patients_sets(selected, OUT_FIG_MEAN, y_key="y_mean", y_axis_label="mean")
-    plot_patients_sets(selected, OUT_FIG_VAR, y_key="y_var", y_axis_label="var")
+
+    if pos_rec is not None:
+        plot_heatmap(pos_rec["mu"], title="Positive sample - mean(μ)", out_file=OUT_POS_MEAN, value_type="mean")
+        plot_heatmap(pos_rec["var"], title="Positive sample - var(σ²)", out_file=OUT_POS_VAR, value_type="var")
+    else:
+        print("No positive sample found.")
+
+    if neg_rec is not None:
+        plot_heatmap(neg_rec["mu"], title="Negative sample - mean(μ)", out_file=OUT_NEG_MEAN, value_type="mean")
+        plot_heatmap(neg_rec["var"], title="Negative sample - var(σ²)", out_file=OUT_NEG_VAR, value_type="var")
+    else:
+        print("No negative sample found.")
 
 
 if __name__ == "__main__":
