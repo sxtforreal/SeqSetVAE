@@ -130,6 +130,21 @@ def main():
     parser.add_argument("--target_auc", type=float, default=0.90, help="Target AUC score for SOTA mode")
     parser.add_argument("--target_auprc", type=float, default=0.50, help="Target AUPRC score for SOTA mode")
 
+    # Finetune classifier/aggregator options
+    parser.add_argument("--aggregator", type=str, default="transformer", choices=["transformer", "poe"],
+                        help="How to aggregate per-set latents into a fixed-size sequence feature")
+    parser.add_argument("--cls_head_type", type=str, default="advanced", choices=["advanced", "mlp", "linear"],
+                        help="Classification head type")
+    parser.add_argument("--poe_use_logvar", action="store_true", help="For PoE, concatenate logvar with mu as features")
+    parser.add_argument("--poe_weight_mode", type=str, default="precision_softmax", choices=["uniform", "precision_softmax"],
+                        help="Weighting strategy for PoE across sets")
+    parser.add_argument("--poe_temp", type=float, default=1.0, help="Temperature for PoE softmax weights")
+    parser.add_argument("--poe_clip_min", type=float, default=1e-6, help="Min precision clip for PoE")
+    parser.add_argument("--poe_clip_max", type=float, default=1e6, help="Max precision clip for PoE")
+    parser.add_argument("--poe_learn_temp", action="store_true", help="Learn PoE temperature")
+    parser.add_argument("--loss_mode", type=str, default="focal", choices=["focal", "sota"],
+                        help="Loss strategy in finetune: focal-only or sota composite")
+
     args = parser.parse_args()
 
     # Prepare unified output dirs
@@ -351,8 +366,18 @@ def main():
             focal_alpha=focal_alpha_final,
             focal_gamma=focal_gamma_final,
             medical_scenario=medical_scenario_param,  # SOTA parameter
+            aggregator_type=args.aggregator,
+            cls_head_type=args.cls_head_type,
+            loss_mode=args.loss_mode,
+            poe_use_logvar=args.poe_use_logvar,
+            poe_weight_mode=args.poe_weight_mode,
+            poe_temp=args.poe_temp,
+            poe_clip_min=args.poe_clip_min,
+            poe_clip_max=args.poe_clip_max,
+            poe_learn_temp=args.poe_learn_temp,
         )
-        monitor_metric = 'val_auc'
+        # Prefer AUPRC when optimizing for imbalanced data
+        monitor_metric = 'val_auprc'
         monitor_mode = 'max'
 
         # Note: Pretrained weights are now loaded automatically in SeqSetVAE constructor
@@ -364,6 +389,10 @@ def main():
         trainable_params = 0
         for name, param in model.named_parameters():
             if name.startswith('cls_head'):
+                param.requires_grad = True
+                trainable_params += param.numel()
+                print(f"   ✅ Trainable: {name} ({param.numel():,} params)")
+            elif name.startswith('poe_') or name.startswith('poe'):  # allow PoE scalars/norm to learn
                 param.requires_grad = True
                 trainable_params += param.numel()
                 print(f"   ✅ Trainable: {name} ({param.numel():,} params)")
