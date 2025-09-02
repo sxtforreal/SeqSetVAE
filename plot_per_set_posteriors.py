@@ -99,11 +99,11 @@ def encode_sets_batch(set_encoder, sets, device: torch.device):
 def collect_patients_points(model: SeqSetVAEPretrain, dl, device: torch.device,
                             num_pos: int = 5, num_neg: int = 5):
     """从测试集中收集 5 个正样本和 5 个负样本。
-    对每个被选中的病人，提取其每个 set 的后验分布均值与方差的“逐维平均值”。
+    对每个被选中的病人，提取其每个 set 的后验分布均值（mu）的“逐维平均值”。
 
     返回一个列表，每个元素为 dict：
         {"label": 0/1, "x": np.ndarray[S], "y": np.ndarray[S]}
-    其中 x 为 mean(mu)（按特征维求平均），y 为 mean(var)。
+    其中 x 为 set 的索引（0..S-1），y 为 mean(mu)（按特征维求平均）。
     """
     pos_cnt, neg_cnt = 0, 0
     selected = []
@@ -136,10 +136,10 @@ def collect_patients_points(model: SeqSetVAEPretrain, dl, device: torch.device,
                 if mu_b is None:
                     continue
 
-                # 逐 set 的均值与方差（对角高斯），对特征维做平均以得到标量
-                var_b = torch.exp(logvar_b)
-                x_vals = mu_b.mean(dim=-1).float().cpu().numpy()  # [S]
-                y_vals = var_b.mean(dim=-1).float().cpu().numpy()  # [S]
+                # 逐 set 的均值（对特征维做平均）并以 set 索引为横坐标
+                S = mu_b.shape[0]
+                x_vals = np.arange(S)
+                y_vals = mu_b.mean(dim=-1).float().cpu().numpy()  # [S]
 
                 selected.append({
                     "label": label,
@@ -190,8 +190,8 @@ def plot_patients_sets(selected, out_file: str = OUT_FIG):
         else:
             legend_neg_added = True
 
-    plt.xlabel("mean(mu) per set")
-    plt.ylabel("mean(var) per set")
+    plt.xlabel("set idx")
+    plt.ylabel("mean")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_file, dpi=240)
