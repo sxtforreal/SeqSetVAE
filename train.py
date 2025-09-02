@@ -124,6 +124,9 @@ def main():
     # Classification head selection
     parser.add_argument("--head_type", type=str, default="advanced", choices=["advanced", "gaussian_mil"], help="Classification head type")
     parser.add_argument("--gaussian_use_time", action="store_true", help="Use time feature in Gaussian-MIL gate")
+    # Classification loss/aggregation options
+    parser.add_argument("--classification_loss", type=str, default="focal", choices=["focal", "ce", "sota"], help="Which classification loss to use in finetune")
+    parser.add_argument("--aggregator", type=str, default="mean_var", choices=["mean_var", "attn"], help="Sequence pooling for classifier features")
 
     # (Removed SOTA finetune mode and related arguments)
 
@@ -291,6 +294,8 @@ def main():
             medical_scenario="multi_condition_screening",
             head_type=args.head_type,
             gaussian_use_time=args.gaussian_use_time,
+            classification_loss=args.classification_loss,
+            aggregator=args.aggregator,
         )
         monitor_metric = 'val_auc'
         monitor_mode = 'max'

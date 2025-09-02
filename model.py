@@ -654,6 +654,9 @@ class SeqSetVAE(pl.LightningModule):
         medical_scenario: str = "multi_condition_screening",  # SOTA: Medical scenario for loss strategy
         head_type: str = "advanced",  # "advanced" | "gaussian_mil"
         gaussian_use_time: bool = True,
+        # New options
+        classification_loss: str = "focal",  # "focal" | "ce" | "sota"
+        aggregator: str = "mean_var",        # "attn" | "mean_var"
     ):
 
         super().__init__()
@@ -851,6 +854,11 @@ class SeqSetVAE(pl.LightningModule):
         self.val_auprc = AveragePrecision(task=task_type, num_classes=num_classes)
         self.val_acc = Accuracy(task=task_type, num_classes=num_classes)
         self.num_classes = num_classes
+        # Loss/aggregation options
+        self.loss_type = classification_loss
+        self.aggregator_type = aggregator
+        # Projection for mean-variance aggregation to latent_dim
+        self.meanvar_projection = nn.Linear(2 * latent_dim, latent_dim)
 
         # Training hyperparameters
         self.w = w
@@ -1412,6 +1420,13 @@ class SeqSetVAE(pl.LightningModule):
         Uses attention-weighted pooling for better representation.
         """
         B, S, D = h_t.shape
+
+        # Optional mean/variance aggregation across the sequence dimension
+        if getattr(self, 'aggregator_type', 'attn') == 'mean_var':
+            seq_mean = h_t.mean(dim=1)                 # [B, D]
+            seq_var = h_t.var(dim=1, unbiased=False)   # [B, D]
+            combined = torch.cat([seq_mean, seq_var], dim=-1)  # [B, 2D]
+            return self.meanvar_projection(combined)   # [B, D]
         
         # Use last token (most recent) as primary representation
         last_token = h_t[:, -1, :]  # [B, D] - most recent representation
@@ -1625,85 +1640,56 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # 🏆 SOTA Loss Strategy: 基于2024年最新学术研究
-        # 集成多项前沿技术：SoftAdapt, Asymmetric Loss, Self-Distillation, Gradient Adaptation
-        
-        # 初始化SOTA损失策略 (懒加载，仅在第一次调用时创建)
-        if not hasattr(self, '_sota_loss_strategy'):
-            from losses import get_sota_loss_strategy
-            # 根据医疗场景选择最优策略
-            medical_scenario = getattr(self, 'medical_scenario', 'multi_condition_screening')
-            self._sota_loss_strategy = get_sota_loss_strategy(
-                medical_scenario=medical_scenario,
-                num_classes=self.num_classes
-            )
-            print(f"🔬 Initialized SOTA loss strategy for: {medical_scenario}")
-        
-        # 获取当前训练步骤作为epoch近似
-        current_epoch = getattr(self, 'current_step', 0) // 100  # 假设每100步为一个epoch
-        
-        # 收集主头和辅助头的参数用于梯度分析（兼容不同 head）
-        if self.head_type == "gaussian_mil":
-            main_params = [self.cls_head.mu, self.cls_head.log_tau2, self.cls_head.log_prior]
-            aux_params = list(self.cls_head.gate.parameters())
-        else:
-            main_params = list(self.cls_head['classifier'].parameters()) + list(self.cls_head['pre_classifier'].parameters())
-            aux_params = list(self.cls_head['aux_classifier'].parameters())
-        
-        try:
-            # 🚀 使用SOTA损失策略计算损失
-            pred_loss, loss_breakdown = self._sota_loss_strategy.compute_loss(
-                main_logits=logits,
-                aux_logits=aux_logits,
-                labels=label,
-                epoch=current_epoch,
-                main_params=main_params,
-                aux_params=aux_params
-            )
-            
-            # 存储详细的损失分解用于监控
-            if stage == "train":
-                for key, value in loss_breakdown.items():
-                    if isinstance(value, torch.Tensor):
-                        setattr(self, f'_last_{key}', value.detach())
-            
-        except Exception as e:
-            # 降级到简化策略（确保训练不会中断）
-            print(f"⚠️ SOTA loss computation failed, falling back to simplified strategy: {e}")
-            
-            # 主损失：Focal Loss
-            if self.focal_loss_fn is not None:
-                main_pred_loss = self.focal_loss_fn(logits, label)
+        # --- Classification loss selection ---
+        loss_mode = getattr(self, 'loss_type', 'sota')
+        if loss_mode == 'sota':
+            # 🏆 SOTA Loss Strategy
+            if not hasattr(self, '_sota_loss_strategy'):
+                from losses import get_sota_loss_strategy
+                medical_scenario = getattr(self, 'medical_scenario', 'multi_condition_screening')
+                self._sota_loss_strategy = get_sota_loss_strategy(
+                    medical_scenario=medical_scenario,
+                    num_classes=self.num_classes
+                )
+                print(f"🔬 Initialized SOTA loss strategy for: {medical_scenario}")
+
+            current_epoch = getattr(self, 'current_step', 0) // 100
+
+            if self.head_type == "gaussian_mil":
+                main_params = [self.cls_head.mu, self.cls_head.log_tau2, self.cls_head.log_prior]
+                aux_params = list(self.cls_head.gate.parameters())
             else:
-                main_pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
-                
-            # 辅助损失：不对称损失 (处理极端不平衡)
+                main_params = list(self.cls_head['classifier'].parameters()) + list(self.cls_head['pre_classifier'].parameters())
+                aux_params = list(self.cls_head['aux_classifier'].parameters())
+
             try:
-                from losses import AsymmetricLoss
-                if not hasattr(self, '_asymmetric_loss'):
-                    self._asymmetric_loss = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05)
-                aux_pred_loss = self._asymmetric_loss(aux_logits, label)
-            except:
-                aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.15)
-            
-            # EMA自蒸馏损失
-            if not hasattr(self, '_ema_teacher'):
-                self._ema_teacher = F.softmax(logits.detach(), dim=1)
+                pred_loss, loss_breakdown = self._sota_loss_strategy.compute_loss(
+                    main_logits=logits,
+                    aux_logits=aux_logits,
+                    labels=label,
+                    epoch=current_epoch,
+                    main_params=main_params,
+                    aux_params=aux_params
+                )
+                if stage == "train":
+                    for key, value in loss_breakdown.items():
+                        if isinstance(value, torch.Tensor):
+                            setattr(self, f'_last_{key}', value.detach())
+            except Exception as e:
+                print(f"⚠️ SOTA loss computation failed, falling back to focal: {e}")
+                if self.focal_loss_fn is not None:
+                    pred_loss = self.focal_loss_fn(logits, label)
+                else:
+                    pred_loss = F.cross_entropy(logits, label)
+        elif loss_mode == 'focal':
+            # Pure Focal Loss on main logits
+            if self.focal_loss_fn is not None:
+                pred_loss = self.focal_loss_fn(logits, label)
             else:
-                self._ema_teacher = 0.999 * self._ema_teacher + 0.001 * F.softmax(logits.detach(), dim=1)
-            
-            distill_loss = F.kl_div(
-                F.log_softmax(aux_logits / 3.0, dim=1),
-                self._ema_teacher / 3.0,
-                reduction='batchmean'
-            ) * 9.0  # temperature^2 scaling
-            
-            # 动态权重组合
-            main_weight = 0.6
-            aux_weight = 0.3  
-            distill_weight = 0.1
-            
-            pred_loss = main_weight * main_pred_loss + aux_weight * aux_pred_loss + distill_weight * distill_loss
+                pred_loss = F.cross_entropy(logits, label)
+        else:
+            # Cross-entropy
+            pred_loss = F.cross_entropy(logits, label)
 
         # FINETUNE MODE: Only classification loss, no recon/KL loss
         total_loss = pred_loss
