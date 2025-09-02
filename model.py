@@ -539,6 +539,11 @@ class SeqSetVAE(pl.LightningModule):
         focal_gamma: float = 2.0,
         focal_alpha = None,
         medical_scenario: str = "multi_condition_screening",  # SOTA: Medical scenario for loss strategy
+        # New finetune options
+        aggregator_type: str = "transformer",  # "transformer" or "poe"
+        cls_head_type: str = "advanced",       # "advanced" | "mlp" | "linear"
+        loss_mode: str = "focal",              # "focal" | "sota"
+        poe_use_logvar: bool = False,
     ):
 
         super().__init__()
@@ -716,9 +721,32 @@ class SeqSetVAE(pl.LightningModule):
             m,
         )
         
-        # Advanced classification head for better AUC/AUPRC performance
-        self.cls_head = self._build_advanced_classifier(latent_dim, num_classes)
-        
+        # Aggregation/classifier configuration
+        self.aggregator_type = aggregator_type
+        self.cls_head_type = cls_head_type
+        self.loss_mode = loss_mode
+        self.poe_use_logvar = poe_use_logvar
+
+        # Determine classifier input dim depending on aggregator
+        if self.aggregator_type == "poe":
+            classifier_input_dim = latent_dim * (2 if poe_use_logvar else 1)
+        else:
+            classifier_input_dim = latent_dim
+
+        # Build classification head
+        if self.cls_head_type == "advanced":
+            self.cls_head = self._build_advanced_classifier(classifier_input_dim, num_classes)
+        elif self.cls_head_type == "mlp":
+            self.cls_head = nn.Sequential(
+                nn.Linear(classifier_input_dim, classifier_input_dim // 2),
+                nn.LayerNorm(classifier_input_dim // 2),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(classifier_input_dim // 2, num_classes),
+            )
+        else:  # linear
+            self.cls_head = nn.Linear(classifier_input_dim, num_classes)
+
         # Learnable gate for pooling between last_token and attention pooling
         self.pooling_gate = nn.Parameter(torch.tensor(0.7))
         
@@ -860,6 +888,32 @@ class SeqSetVAE(pl.LightningModule):
         aux_logits = self.cls_head['aux_classifier'](enhanced_features)
         
         return main_logits, aux_logits
+
+    def _forward_classifier(self, features):
+        """Dispatch to the configured classifier head. Returns (logits, aux_logits)."""
+        if self.cls_head_type == "advanced":
+            return self._forward_advanced_classifier(features)
+        else:
+            logits = self.cls_head(features)
+            aux_logits = torch.zeros_like(logits)
+            return logits, aux_logits
+
+    @staticmethod
+    def _poe_aggregate(mu_list, logvar_list, prior_var: float = 1.0, eps: float = 1e-8):
+        """Product-of-Experts for diagonal Gaussians.
+        Args:
+            mu_list: list of [B, D]
+            logvar_list: list of [B, D]
+        Returns:
+            mu_poe, var_poe  (both [B, D])
+        """
+        var_list = [torch.exp(lv).clamp_min(eps) for lv in logvar_list]
+        precisions = [1.0 / v for v in var_list]
+        sum_prec = torch.stack(precisions, dim=0).sum(dim=0) + (1.0 / max(prior_var, eps))
+        var_poe = 1.0 / sum_prec
+        weighted_mu = torch.stack([p * m for p, m in zip(precisions, mu_list)], dim=0).sum(dim=0)
+        mu_poe = var_poe * weighted_mu
+        return mu_poe, var_poe
 
     def get_current_beta(self):
         """Calculate current beta value with support for warmup and annealing"""
@@ -1138,71 +1192,79 @@ class SeqSetVAE(pl.LightningModule):
         else:
             kl_total = torch.tensor(0.0, device=z_prims[0].device)
         
-        z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
-        pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
-        
-        # Apply positional and time encoding
-        z_seq = self._apply_positional_encoding(z_seq, pos_tensor, None)
-        
-        # Add layer normalization
-        z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
-        
-        # Build causal + relative-time bias mask
-        minutes_1d = pos_tensor.squeeze(0) if pos_tensor.dim() == 2 else pos_tensor.view(-1)
-        attn_mask = self._build_causal_time_bias_mask(minutes_1d)
-        h_seq = self.transformer(z_seq, mask=attn_mask)
-        
-        # Apply post-transformer normalization for better feature quality
-        h_seq = self.post_transformer_norm(h_seq)
-        
-        # Classification-only finetune mode skips reconstruction entirely
-        if self.classification_only:
-            recon_loss_total = torch.tensor(0.0, device=h_seq.device)
+        # Aggregation path: transformer (default) or PoE
+        if self.aggregator_type == "poe":
+            # Product-of-Experts across sets -> single Gaussian per patient
+            mu_stack = []
+            logvar_stack = []
+            for i in range(S):
+                # Recover original mu/logvar via inverse of fusion: use z_list stored in all_z_lists
+                z_list_i = all_z_lists[i]
+                _, mu_i, logvar_i = z_list_i[-1]
+                mu_stack.append(mu_i.squeeze(1))
+                logvar_stack.append(logvar_i.squeeze(1))
+            mu_poe, var_poe = self._poe_aggregate(mu_stack, logvar_stack)
+            feat = mu_poe if not self.poe_use_logvar else torch.cat([mu_poe, torch.log(var_poe + 1e-8)], dim=-1)
+            enhanced_features = F.layer_norm(feat, [feat.size(-1)])
+            recon_loss_total = torch.tensor(0.0, device=enhanced_features.device) if self.classification_only else kl_total * 0.0
         else:
-            recon_loss_total = 0.0
-            valid_sets = 0
-            last_recon_list = []
-            last_target_list = []
-            for idx, s_dict in enumerate(sets):
-                N_t = s_dict["var"].size(1)
-                recon = self.decoder(h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3))
-                if self.setvae.setvae.dim_reducer is not None:
-                    reduced = self.setvae.setvae.dim_reducer(s_dict["var"]) 
-                else:
-                    reduced = s_dict["var"]
-                norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
-                reduced_normalized = reduced / (norms + 1e-8)
-                target_x = reduced_normalized * s_dict["val"]
-                # store for visualization
+            z_seq = torch.stack(z_prims, dim=1)  # [B, S, latent]
+            pos_tensor = torch.stack(pos_list, dim=1)  # [B, S]
+            # Apply positional and time encoding
+            z_seq = self._apply_positional_encoding(z_seq, pos_tensor, None)
+            # Add layer normalization
+            z_seq = F.layer_norm(z_seq, [z_seq.size(-1)])
+            # Build causal + relative-time bias mask
+            minutes_1d = pos_tensor.squeeze(0) if pos_tensor.dim() == 2 else pos_tensor.view(-1)
+            attn_mask = self._build_causal_time_bias_mask(minutes_1d)
+            h_seq = self.transformer(z_seq, mask=attn_mask)
+            # Apply post-transformer normalization for better feature quality
+            h_seq = self.post_transformer_norm(h_seq)
+
+            # Classification-only finetune mode skips reconstruction entirely
+            if self.classification_only:
+                recon_loss_total = torch.tensor(0.0, device=h_seq.device)
+            else:
+                recon_loss_total = 0.0
+                valid_sets = 0
+                last_recon_list = []
+                last_target_list = []
+                for idx, s_dict in enumerate(sets):
+                    N_t = s_dict["var"].size(1)
+                    recon = self.decoder(h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3))
+                    if self.setvae.setvae.dim_reducer is not None:
+                        reduced = self.setvae.setvae.dim_reducer(s_dict["var"]) 
+                    else:
+                        reduced = s_dict["var"]
+                    norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+                    reduced_normalized = reduced / (norms + 1e-8)
+                    target_x = reduced_normalized * s_dict["val"]
+                    try:
+                        last_recon_list.append(recon.detach())
+                        last_target_list.append(target_x.detach())
+                    except Exception:
+                        pass
+                    recon_loss_total += chamfer_recon_loss(recon, target_x)
+                    valid_sets += 1
+                if valid_sets > 0:
+                    recon_loss_total /= valid_sets
                 try:
-                    last_recon_list.append(recon.detach())
-                    last_target_list.append(target_x.detach())
+                    self._last_recon_list = last_recon_list
+                    self._last_target_list = last_target_list
+                    self._last_recon_cat = torch.cat(last_recon_list, dim=1) if len(last_recon_list) > 0 else None
+                    self._last_target_cat = torch.cat(last_target_list, dim=1) if len(last_target_list) > 0 else None
                 except Exception:
-                    pass
-                recon_loss_total += chamfer_recon_loss(recon, target_x)
-                valid_sets += 1
-            if valid_sets > 0:
-                recon_loss_total /= valid_sets
-            # expose concatenated tensors if possible
-            try:
-                self._last_recon_list = last_recon_list
-                self._last_target_list = last_target_list
-                self._last_recon_cat = torch.cat(last_recon_list, dim=1) if len(last_recon_list) > 0 else None
-                self._last_target_cat = torch.cat(last_target_list, dim=1) if len(last_target_list) > 0 else None
-            except Exception:
-                self._last_recon_cat = None
-                self._last_target_cat = None
-        
-        # Enhanced feature extraction using multi-scale pooling
-        enhanced_features = self._extract_enhanced_features(h_seq)
-        
-        # Alternative: Use attention-based pooling as fallback (deterministic)
-        if enhanced_features is None:
-            attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
-            enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
-        
-        # Classification with advanced classifier
-        main_logits, aux_logits = self._forward_advanced_classifier(enhanced_features)
+                    self._last_recon_cat = None
+                    self._last_target_cat = None
+
+            # Enhanced feature extraction using multi-scale pooling
+            enhanced_features = self._extract_enhanced_features(h_seq)
+            if enhanced_features is None:
+                attn_weights = F.softmax(torch.sum(h_seq * z_seq, dim=-1), dim=1)
+                enhanced_features = torch.sum(h_seq * attn_weights.unsqueeze(-1), dim=1)
+
+        # Classification via chosen head
+        main_logits, aux_logits = self._forward_classifier(enhanced_features)
         # Use main logits for primary predictions
         logits = main_logits
         
@@ -1477,30 +1539,33 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # 🏆 SOTA Loss Strategy: 基于2024年最新学术研究
-        # 集成多项前沿技术：SoftAdapt, Asymmetric Loss, Self-Distillation, Gradient Adaptation
-        
-        # 初始化SOTA损失策略 (懒加载，仅在第一次调用时创建)
-        if not hasattr(self, '_sota_loss_strategy'):
-            from losses import get_sota_loss_strategy
-            # 根据医疗场景选择最优策略
-            medical_scenario = getattr(self, 'medical_scenario', 'multi_condition_screening')
-            self._sota_loss_strategy = get_sota_loss_strategy(
-                medical_scenario=medical_scenario,
-                num_classes=self.num_classes
-            )
-            print(f"🔬 Initialized SOTA loss strategy for: {medical_scenario}")
-        
-        # 获取当前训练步骤作为epoch近似
-        current_epoch = getattr(self, 'current_step', 0) // 100  # 假设每100步为一个epoch
-        
-        # 收集主头和辅助头的参数用于梯度分析
-        main_params = list(self.cls_head['classifier'].parameters()) + list(self.cls_head['pre_classifier'].parameters())
-        aux_params = list(self.cls_head['aux_classifier'].parameters())
-        
-        try:
-            # 🚀 使用SOTA损失策略计算损失
-            pred_loss, loss_breakdown = self._sota_loss_strategy.compute_loss(
+        # Loss computation: focal-only (default) or SOTA composite
+        if self.loss_mode == "focal":
+            if self.focal_loss_fn is not None:
+                pred_loss = self.focal_loss_fn(logits, label)
+            else:
+                pred_loss = F.cross_entropy(logits, label)
+        else:
+            # 🏆 SOTA Loss Strategy（保留向后兼容）
+            if not hasattr(self, '_sota_loss_strategy'):
+                from losses import get_sota_loss_strategy
+                medical_scenario = getattr(self, 'medical_scenario', 'multi_condition_screening')
+                self._sota_loss_strategy = get_sota_loss_strategy(
+                    medical_scenario=medical_scenario,
+                    num_classes=self.num_classes
+                )
+                print(f"🔬 Initialized SOTA loss strategy for: {medical_scenario}")
+
+            current_epoch = getattr(self, 'current_step', 0) // 100
+
+            # 参数收集仅对 advanced 头有效，其余分支传空避免错误
+            if isinstance(self.cls_head, nn.ModuleDict):
+                main_params = list(self.cls_head['classifier'].parameters()) + list(self.cls_head['pre_classifier'].parameters())
+                aux_params = list(self.cls_head['aux_classifier'].parameters())
+            else:
+                main_params, aux_params = [], []
+
+            pred_loss, _ = self._sota_loss_strategy.compute_loss(
                 main_logits=logits,
                 aux_logits=aux_logits,
                 labels=label,
@@ -1508,50 +1573,6 @@ class SeqSetVAE(pl.LightningModule):
                 main_params=main_params,
                 aux_params=aux_params
             )
-            
-            # 存储详细的损失分解用于监控
-            if stage == "train":
-                for key, value in loss_breakdown.items():
-                    if isinstance(value, torch.Tensor):
-                        setattr(self, f'_last_{key}', value.detach())
-            
-        except Exception as e:
-            # 降级到简化策略（确保训练不会中断）
-            print(f"⚠️ SOTA loss computation failed, falling back to simplified strategy: {e}")
-            
-            # 主损失：Focal Loss
-            if self.focal_loss_fn is not None:
-                main_pred_loss = self.focal_loss_fn(logits, label)
-            else:
-                main_pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
-                
-            # 辅助损失：不对称损失 (处理极端不平衡)
-            try:
-                from losses import AsymmetricLoss
-                if not hasattr(self, '_asymmetric_loss'):
-                    self._asymmetric_loss = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05)
-                aux_pred_loss = self._asymmetric_loss(aux_logits, label)
-            except:
-                aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.15)
-            
-            # EMA自蒸馏损失
-            if not hasattr(self, '_ema_teacher'):
-                self._ema_teacher = F.softmax(logits.detach(), dim=1)
-            else:
-                self._ema_teacher = 0.999 * self._ema_teacher + 0.001 * F.softmax(logits.detach(), dim=1)
-            
-            distill_loss = F.kl_div(
-                F.log_softmax(aux_logits / 3.0, dim=1),
-                self._ema_teacher / 3.0,
-                reduction='batchmean'
-            ) * 9.0  # temperature^2 scaling
-            
-            # 动态权重组合
-            main_weight = 0.6
-            aux_weight = 0.3  
-            distill_weight = 0.1
-            
-            pred_loss = main_weight * main_pred_loss + aux_weight * aux_pred_loss + distill_weight * distill_loss
 
         # FINETUNE MODE: Only classification loss, no recon/KL loss
         total_loss = pred_loss
@@ -1673,42 +1694,25 @@ class SeqSetVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.classification_only:
-            # Enhanced optimizer for advanced classifier architecture
-            cls_params = []
-            
-            # Collect parameters from advanced classifier with different LR groups
-            attention_params = []
-            classifier_params = []
-            
-            for name, module in self.cls_head.items():
-                if 'attention' in name:
-                    attention_params.extend(list(module.parameters()))
-                else:
-                    classifier_params.extend(list(module.parameters()))
-            
-            # Use differentiated learning rates for different components
-            cls_lr = self.cls_head_lr or (self.lr * 4.0)  # Higher LR for complex architecture
-            
-            param_groups = [
-                {
-                    'params': attention_params, 
-                    'lr': cls_lr * 0.8,  # Slightly lower LR for attention layers
-                    'weight_decay': 0.005,
-                    'name': 'attention'
-                },
-                {
-                    'params': classifier_params, 
-                    'lr': cls_lr,
-                    'weight_decay': 0.01,
-                    'name': 'classifier'
-                }
-            ]
-            
-            optimizer = AdamW(
-                param_groups,
-                betas=(0.9, 0.999),  # Standard AdamW betas
-                eps=1e-8,
-            )
+            # Optimizer for classification-only finetune
+            if isinstance(self.cls_head, nn.ModuleDict):
+                attention_params = []
+                classifier_params = []
+                for name, module in self.cls_head.items():
+                    if 'attention' in name:
+                        attention_params.extend(list(module.parameters()))
+                    else:
+                        classifier_params.extend(list(module.parameters()))
+                cls_lr = self.cls_head_lr or (self.lr * 4.0)
+                param_groups = [
+                    {'params': attention_params, 'lr': cls_lr * 0.8, 'weight_decay': 0.005, 'name': 'attention'},
+                    {'params': classifier_params, 'lr': cls_lr, 'weight_decay': 0.01, 'name': 'classifier'}
+                ]
+            else:
+                cls_lr = self.cls_head_lr or (self.lr * 4.0)
+                param_groups = [{'params': self.cls_head.parameters(), 'lr': cls_lr, 'weight_decay': 0.01, 'name': 'classifier'}]
+
+            optimizer = AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
         else:
             # Set different learning rates for different parts
             setvae_params = list(self.setvae.parameters())
@@ -1732,15 +1736,10 @@ class SeqSetVAE(pl.LightningModule):
         
         # Enhanced learning rate scheduler for advanced architecture
         if self.classification_only:
-            # Use cosine annealing with warm restarts for better convergence
-            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-            scheduler = CosineAnnealingWarmRestarts(
-                optimizer,
-                T_0=500,  # Initial restart period
-                T_mult=2,  # Multiply restart period by this factor
-                eta_min=cls_lr * 0.001,  # Minimum learning rate
-                verbose=True
-            )
+            # Use cosine annealing without restarts for stability
+            from torch.optim.lr_scheduler import CosineAnnealingLR
+            min_lr = (self.cls_head_lr or (self.lr * 4.0)) * 1e-3
+            scheduler = CosineAnnealingLR(optimizer, T_max=2000, eta_min=min_lr)
         else:
             # Standard scheduler for pretraining
             from torch.optim.lr_scheduler import ReduceLROnPlateau

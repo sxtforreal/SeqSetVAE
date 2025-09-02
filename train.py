@@ -130,6 +130,15 @@ def main():
     parser.add_argument("--target_auc", type=float, default=0.90, help="Target AUC score for SOTA mode")
     parser.add_argument("--target_auprc", type=float, default=0.50, help="Target AUPRC score for SOTA mode")
 
+    # Finetune classifier/aggregator options
+    parser.add_argument("--aggregator", type=str, default="transformer", choices=["transformer", "poe"],
+                        help="How to aggregate per-set latents into a fixed-size sequence feature")
+    parser.add_argument("--cls_head_type", type=str, default="advanced", choices=["advanced", "mlp", "linear"],
+                        help="Classification head type")
+    parser.add_argument("--poe_use_logvar", action="store_true", help="For PoE, concatenate logvar with mu as features")
+    parser.add_argument("--loss_mode", type=str, default="focal", choices=["focal", "sota"],
+                        help="Loss strategy in finetune: focal-only or sota composite")
+
     args = parser.parse_args()
 
     # Prepare unified output dirs
@@ -351,8 +360,13 @@ def main():
             focal_alpha=focal_alpha_final,
             focal_gamma=focal_gamma_final,
             medical_scenario=medical_scenario_param,  # SOTA parameter
+            aggregator_type=args.aggregator,
+            cls_head_type=args.cls_head_type,
+            loss_mode=args.loss_mode,
+            poe_use_logvar=args.poe_use_logvar,
         )
-        monitor_metric = 'val_auc'
+        # Prefer AUPRC when optimizing for imbalanced data
+        monitor_metric = 'val_auprc'
         monitor_mode = 'max'
 
         # Note: Pretrained weights are now loaded automatically in SeqSetVAE constructor
