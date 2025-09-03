@@ -30,6 +30,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchmetrics.classification import AUROC, AveragePrecision
 
+import sys
+# Ensure main module directory is importable when running from exp/
+_MAIN_DIR = "/home/sunx/data/aiiih/projects/sunx/projects/SeqSetVAE/main"
+if _MAIN_DIR not in sys.path:
+    sys.path.insert(0, _MAIN_DIR)
+
 from model import GaussianMILHead
 import config
 
