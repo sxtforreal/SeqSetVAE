@@ -50,8 +50,10 @@ class AttentionPoolingHead(nn.Module):
 
 
 class ExpectationLogit(nn.Module):
-    """Route B: 期望-logit 线性： a_t = w^T z_t + b; E[sigmoid(a_t)] ~ sigma( (w^T μ + b) / sqrt(1 + π/8 w^T Σ w) )
-    我们实现 w,b 并在前向中用 μ, Σ=diag(exp(logvar)) 的封闭式近似得到 p_t，然后均值聚合。
+    """Route B: Expected-logit linear model.
+    a_t = w^T z_t + b; E[sigmoid(a_t)] ≈ sigma((w^T μ + b) / sqrt(1 + π/8 w^T Σ w)).
+    We implement w, b and use a closed-form approximation with μ and Σ=diag(exp(logvar))
+    to obtain p_t in the forward pass, then aggregate by averaging across time.
     """
 
     def __init__(self, dim: int):
@@ -76,7 +78,7 @@ class ExpectationLogit(nn.Module):
 
 
 class TimeWeightedPoE(nn.Module):
-    """Route C: 时间加权 PoE，再接小 MLP/LogReg"""
+    """Route C: Time-weighted Product-of-Experts, followed by a small MLP/LogReg"""
 
     def __init__(self, dim: int, lambda_decay: float = 0.99, mlp_hidden: int = 128):
         super().__init__()
@@ -96,9 +98,9 @@ class TimeWeightedPoE(nn.Module):
 
 
 class WassersteinBarycenter(nn.Module):
-    """Route D: 维度上近似 W2 重心（对角协方差近似）：
-    μ* = 平均(μ)， σ* = 平均(σ) 之后取平方 => 对角线近似。
-    然后接 LogReg/MLP。
+    """Route D: Approximate W2 barycenter per dimension (diagonal covariance approximation):
+    μ* = mean(μ), σ* = mean(σ) then squared -> diagonal approximation.
+    Followed by a LogReg/MLP head.
     """
 
     def __init__(self, dim: int, hidden: int = 128):
@@ -117,7 +119,7 @@ class WassersteinBarycenter(nn.Module):
 
 
 class KMEPooling(nn.Module):
-    """Route E: Kernel Mean Embedding + MLP。"""
+    """Route E: Kernel Mean Embedding + MLP."""
 
     def __init__(self, dim: int, kernel_scale: float = 1.0, hidden: int = 128):
         super().__init__()
@@ -125,7 +127,8 @@ class KMEPooling(nn.Module):
         self.head = nn.Sequential(nn.Linear(dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
 
     def forward(self, mu: torch.Tensor, logvar: torch.Tensor, mask: torch.Tensor):
-        # 这里用 RBF 核对 μ 做均值嵌入近似：phi(x) ~ exp(-||x||^2 / (2 s^2)) * x
+        # Use an RBF feature to approximate the mean embedding of μ:
+        # phi(x) ~ exp(-||x||^2 / (2 s^2)) * x
         s2 = self.kernel_scale ** 2
         feat = torch.exp(-(mu ** 2).sum(dim=-1, keepdim=True) / (2 * s2)) * mu
         feat = feat * mask.unsqueeze(-1).float()
@@ -135,7 +138,7 @@ class KMEPooling(nn.Module):
 
 
 class ShallowSequenceModel(nn.Module):
-    """Route F: 1–2 层 GRU/Transformer（轻量）。"""
+    """Route F: 1–2 layer GRU/Transformer (lightweight)."""
 
     def __init__(self, token_dim: int, hidden: int = 64, num_layers: int = 1, use_gru: bool = True):
         super().__init__()

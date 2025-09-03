@@ -89,7 +89,7 @@ def forward_route(model, mu, logvar, dt, mask):
 
 def grid_for_route(route: str, dim: int):
     if route == "A":
-        # 注意力池化 h ∈ {64,128}, 层数 ∈ {1,2}
+        # Attention pooling: hidden size in {64, 128}, number of layers in {1, 2}
         for hidden in [64, 128]:
             for layers in [1, 2]:
                 yield AttentionPoolingHead(in_dim=2 * dim, hidden=hidden, num_layers=layers)
@@ -111,7 +111,7 @@ def grid_for_route(route: str, dim: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 2: 候选路线最小实现对比")
+    parser = argparse.ArgumentParser(description="Stage 2: Minimal implementations comparison across candidate routes")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--routes", type=str, default="A,B,C")

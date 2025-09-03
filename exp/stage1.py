@@ -85,7 +85,7 @@ def collate(batch):
 
 
 def maybe_shuffle_time(mu, logvar, dt, mask):
-    # Shuffle valid time steps per-sample, keeping mask count fixed
+    # Shuffle valid time steps per sample while keeping the number of valid steps (mask) fixed
     B, T, D = mu.shape
     device = mu.device
     rng = torch.Generator(device=device)
@@ -212,7 +212,7 @@ def run_once(args, seed, feature_mode: str, use_logvar: bool, shuffle_time_flag:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 1: 三件套线性探针 + 顺序/不确定性检验")
+    parser = argparse.ArgumentParser(description="Stage 1: Three linear probes + order/uncertainty checks")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -223,11 +223,11 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
-    parser.add_argument("--pos_weight", type=float, default=-1.0, help="若<0则根据训练集类别频次自动设置")
+    parser.add_argument("--pos_weight", type=float, default=-1.0, help="If <0, set from training set class frequency")
     parser.add_argument("--seeds", type=int, nargs="*", default=[0,1,2])
     parser.add_argument("--modes", type=str, default="last,mean,poe")
     parser.add_argument("--with_logvar", action="store_true")
-    parser.add_argument("--order_check", action="store_true", help="对 Mean/PoE 做顺序打乱验证")
+    parser.add_argument("--order_check", action="store_true", help="For Mean/PoE, validate by shuffling order")
     args = parser.parse_args()
 
     ensure_dir(args.out_dir)

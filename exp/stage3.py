@@ -70,7 +70,7 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-        # val
+        # Validation
         model.eval()
         y_true, y_logits = [], []
         with torch.no_grad():
@@ -90,7 +90,7 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # test
+    # Test
     model.eval()
     y_true, y_logits = [], []
     with torch.no_grad():
@@ -103,7 +103,7 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 3: 诊断性消融")
+    parser = argparse.ArgumentParser(description="Stage 3: Diagnostic ablations")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--best_routes", type=str, default="A,C")
@@ -119,7 +119,7 @@ def main():
 
     # Ablation toggles
     parser.add_argument("--near_vs_far_steps", type=int, nargs="*", default=[1,3,5])
-    parser.add_argument("--add_logvar", action="store_true", help="在可用路线上加入/去除 log σ 特征")
+    parser.add_argument("--add_logvar", action="store_true", help="For routes that support it, add/remove log-σ feature")
     parser.add_argument("--scale_widths", type=int, nargs="*", default=[64,128,256])
     args = parser.parse_args()
 
@@ -137,13 +137,13 @@ def main():
         _, _, _, class_counts = loaders
         pos_weight_value = float(class_counts[0]) / max(1, class_counts[1])
 
-        # 1) 近期 vs 远期：仅用最后 k 次就诊（k ∈ near_vs_far_steps）
+        # 1) Near vs far history: use only the last k visits (k ∈ near_vs_far_steps)
         for route in routes:
             for k in args.near_vs_far_steps:
                 arrays_k = arrays.copy()
                 mask = arrays_k["mask"].copy()
                 T = mask.shape[1]
-                # keep last k valid tokens
+                # Keep last k valid tokens
                 for i in range(B):
                     valid_idx = np.where(mask[i])[0]
                     if len(valid_idx) > k:
@@ -155,13 +155,13 @@ def main():
                 m.update({"seed": seed, "route": route, "abl": f"near_last_{k}"})
                 all_results.append(m)
 
-        # 2) 顺序敏感性：打乱顺序
+        # 2) Order sensitivity: shuffle order
         arrays_shuffle = arrays.copy()
         rng = np.random.default_rng(seed)
         for i in range(B):
             idx = np.where(arrays_shuffle["mask"][i])[0]
             rng.shuffle(idx)
-            # reorder the valid prefix; keep padding after
+            # Reorder the valid prefix; keep padding after
             T = arrays_shuffle["mu"].shape[1]
             keep = np.where(arrays["mask"][i])[0]
             pad = np.where(~arrays["mask"][i])[0]
@@ -176,9 +176,9 @@ def main():
             m.update({"seed": seed, "route": route, "abl": "order_shuffle"})
             all_results.append(m)
 
-        # 3) 不确定性贡献：加入/去除 log σ
+        # 3) Uncertainty contribution: add/remove log-σ
         if args.add_logvar:
-            # 对能加的模型（A/C/D/F）额外加入 log σ -> 通过更宽 head 近似
+            # For routes that can accept it (A/C/D/F), add log-σ by widening the head
             for route in routes:
                 width_list = args.scale_widths
                 for w in width_list:
