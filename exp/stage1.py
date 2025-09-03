@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from exp.utils import set_global_seed, ensure_dir, save_json, load_npz_data, mask_last_index
+from exp.utils import set_global_seed, ensure_dir, save_json, load_npz_data, mask_last_index, per_dim_kl_to_standard_normal, make_dim_gate
 from exp.metrics import evaluate_all_metrics
 
 
@@ -44,7 +44,7 @@ class LogisticProbe(nn.Module):
         return self.linear(x).squeeze(-1)
 
 
-def build_feature(mu, logvar, mask, mode: str, use_logvar: bool):
+def build_feature(mu, logvar, mask, mode: str, use_logvar: bool, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
     # mu, logvar, mask: [B,T,D], [B,T,D], [B,T]
     device = mu.device
     B, T, D = mu.shape
@@ -68,6 +68,12 @@ def build_feature(mu, logvar, mask, mode: str, use_logvar: bool):
     else:
         raise ValueError(f"Unknown mode {mode}")
 
+    if use_dim_gate:
+        kl_mean = per_dim_kl_to_standard_normal(mu, logvar, mask)  # [B,D]
+        gate = make_dim_gate(kl_mean, scale=gate_scale, bias=gate_bias)  # [B,D]
+        feats_mu = feats_mu * gate
+        feats_lv = feats_lv * gate
+
     features = [feats_mu]
     if use_logvar:
         features.append(feats_lv)
@@ -85,7 +91,7 @@ def collate(batch):
 
 
 def maybe_shuffle_time(mu, logvar, dt, mask):
-    # Shuffle valid time steps per-sample, keeping mask count fixed
+    # Shuffle valid time steps per sample while keeping the number of valid steps (mask) fixed
     B, T, D = mu.shape
     device = mu.device
     rng = torch.Generator(device=device)
@@ -105,7 +111,7 @@ def maybe_shuffle_time(mu, logvar, dt, mask):
     return torch.stack(out_mu), torch.stack(out_lv), torch.stack(out_dt)
 
 
-def train_epoch(model, loader, optimizer, criterion, device, feature_mode, use_logvar, shuffle_time=False):
+def train_epoch(model, loader, optimizer, criterion, device, feature_mode, use_logvar, shuffle_time=False, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
     model.train()
     losses = []
     for mu, logvar, dt, mask, y in loader:
@@ -115,7 +121,7 @@ def train_epoch(model, loader, optimizer, criterion, device, feature_mode, use_l
         y = y.to(device)
         if shuffle_time:
             mu, logvar, dt = maybe_shuffle_time(mu, logvar, dt, mask)
-        x = build_feature(mu, logvar, mask, feature_mode, use_logvar)
+        x = build_feature(mu, logvar, mask, feature_mode, use_logvar, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         logits = model(x)
         loss = criterion(logits, y)
         optimizer.zero_grad(set_to_none=True)
@@ -126,7 +132,7 @@ def train_epoch(model, loader, optimizer, criterion, device, feature_mode, use_l
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, feature_mode, use_logvar):
+def evaluate(model, loader, device, feature_mode, use_logvar, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
     model.eval()
     y_true = []
     y_logits = []
@@ -134,7 +140,7 @@ def evaluate(model, loader, device, feature_mode, use_logvar):
         mu = mu.to(device)
         logvar = logvar.to(device)
         mask = mask.to(device)
-        x = build_feature(mu, logvar, mask, feature_mode, use_logvar)
+        x = build_feature(mu, logvar, mask, feature_mode, use_logvar, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         logits = model(x)
         y_true.append(y.numpy())
         y_logits.append(logits.detach().cpu().numpy())
@@ -188,8 +194,29 @@ def run_once(args, seed, feature_mode: str, use_logvar: bool, shuffle_time_flag:
     patience = args.patience
     no_improve = 0
     for epoch in range(args.max_epochs):
-        train_epoch(model, loader_train, optimizer, criterion, args.device, feature_mode, use_logvar, shuffle_time=shuffle_time_flag)
-        val_metrics = evaluate(model, loader_val, args.device, feature_mode, use_logvar)
+        train_epoch(
+            model,
+            loader_train,
+            optimizer,
+            criterion,
+            args.device,
+            feature_mode,
+            use_logvar,
+            shuffle_time=shuffle_time_flag,
+            use_dim_gate=args.use_dim_gate,
+            gate_scale=args.gate_scale,
+            gate_bias=args.gate_bias,
+        )
+        val_metrics = evaluate(
+            model,
+            loader_val,
+            args.device,
+            feature_mode,
+            use_logvar,
+            use_dim_gate=args.use_dim_gate,
+            gate_scale=args.gate_scale,
+            gate_bias=args.gate_bias,
+        )
         if val_metrics["auprc"] > best_val + 1e-6:
             best_val = val_metrics["auprc"]
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -201,7 +228,16 @@ def run_once(args, seed, feature_mode: str, use_logvar: bool, shuffle_time_flag:
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    test_metrics = evaluate(model, loader_test, args.device, feature_mode, use_logvar)
+    test_metrics = evaluate(
+        model,
+        loader_test,
+        args.device,
+        feature_mode,
+        use_logvar,
+        use_dim_gate=args.use_dim_gate,
+        gate_scale=args.gate_scale,
+        gate_bias=args.gate_bias,
+    )
     return {
         "seed": seed,
         "feature_mode": feature_mode,
@@ -212,7 +248,7 @@ def run_once(args, seed, feature_mode: str, use_logvar: bool, shuffle_time_flag:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 1: 三件套线性探针 + 顺序/不确定性检验")
+    parser = argparse.ArgumentParser(description="Stage 1: Three linear probes + order/uncertainty checks")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -223,11 +259,15 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
-    parser.add_argument("--pos_weight", type=float, default=-1.0, help="若<0则根据训练集类别频次自动设置")
+    parser.add_argument("--pos_weight", type=float, default=-1.0, help="If <0, set from training set class frequency")
     parser.add_argument("--seeds", type=int, nargs="*", default=[0,1,2])
     parser.add_argument("--modes", type=str, default="last,mean,poe")
     parser.add_argument("--with_logvar", action="store_true")
-    parser.add_argument("--order_check", action="store_true", help="对 Mean/PoE 做顺序打乱验证")
+    parser.add_argument("--order_check", action="store_true", help="For Mean/PoE, validate by shuffling order")
+    # Dimension gating for prior-like dimensions
+    parser.add_argument("--use_dim_gate", action="store_true")
+    parser.add_argument("--gate_scale", type=float, default=5.0)
+    parser.add_argument("--gate_bias", type=float, default=0.0)
     args = parser.parse_args()
 
     ensure_dir(args.out_dir)

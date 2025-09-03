@@ -20,9 +20,12 @@ from exp.models import (
 )
 
 
-def forward_route(model, mu, logvar, dt, mask):
+from exp.models import build_tokens
+
+
+def forward_route(model, mu, logvar, dt, mask, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     if isinstance(model, AttentionPoolingHead):
-        tokens = torch.cat([mu, torch.log(torch.clamp(torch.exp(logvar), min=1e-8))], dim=-1)
+        tokens = build_tokens(mu, logvar, dt, mask, add_time=False, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         return model(tokens, mask, dt)
     if isinstance(model, ExpectationLogit):
         return model(mu, logvar, mask)
@@ -33,28 +36,28 @@ def forward_route(model, mu, logvar, dt, mask):
     if isinstance(model, KMEPooling):
         return model(mu, logvar, mask)
     if isinstance(model, ShallowSequenceModel):
-        tokens = torch.cat([mu, torch.log(torch.clamp(torch.exp(logvar), min=1e-8))], dim=-1)
+        tokens = build_tokens(mu, logvar, dt, mask, add_time=False, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         return model(tokens, mask)
     raise ValueError("Unknown model type")
 
 
-def make_model(route: str, dim: int, width: int = 128):
+def make_model(route: str, dim: int, width: int = 128, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
     if route == "A":
         return AttentionPoolingHead(in_dim=2 * dim, hidden=width, num_layers=1)
     if route == "B":
-        return ExpectationLogit(dim=dim)
+        return ExpectationLogit(dim=dim, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "C":
-        return TimeWeightedPoE(dim=dim, lambda_decay=0.99, mlp_hidden=width)
+        return TimeWeightedPoE(dim=dim, lambda_decay=0.99, mlp_hidden=width, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "D":
-        return WassersteinBarycenter(dim=dim, hidden=width)
+        return WassersteinBarycenter(dim=dim, hidden=width, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "E":
-        return KMEPooling(dim=dim, kernel_scale=1.0, hidden=width)
+        return KMEPooling(dim=dim, kernel_scale=1.0, hidden=width, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "F":
         return ShallowSequenceModel(token_dim=2 * dim, hidden=width//2, num_layers=1, use_gru=True)
     raise ValueError(route)
 
 
-def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weight_value):
+def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weight_value, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     train_loader, val_loader, test_loader = loaders
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_value], device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -65,18 +68,18 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
         model.train()
         for mu, logvar, dt, mask, y in train_loader:
             mu, logvar, dt, mask, y = mu.to(device), logvar.to(device), dt.to(device), mask.to(device), y.to(device)
-            logits = forward_route(model, mu, logvar, dt, mask)
+            logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
             loss = criterion(logits, y)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-        # val
+        # Validation
         model.eval()
         y_true, y_logits = [], []
         with torch.no_grad():
             for mu, logvar, dt, mask, y in val_loader:
                 mu, logvar, dt, mask = mu.to(device), logvar.to(device), dt.to(device), mask.to(device)
-                logits = forward_route(model, mu, logvar, dt, mask)
+                logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
                 y_true.append(y.numpy()); y_logits.append(logits.detach().cpu().numpy())
         val_metrics = evaluate_all_metrics(np.concatenate(y_true), np.concatenate(y_logits))
         if val_metrics["auprc"] > best_val + 1e-6:
@@ -90,20 +93,20 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # test
+    # Test
     model.eval()
     y_true, y_logits = [], []
     with torch.no_grad():
         for mu, logvar, dt, mask, y in test_loader:
             mu, logvar, dt, mask = mu.to(device), logvar.to(device), dt.to(device), mask.to(device)
-            logits = forward_route(model, mu, logvar, dt, mask)
+            logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
             y_true.append(y.numpy()); y_logits.append(logits.detach().cpu().numpy())
     test_metrics = evaluate_all_metrics(np.concatenate(y_true), np.concatenate(y_logits))
     return test_metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 3: 诊断性消融")
+    parser = argparse.ArgumentParser(description="Stage 3: Diagnostic ablations")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--best_routes", type=str, default="A,C")
@@ -119,8 +122,12 @@ def main():
 
     # Ablation toggles
     parser.add_argument("--near_vs_far_steps", type=int, nargs="*", default=[1,3,5])
-    parser.add_argument("--add_logvar", action="store_true", help="在可用路线上加入/去除 log σ 特征")
+    parser.add_argument("--add_logvar", action="store_true", help="For routes that support it, add/remove log-σ feature")
     parser.add_argument("--scale_widths", type=int, nargs="*", default=[64,128,256])
+    # Dimension gating
+    parser.add_argument("--use_dim_gate", action="store_true")
+    parser.add_argument("--gate_scale", type=float, default=5.0)
+    parser.add_argument("--gate_bias", type=float, default=0.0)
     args = parser.parse_args()
 
     ensure_dir(args.out_dir)
@@ -137,31 +144,31 @@ def main():
         _, _, _, class_counts = loaders
         pos_weight_value = float(class_counts[0]) / max(1, class_counts[1])
 
-        # 1) 近期 vs 远期：仅用最后 k 次就诊（k ∈ near_vs_far_steps）
+        # 1) Near vs far history: use only the last k visits (k ∈ near_vs_far_steps)
         for route in routes:
             for k in args.near_vs_far_steps:
                 arrays_k = arrays.copy()
                 mask = arrays_k["mask"].copy()
                 T = mask.shape[1]
-                # keep last k valid tokens
+                # Keep last k valid tokens
                 for i in range(B):
                     valid_idx = np.where(mask[i])[0]
                     if len(valid_idx) > k:
                         drop = valid_idx[:-k]
                         arrays_k["mask"][i, drop] = False
                 loaders_k = make_loaders(arrays_k, train_idx, val_idx, test_idx, args.batch_size)
-                model = make_model(route, dim, width=128).to(args.device)
-                m = run_training(model, loaders_k, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value)
+                model = make_model(route, dim, width=128, use_dim_gate=args.use_dim_gate, gate_scale=args.gate_scale, gate_bias=args.gate_bias).to(args.device)
+                m = run_training(model, loaders_k, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value, args.use_dim_gate, args.gate_scale, args.gate_bias)
                 m.update({"seed": seed, "route": route, "abl": f"near_last_{k}"})
                 all_results.append(m)
 
-        # 2) 顺序敏感性：打乱顺序
+        # 2) Order sensitivity: shuffle order
         arrays_shuffle = arrays.copy()
         rng = np.random.default_rng(seed)
         for i in range(B):
             idx = np.where(arrays_shuffle["mask"][i])[0]
             rng.shuffle(idx)
-            # reorder the valid prefix; keep padding after
+            # Reorder the valid prefix; keep padding after
             T = arrays_shuffle["mu"].shape[1]
             keep = np.where(arrays["mask"][i])[0]
             pad = np.where(~arrays["mask"][i])[0]
@@ -171,19 +178,19 @@ def main():
             arrays_shuffle["dt"][i] = arrays["dt"][i, order]
         loaders_shuf = make_loaders(arrays_shuffle, train_idx, val_idx, test_idx, args.batch_size)
         for route in routes:
-            model = make_model(route, dim, width=128).to(args.device)
-            m = run_training(model, loaders_shuf, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value)
+            model = make_model(route, dim, width=128, use_dim_gate=args.use_dim_gate, gate_scale=args.gate_scale, gate_bias=args.gate_bias).to(args.device)
+            m = run_training(model, loaders_shuf, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value, args.use_dim_gate, args.gate_scale, args.gate_bias)
             m.update({"seed": seed, "route": route, "abl": "order_shuffle"})
             all_results.append(m)
 
-        # 3) 不确定性贡献：加入/去除 log σ
+        # 3) Uncertainty contribution: add/remove log-σ
         if args.add_logvar:
-            # 对能加的模型（A/C/D/F）额外加入 log σ -> 通过更宽 head 近似
+            # For routes that can accept it (A/C/D/F), add log-σ by widening the head
             for route in routes:
                 width_list = args.scale_widths
                 for w in width_list:
-                    model = make_model(route, dim, width=w).to(args.device)
-                    m = run_training(model, loaders, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value)
+                    model = make_model(route, dim, width=w, use_dim_gate=args.use_dim_gate, gate_scale=args.gate_scale, gate_bias=args.gate_bias).to(args.device)
+                    m = run_training(model, loaders, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value, args.use_dim_gate, args.gate_scale, args.gate_bias)
                     m.update({"seed": seed, "route": route, "abl": f"width_{w}"})
                     all_results.append(m)
 
