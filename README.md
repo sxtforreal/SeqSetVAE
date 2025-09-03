@@ -1,3 +1,37 @@
+实验计划脚本（Stage 1–3）
+
+数据期望格式：单个 `.npz` 文件包含键：`mu[B,T,D]`，`logvar[B,T,D]`，`dt[B,T,1]`（或 `[B,T]`），`mask[B,T]`（0/1），`y[B]`。
+
+快速开始：
+
+1) 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+2) 运行 Stage 1：线性探针与顺序/不确定性检验
+
+```bash
+python stage1.py --data_path /path/to/data.npz --out_dir runs/stage1
+```
+
+3) 运行 Stage 2：候选路线最小实现对比（从 A–F 中选择）
+
+```bash
+python stage2.py --data_path /path/to/data.npz --out_dir runs/stage2 --routes A,B,C
+```
+
+4) 运行 Stage 3：诊断性消融（近期 vs 远期、顺序敏感、不确定性贡献/宽度）
+
+```bash
+python stage3.py --data_path /path/to/data.npz --out_dir runs/stage3 --best_routes A,C
+```
+
+备注
+- 主指标为 AUPRC（Val 上早停）。同时报告 AUROC、Recall@Precision≥{0.6,0.7}、Precision@Top-k 和 ECE（可选）。
+- 所有脚本均支持多次随机种子重复（默认 3 次）并输出表格汇总。
+ - 数据键名可通过简单修改 `exp/utils.py` 与 `exp/data.py` 适配。
 # SeqSetVAE
 
 Unified training interface with two modes and **advanced VAE feature fusion** (2024 update):
