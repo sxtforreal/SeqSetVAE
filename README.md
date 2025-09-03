@@ -13,19 +13,19 @@ pip install -r requirements.txt
 2) 运行 Stage 1：线性探针与顺序/不确定性检验
 
 ```bash
-python stage1.py --data_path /path/to/data.npz --out_dir runs/stage1
+python -m exp.stage1 --data_path /path/to/data.npz --out_dir runs/stage1
 ```
 
 3) 运行 Stage 2：候选路线最小实现对比（从 A–F 中选择）
 
 ```bash
-python stage2.py --data_path /path/to/data.npz --out_dir runs/stage2 --routes A,B,C
+python -m exp.stage2 --data_path /path/to/data.npz --out_dir runs/stage2 --routes A,B,C
 ```
 
 4) 运行 Stage 3：诊断性消融（近期 vs 远期、顺序敏感、不确定性贡献/宽度）
 
 ```bash
-python stage3.py --data_path /path/to/data.npz --out_dir runs/stage3 --best_routes A,C
+python -m exp.stage3 --data_path /path/to/data.npz --out_dir runs/stage3 --best_routes A,C
 ```
 
 备注
