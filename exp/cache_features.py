@@ -34,6 +34,12 @@ from typing import Dict, Any
 import torch
 import torch.nn.functional as F
 
+import sys
+# Ensure main module directory is importable when running from exp/
+_MAIN_DIR = "/home/sunx/data/aiiih/projects/sunx/projects/SeqSetVAE/main"
+if _MAIN_DIR not in sys.path:
+    sys.path.insert(0, _MAIN_DIR)
+
 from dataset import SeqSetVAEDataModule
 from model import SeqSetVAEPretrain, load_checkpoint_weights
 import config

@@ -30,6 +30,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchmetrics.classification import AUROC, AveragePrecision
 
+import sys
+# Ensure main module directory is importable when running from exp/
+_MAIN_DIR = "/home/sunx/data/aiiih/projects/sunx/projects/SeqSetVAE/main"
+if _MAIN_DIR not in sys.path:
+    sys.path.insert(0, _MAIN_DIR)
+
 from model import GaussianMILHead
 import config
 
@@ -290,8 +296,7 @@ def main():
                 loss = F.binary_cross_entropy_with_logits(logit, y, pos_weight=torch.tensor(args.pos_weight, device=device))
                 opt.zero_grad(); loss.backward(); opt.step()
         lin.eval()
-        base, cal = eval_loader(lambda b: lin(masked_select_last(*tw_apply(b, hours)[:2:1],).squeeze(-1) if False else lin(masked_select_last(tw_apply(b, hours)[0], tw_apply(b, hours)[3])).squeeze(-1), valid_loader)  # placeholder, replaced below
-        # above line was a placeholder; redefining cleanly:
+        # Clean evaluation using a properly defined function (removes placeholder logic)
         def lin_fn(b):
             mu, _, _, pm = tw_apply(b, hours)
             return lin(masked_select_last(mu, pm)).squeeze(-1)
