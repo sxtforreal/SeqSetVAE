@@ -24,7 +24,7 @@ from exp.models import (
 )
 
 
-def train_one(model, loaders, device, pos_weight_value, lr, wd, max_epochs, patience):
+def train_one(model, loaders, device, pos_weight_value, lr, wd, max_epochs, patience, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     train_loader, val_loader, test_loader = loaders
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_value], device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -35,12 +35,12 @@ def train_one(model, loaders, device, pos_weight_value, lr, wd, max_epochs, pati
         model.train()
         for mu, logvar, dt, mask, y in train_loader:
             mu, logvar, dt, mask, y = mu.to(device), logvar.to(device), dt.to(device), mask.to(device), y.to(device)
-            logits = forward_route(model, mu, logvar, dt, mask)
+            logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
             loss = criterion(logits, y)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-        val_metrics = evaluate_model(model, val_loader, device)
+        val_metrics = evaluate_model(model, val_loader, device, use_dim_gate, gate_scale, gate_bias)
         if val_metrics["auprc"] > best_val + 1e-6:
             best_val = val_metrics["auprc"]
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -51,17 +51,17 @@ def train_one(model, loaders, device, pos_weight_value, lr, wd, max_epochs, pati
                 break
     if best_state is not None:
         model.load_state_dict(best_state)
-    test_metrics = evaluate_model(model, test_loader, device)
+    test_metrics = evaluate_model(model, test_loader, device, use_dim_gate, gate_scale, gate_bias)
     return test_metrics
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, device):
+def evaluate_model(model, loader, device, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     model.eval()
     y_true, y_logits = [], []
     for mu, logvar, dt, mask, y in loader:
         mu, logvar, dt, mask = mu.to(device), logvar.to(device), dt.to(device), mask.to(device)
-        logits = forward_route(model, mu, logvar, dt, mask)
+        logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
         y_true.append(y.numpy())
         y_logits.append(logits.detach().cpu().numpy())
     y_true = np.concatenate(y_true)
@@ -69,9 +69,9 @@ def evaluate_model(model, loader, device):
     return evaluate_all_metrics(y_true, y_logits)
 
 
-def forward_route(model, mu, logvar, dt, mask):
+def forward_route(model, mu, logvar, dt, mask, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     if isinstance(model, AttentionPoolingHead):
-        tokens = torch.cat([mu, torch.log(torch.clamp(torch.exp(logvar), min=1e-8))], dim=-1)
+        tokens = build_tokens(mu, logvar, dt, mask, add_time=False, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         return model(tokens, mask, dt)
     if isinstance(model, ExpectationLogit):
         return model(mu, logvar, mask)
@@ -82,27 +82,27 @@ def forward_route(model, mu, logvar, dt, mask):
     if isinstance(model, KMEPooling):
         return model(mu, logvar, mask)
     if isinstance(model, ShallowSequenceModel):
-        tokens = torch.cat([mu, torch.log(torch.clamp(torch.exp(logvar), min=1e-8))], dim=-1)
+        tokens = build_tokens(mu, logvar, dt, mask, add_time=False, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         return model(tokens, mask)
     raise ValueError("Unknown model type")
 
 
-def grid_for_route(route: str, dim: int):
+def grid_for_route(route: str, dim: int, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     if route == "A":
         # Attention pooling: hidden size in {64, 128}, number of layers in {1, 2}
         for hidden in [64, 128]:
             for layers in [1, 2]:
                 yield AttentionPoolingHead(in_dim=2 * dim, hidden=hidden, num_layers=layers)
     elif route == "B":
-        yield ExpectationLogit(dim=dim)
+        yield ExpectationLogit(dim=dim, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     elif route == "C":
         for lam in [0.95, 0.97, 0.99]:
-            yield TimeWeightedPoE(dim=dim, lambda_decay=lam, mlp_hidden=128)
+            yield TimeWeightedPoE(dim=dim, lambda_decay=lam, mlp_hidden=128, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     elif route == "D":
-        yield WassersteinBarycenter(dim=dim, hidden=128)
+        yield WassersteinBarycenter(dim=dim, hidden=128, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     elif route == "E":
         for scale in [0.5, 1.0, 2.0]:
-            yield KMEPooling(dim=dim, kernel_scale=scale, hidden=128)
+            yield KMEPooling(dim=dim, kernel_scale=scale, hidden=128, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     elif route == "F":
         for layers in [1, 2]:
             yield ShallowSequenceModel(token_dim=2 * dim, hidden=64, num_layers=layers, use_gru=True)
@@ -124,6 +124,10 @@ def main():
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--seeds", type=int, nargs="*", default=[0, 1, 2])
+    # Dimension gating
+    parser.add_argument("--use_dim_gate", action="store_true")
+    parser.add_argument("--gate_scale", type=float, default=5.0)
+    parser.add_argument("--gate_bias", type=float, default=0.0)
     args = parser.parse_args()
 
     ensure_dir(args.out_dir)
@@ -140,9 +144,21 @@ def main():
         loader_train, loader_val, loader_test, class_counts = loaders
         pos_weight_value = float(class_counts[0]) / max(1, class_counts[1])
         for route in routes:
-            for model in grid_for_route(route, dim):
+            for model in grid_for_route(route, dim, args.use_dim_gate, args.gate_scale, args.gate_bias):
                 model = model.to(args.device)
-                metrics = train_one(model, (loader_train, loader_val, loader_test), args.device, pos_weight_value, args.lr, args.wd, args.max_epochs, args.patience)
+                metrics = train_one(
+                    model,
+                    (loader_train, loader_val, loader_test),
+                    args.device,
+                    pos_weight_value,
+                    args.lr,
+                    args.wd,
+                    args.max_epochs,
+                    args.patience,
+                    args.use_dim_gate,
+                    args.gate_scale,
+                    args.gate_bias,
+                )
                 all_results.append({"seed": seed, "route": route, "model": type(model).__name__, **metrics})
 
     out_path = os.path.join(args.out_dir, "stage2_results.json")

@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .utils import mask_last_index, time_encoding_sin
+from .utils import mask_last_index, time_encoding_sin, per_dim_kl_to_standard_normal, make_dim_gate
 
 
 class LogisticProbe(nn.Module):
@@ -15,9 +15,26 @@ class LogisticProbe(nn.Module):
         return self.linear(x).squeeze(-1)
 
 
-def build_tokens(mu: torch.Tensor, logvar: torch.Tensor, dt: torch.Tensor, mask: torch.Tensor, add_time: bool, time_dim: int = 8):
+def build_tokens(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    dt: torch.Tensor,
+    mask: torch.Tensor,
+    add_time: bool,
+    time_dim: int = 8,
+    use_dim_gate: bool = False,
+    gate_scale: float = 5.0,
+    gate_bias: float = 0.0,
+):
     # mu/logvar: [B,T,D], dt: [B,T,1], mask: [B,T]
-    tokens = [mu, torch.log(torch.clamp(torch.exp(logvar), min=1e-8))]
+    if use_dim_gate:
+        kl_mean = per_dim_kl_to_standard_normal(mu, logvar, mask)  # [B,D]
+        gate = make_dim_gate(kl_mean, scale=gate_scale, bias=gate_bias)  # [B,D]
+        mu = mu * gate.unsqueeze(1)
+        lv_token = torch.log(torch.clamp(torch.exp(logvar), min=1e-8)) * gate.unsqueeze(1)
+    else:
+        lv_token = torch.log(torch.clamp(torch.exp(logvar), min=1e-8))
+    tokens = [mu, lv_token]
     if add_time:
         phi = time_encoding_sin(dt, num_feats=time_dim)  # [B,T,2*time_dim]
         tokens.append(phi)
@@ -56,18 +73,27 @@ class ExpectationLogit(nn.Module):
     to obtain p_t in the forward pass, then aggregate by averaging across time.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
         super().__init__()
         self.w = nn.Parameter(torch.zeros(dim))
         self.b = nn.Parameter(torch.zeros(1))
+        self.use_dim_gate = use_dim_gate
+        self.gate_scale = gate_scale
+        self.gate_bias = gate_bias
 
     def forward(self, mu: torch.Tensor, logvar: torch.Tensor, mask: torch.Tensor):
         # mu/logvar: [B,T,D]
         var = torch.exp(logvar)
+        if self.use_dim_gate:
+            kl_mean = per_dim_kl_to_standard_normal(mu, logvar, mask)  # [B,D]
+            gate = make_dim_gate(kl_mean, scale=self.gate_scale, bias=self.gate_bias)  # [B,D]
+            w_eff = self.w.view(1, -1) * gate  # [B,D]
+        else:
+            w_eff = self.w.view(1, -1)  # [1,D]
         # w^T μ + b
-        a = (mu * self.w.view(1, 1, -1)).sum(-1) + self.b  # [B,T]
+        a = (mu * w_eff.view(1, 1, -1)).sum(-1) + self.b  # [B,T]
         # denom = sqrt(1 + pi/8 * w^T Σ w)
-        quad = (var * (self.w.view(1, 1, -1) ** 2)).sum(-1)
+        quad = (var * (w_eff.view(1, 1, -1) ** 2)).sum(-1)
         denom = torch.sqrt(1.0 + (3.1415926535 / 8.0) * quad)
         p_t = torch.sigmoid(a / denom)
         p_t = p_t * mask.float()
@@ -80,16 +106,24 @@ class ExpectationLogit(nn.Module):
 class TimeWeightedPoE(nn.Module):
     """Route C: Time-weighted Product-of-Experts, followed by a small MLP/LogReg"""
 
-    def __init__(self, dim: int, lambda_decay: float = 0.99, mlp_hidden: int = 128):
+    def __init__(self, dim: int, lambda_decay: float = 0.99, mlp_hidden: int = 128, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
         super().__init__()
         self.lambda_decay = lambda_decay
         self.head = nn.Sequential(nn.Linear(2 * dim, mlp_hidden), nn.ReLU(), nn.Linear(mlp_hidden, 1))
+        self.use_dim_gate = use_dim_gate
+        self.gate_scale = gate_scale
+        self.gate_bias = gate_bias
 
     def forward(self, mu: torch.Tensor, logvar: torch.Tensor, mask: torch.Tensor):
         B, T, D = mu.shape
         t = torch.arange(T, device=mu.device).float()
         gamma = (self.lambda_decay ** (T - 1 - t)).view(1, T, 1)
-        prec = torch.exp(-logvar) * gamma * mask.unsqueeze(-1).float()
+        if self.use_dim_gate:
+            kl_mean = per_dim_kl_to_standard_normal(mu, logvar, mask)  # [B,D]
+            gate = make_dim_gate(kl_mean, scale=self.gate_scale, bias=self.gate_bias).unsqueeze(1)  # [B,1,D]
+        else:
+            gate = 1.0
+        prec = torch.exp(-logvar) * gamma * mask.unsqueeze(-1).float() * gate
         prec_sum = prec.sum(dim=1).clamp(min=1e-6)
         mu_star = (prec * mu).sum(dim=1) / prec_sum
         logvar_star = -torch.log(prec_sum)
@@ -103,16 +137,24 @@ class WassersteinBarycenter(nn.Module):
     Followed by a LogReg/MLP head.
     """
 
-    def __init__(self, dim: int, hidden: int = 128):
+    def __init__(self, dim: int, hidden: int = 128, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
         super().__init__()
         self.head = nn.Sequential(nn.Linear(2 * dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
+        self.use_dim_gate = use_dim_gate
+        self.gate_scale = gate_scale
+        self.gate_bias = gate_bias
 
     def forward(self, mu: torch.Tensor, logvar: torch.Tensor, mask: torch.Tensor):
         mask_f = mask.float()
         denom = mask_f.sum(dim=1).clamp(min=1.0).unsqueeze(-1)
-        mu_bar = (mu * mask_f.unsqueeze(-1)).sum(dim=1) / denom
+        if self.use_dim_gate:
+            kl_mean = per_dim_kl_to_standard_normal(mu, logvar, mask)  # [B,D]
+            gate = make_dim_gate(kl_mean, scale=self.gate_scale, bias=self.gate_bias).unsqueeze(1)  # [B,1,D]
+        else:
+            gate = 1.0
+        mu_bar = (mu * gate * mask_f.unsqueeze(-1)).sum(dim=1) / denom
         sigma = torch.sqrt(torch.exp(logvar))
-        sigma_bar = (sigma * mask_f.unsqueeze(-1)).sum(dim=1) / denom
+        sigma_bar = (sigma * gate * mask_f.unsqueeze(-1)).sum(dim=1) / denom
         logvar_star = 2.0 * torch.log(sigma_bar.clamp(min=1e-6))
         x = torch.cat([mu_bar, logvar_star], dim=-1)
         return self.head(x).squeeze(-1)
@@ -121,16 +163,24 @@ class WassersteinBarycenter(nn.Module):
 class KMEPooling(nn.Module):
     """Route E: Kernel Mean Embedding + MLP."""
 
-    def __init__(self, dim: int, kernel_scale: float = 1.0, hidden: int = 128):
+    def __init__(self, dim: int, kernel_scale: float = 1.0, hidden: int = 128, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
         super().__init__()
         self.kernel_scale = kernel_scale
         self.head = nn.Sequential(nn.Linear(dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
+        self.use_dim_gate = use_dim_gate
+        self.gate_scale = gate_scale
+        self.gate_bias = gate_bias
 
     def forward(self, mu: torch.Tensor, logvar: torch.Tensor, mask: torch.Tensor):
         # Use an RBF feature to approximate the mean embedding of μ:
         # phi(x) ~ exp(-||x||^2 / (2 s^2)) * x
         s2 = self.kernel_scale ** 2
-        feat = torch.exp(-(mu ** 2).sum(dim=-1, keepdim=True) / (2 * s2)) * mu
+        if self.use_dim_gate:
+            kl_mean = per_dim_kl_to_standard_normal(mu, logvar, mask)  # [B,D]
+            gate = make_dim_gate(kl_mean, scale=self.gate_scale, bias=self.gate_bias).unsqueeze(1)  # [B,1,D]
+        else:
+            gate = 1.0
+        feat = torch.exp(-(mu ** 2).sum(dim=-1, keepdim=True) / (2 * s2)) * (mu * gate)
         feat = feat * mask.unsqueeze(-1).float()
         denom = mask.float().sum(dim=1).clamp(min=1.0).unsqueeze(-1)
         pooled = feat.sum(dim=1) / denom

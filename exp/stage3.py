@@ -20,9 +20,12 @@ from exp.models import (
 )
 
 
-def forward_route(model, mu, logvar, dt, mask):
+from exp.models import build_tokens
+
+
+def forward_route(model, mu, logvar, dt, mask, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     if isinstance(model, AttentionPoolingHead):
-        tokens = torch.cat([mu, torch.log(torch.clamp(torch.exp(logvar), min=1e-8))], dim=-1)
+        tokens = build_tokens(mu, logvar, dt, mask, add_time=False, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         return model(tokens, mask, dt)
     if isinstance(model, ExpectationLogit):
         return model(mu, logvar, mask)
@@ -33,28 +36,28 @@ def forward_route(model, mu, logvar, dt, mask):
     if isinstance(model, KMEPooling):
         return model(mu, logvar, mask)
     if isinstance(model, ShallowSequenceModel):
-        tokens = torch.cat([mu, torch.log(torch.clamp(torch.exp(logvar), min=1e-8))], dim=-1)
+        tokens = build_tokens(mu, logvar, dt, mask, add_time=False, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
         return model(tokens, mask)
     raise ValueError("Unknown model type")
 
 
-def make_model(route: str, dim: int, width: int = 128):
+def make_model(route: str, dim: int, width: int = 128, use_dim_gate: bool = False, gate_scale: float = 5.0, gate_bias: float = 0.0):
     if route == "A":
         return AttentionPoolingHead(in_dim=2 * dim, hidden=width, num_layers=1)
     if route == "B":
-        return ExpectationLogit(dim=dim)
+        return ExpectationLogit(dim=dim, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "C":
-        return TimeWeightedPoE(dim=dim, lambda_decay=0.99, mlp_hidden=width)
+        return TimeWeightedPoE(dim=dim, lambda_decay=0.99, mlp_hidden=width, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "D":
-        return WassersteinBarycenter(dim=dim, hidden=width)
+        return WassersteinBarycenter(dim=dim, hidden=width, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "E":
-        return KMEPooling(dim=dim, kernel_scale=1.0, hidden=width)
+        return KMEPooling(dim=dim, kernel_scale=1.0, hidden=width, use_dim_gate=use_dim_gate, gate_scale=gate_scale, gate_bias=gate_bias)
     if route == "F":
         return ShallowSequenceModel(token_dim=2 * dim, hidden=width//2, num_layers=1, use_gru=True)
     raise ValueError(route)
 
 
-def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weight_value):
+def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weight_value, use_dim_gate: bool, gate_scale: float, gate_bias: float):
     train_loader, val_loader, test_loader = loaders
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_value], device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -65,7 +68,7 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
         model.train()
         for mu, logvar, dt, mask, y in train_loader:
             mu, logvar, dt, mask, y = mu.to(device), logvar.to(device), dt.to(device), mask.to(device), y.to(device)
-            logits = forward_route(model, mu, logvar, dt, mask)
+            logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
             loss = criterion(logits, y)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -76,7 +79,7 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
         with torch.no_grad():
             for mu, logvar, dt, mask, y in val_loader:
                 mu, logvar, dt, mask = mu.to(device), logvar.to(device), dt.to(device), mask.to(device)
-                logits = forward_route(model, mu, logvar, dt, mask)
+                logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
                 y_true.append(y.numpy()); y_logits.append(logits.detach().cpu().numpy())
         val_metrics = evaluate_all_metrics(np.concatenate(y_true), np.concatenate(y_logits))
         if val_metrics["auprc"] > best_val + 1e-6:
@@ -96,7 +99,7 @@ def run_training(model, loaders, device, lr, wd, max_epochs, patience, pos_weigh
     with torch.no_grad():
         for mu, logvar, dt, mask, y in test_loader:
             mu, logvar, dt, mask = mu.to(device), logvar.to(device), dt.to(device), mask.to(device)
-            logits = forward_route(model, mu, logvar, dt, mask)
+            logits = forward_route(model, mu, logvar, dt, mask, use_dim_gate, gate_scale, gate_bias)
             y_true.append(y.numpy()); y_logits.append(logits.detach().cpu().numpy())
     test_metrics = evaluate_all_metrics(np.concatenate(y_true), np.concatenate(y_logits))
     return test_metrics
@@ -121,6 +124,10 @@ def main():
     parser.add_argument("--near_vs_far_steps", type=int, nargs="*", default=[1,3,5])
     parser.add_argument("--add_logvar", action="store_true", help="For routes that support it, add/remove log-σ feature")
     parser.add_argument("--scale_widths", type=int, nargs="*", default=[64,128,256])
+    # Dimension gating
+    parser.add_argument("--use_dim_gate", action="store_true")
+    parser.add_argument("--gate_scale", type=float, default=5.0)
+    parser.add_argument("--gate_bias", type=float, default=0.0)
     args = parser.parse_args()
 
     ensure_dir(args.out_dir)
@@ -150,8 +157,8 @@ def main():
                         drop = valid_idx[:-k]
                         arrays_k["mask"][i, drop] = False
                 loaders_k = make_loaders(arrays_k, train_idx, val_idx, test_idx, args.batch_size)
-                model = make_model(route, dim, width=128).to(args.device)
-                m = run_training(model, loaders_k, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value)
+                model = make_model(route, dim, width=128, use_dim_gate=args.use_dim_gate, gate_scale=args.gate_scale, gate_bias=args.gate_bias).to(args.device)
+                m = run_training(model, loaders_k, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value, args.use_dim_gate, args.gate_scale, args.gate_bias)
                 m.update({"seed": seed, "route": route, "abl": f"near_last_{k}"})
                 all_results.append(m)
 
@@ -171,8 +178,8 @@ def main():
             arrays_shuffle["dt"][i] = arrays["dt"][i, order]
         loaders_shuf = make_loaders(arrays_shuffle, train_idx, val_idx, test_idx, args.batch_size)
         for route in routes:
-            model = make_model(route, dim, width=128).to(args.device)
-            m = run_training(model, loaders_shuf, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value)
+            model = make_model(route, dim, width=128, use_dim_gate=args.use_dim_gate, gate_scale=args.gate_scale, gate_bias=args.gate_bias).to(args.device)
+            m = run_training(model, loaders_shuf, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value, args.use_dim_gate, args.gate_scale, args.gate_bias)
             m.update({"seed": seed, "route": route, "abl": "order_shuffle"})
             all_results.append(m)
 
@@ -182,8 +189,8 @@ def main():
             for route in routes:
                 width_list = args.scale_widths
                 for w in width_list:
-                    model = make_model(route, dim, width=w).to(args.device)
-                    m = run_training(model, loaders, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value)
+                    model = make_model(route, dim, width=w, use_dim_gate=args.use_dim_gate, gate_scale=args.gate_scale, gate_bias=args.gate_bias).to(args.device)
+                    m = run_training(model, loaders, args.device, args.lr, args.wd, args.max_epochs, args.patience, pos_weight_value, args.use_dim_gate, args.gate_scale, args.gate_bias)
                     m.update({"seed": seed, "route": route, "abl": f"width_{w}"})
                     all_results.append(m)
 
