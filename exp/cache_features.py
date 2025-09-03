@@ -56,8 +56,18 @@ def extract_per_set_posteriors(set_encoder, var: torch.Tensor, val: torch.Tensor
       dict(mu=[D], logvar=[D])
     """
     set_encoder.eval()
-    z_list, _ = set_encoder.encode_from_var_val(var, val)  # last level posterior
-    _, mu, logvar = z_list[-1]
+    # Prefer encode_from_var_val if available; otherwise fall back to forward
+    if hasattr(set_encoder, 'encode_from_var_val') and callable(getattr(set_encoder, 'encode_from_var_val')):
+        z_list, _ = set_encoder.encode_from_var_val(var, val)  # last level posterior
+        _, mu, logvar = z_list[-1]
+    else:
+        # Fallback: assume forward returns (recon, z_list, aux)
+        out = set_encoder(var, val)
+        if isinstance(out, (list, tuple)) and len(out) >= 2:
+            z_list = out[1]
+            _, mu, logvar = z_list[-1]
+        else:
+            raise RuntimeError("SetVAEModule forward did not return expected outputs; cannot extract mu/logvar")
     mu = mu.squeeze(0).squeeze(0)       # [D]
     logvar = logvar.squeeze(0).squeeze(0)  # [D]
     return {"mu": mu, "logvar": logvar}
