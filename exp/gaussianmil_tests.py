@@ -395,8 +395,6 @@ def main():
     parser.add_argument("--use_focal", action="store_true")
     parser.add_argument("--focal_alpha", type=float, default=getattr(config, "focal_alpha", 0.35))
     parser.add_argument("--focal_gamma", type=float, default=getattr(config, "focal_gamma", 2.0))
-    parser.add_argument("--progress_file", type=str, default=None, help="Write JSONL progress records to this path")
-    parser.add_argument("--no_partial", action="store_true", help="Disable partial results saving after each ablation")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -433,25 +431,6 @@ def main():
     # Each tuple is (name, model_kwargs[, use_group_lasso][, use_hinge]) with optional flags
 
     results: Dict[str, Dict[str, float]] = {}
-
-    # Progress logging helper (JSONL)
-    progress_fp = None
-    if args.progress_file is None:
-        progress_path = os.path.join(args.cached_dir, "gaussianmil_progress.jsonl")
-    else:
-        progress_path = args.progress_file
-    try:
-        progress_fp = open(progress_path, "a", buffering=1)
-    except Exception:
-        progress_fp = None
-
-    def log_progress(event: str, payload: Dict):
-        rec = {"event": event, **payload}
-        if progress_fp is not None:
-            try:
-                progress_fp.write(json.dumps(rec) + "\n")
-            except Exception:
-                pass
 
     def make_model(model_kwargs: Dict) -> GaussianMILVariant:
         model = GaussianMILVariant(
@@ -537,16 +516,7 @@ def main():
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 pbar.set_postfix(epoch=epoch_idx, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
-            # epoch progress record
-            log_progress(
-                "train_epoch_end",
-                {
-                    "name": name,
-                    "seed": seed,
-                    "epoch": epoch_idx,
-                    "loss": float(loss.item()),
-                },
-            )
+            # tqdm already displays: model(name), epoch, batch
 
         # Evaluation (valid/test) with calibrated and uncalibrated metrics
         @torch.no_grad()
@@ -563,17 +533,6 @@ def main():
 
         base, cal = eval_loader(eval_fn, valid_loader)
         tbase, tcal = eval_loader(eval_fn, test_loader)
-        log_progress(
-            "eval_complete",
-            {
-                "name": name,
-                "seed": seed,
-                "valid": base,
-                "valid_cal": cal,
-                "test": tbase,
-                "test_cal": tcal,
-            },
-        )
         return base, cal, tbase, tcal
 
     # Run all ablations across seeds and aggregate mean/std
@@ -615,15 +574,7 @@ def main():
         results[f"{name}_test"] = reduce_stats(seed_results_test)
         results[f"{name}_test_cal"] = reduce_stats(seed_results_test_cal)
 
-        # Save partial results after each ablation for robustness
-        if not args.no_partial:
-            out_json_partial = os.path.join(args.cached_dir, "gaussianmil_results_partial.json")
-            try:
-                with open(out_json_partial, "w") as f:
-                    json.dump(results, f, indent=2)
-                log_progress("partial_saved", {"file": out_json_partial, "upto": name})
-            except Exception:
-                pass
+        # No partial saving/progress files per user request
 
     # Print concise report
     print("\n=== Gaussian-MIL Ablation Results ===")
@@ -640,12 +591,6 @@ def main():
         json.dump(results, f, indent=2)
     print(f"Saved results to {out_json}")
 
-    # Ensure progress file gets closed
-    if progress_fp is not None:
-        try:
-            progress_fp.close()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
