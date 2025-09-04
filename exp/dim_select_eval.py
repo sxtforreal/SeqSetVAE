@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchmetrics.classification import AUROC, AveragePrecision
+from tqdm import tqdm
 
 
 class CachedSeqDataset(Dataset):
@@ -69,6 +70,7 @@ def masked_select_last(mu: torch.Tensor, pm: torch.Tensor) -> torch.Tensor:
     B, S, D = mu.shape
     last = (~pm).sum(dim=1).clamp(min=1) - 1
     idx = last.view(-1, 1, 1).expand(-1, 1, D)
+    idx = idx.to(device=mu.device, dtype=torch.long)
     return mu.gather(dim=1, index=idx).squeeze(1)
 
 
@@ -130,19 +132,23 @@ def run_eval(cached_dir: str, topk_values: List[int], criterion: str, device: st
         # Linear probe on last-step mu[:, :, dims]
         lin = nn.Linear(K, 1).to(device)
         opt = torch.optim.AdamW(lin.parameters(), lr=5e-3, weight_decay=1e-4)
-        for epoch in range(3):
+        for epoch in range(1, 3 + 1):
             lin.train()
-            for batch in train_loader:
+            pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"linear_last_mu top{K} epoch {epoch}/3", leave=False)
+            for batch_idx, batch in pbar:
                 mu = batch["mu"][:, :, dims_tensor].to(device)
                 y = batch["label"].float().to(device)
-                last = masked_select_last(mu, batch["padding_mask"]).to(device)
+                pm = batch["padding_mask"].to(device)
+                last = masked_select_last(mu, pm)
                 logit = lin(last).squeeze(-1)
                 loss = F.binary_cross_entropy_with_logits(logit, y)
                 opt.zero_grad(); loss.backward(); opt.step()
+                pbar.set_postfix(epoch=epoch, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
         lin.eval()
         def lin_fn(b):
             mu = b["mu"][:, :, dims_tensor].to(device)
-            last = masked_select_last(mu, b["padding_mask"]).to(device)
+            pm = b["padding_mask"].to(device)
+            last = masked_select_last(mu, pm)
             return lin(last).squeeze(-1)
         all_results[f"linear_last_mu_top{K}_valid"] = _eval_loader(lin_fn, valid_loader)
         all_results[f"linear_last_mu_top{K}_test"] = _eval_loader(lin_fn, test_loader)
@@ -150,9 +156,10 @@ def run_eval(cached_dir: str, topk_values: List[int], criterion: str, device: st
         # PoE + MLP on mu/logvar sliced
         mlp = MLPHead(in_dim=K).to(device)
         opt = torch.optim.AdamW(mlp.parameters(), lr=3e-3, weight_decay=1e-4)
-        for epoch in range(5):
+        for epoch in range(1, 5 + 1):
             mlp.train()
-            for batch in train_loader:
+            pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"mlp_poe top{K} epoch {epoch}/5", leave=False)
+            for batch_idx, batch in pbar:
                 mu = batch["mu"][:, :, dims_tensor].to(device)
                 logvar = batch["logvar"][:, :, dims_tensor].to(device)
                 pm = batch["padding_mask"].to(device)
@@ -161,6 +168,7 @@ def run_eval(cached_dir: str, topk_values: List[int], criterion: str, device: st
                 logit = mlp(mu_p)
                 loss = F.binary_cross_entropy_with_logits(logit, y)
                 opt.zero_grad(); loss.backward(); opt.step()
+                pbar.set_postfix(epoch=epoch, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
         mlp.eval()
         def mlp_poe_fn(b):
             mu = b["mu"][:, :, dims_tensor].to(device)
@@ -180,7 +188,8 @@ def run_eval(cached_dir: str, topk_values: List[int], criterion: str, device: st
 @torch.no_grad()
 def _eval_loader(model_fn, loader) -> Dict[str, float]:
     logits, labels = [], []
-    for batch in loader:
+    pbar = tqdm(enumerate(loader, 1), total=len(loader), desc="eval", leave=False)
+    for _idx, batch in pbar:
         logit = model_fn(batch).detach().cpu()
         y = batch["label"].detach().cpu()
         logits.append(logit)
