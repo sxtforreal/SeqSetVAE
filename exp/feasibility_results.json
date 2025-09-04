@@ -1,0 +1,482 @@
+{
+  "linear_last_mu_tw_allh_valid": {
+    "auroc": 0.6154384613037109,
+    "auprc": 0.22040417790412903,
+    "recall@95spec": 0.14857881136950904
+  },
+  "linear_last_mu_tw_allh_valid_cal": {
+    "auroc": 0.6154420375823975,
+    "auprc": 0.22040437161922455,
+    "recall@95spec": 0.14857881136950904
+  },
+  "linear_last_mu_tw_allh_test": {
+    "auroc": 0.5963852405548096,
+    "auprc": 0.21794387698173523,
+    "recall@95spec": 0.17967914438502675
+  },
+  "linear_last_mu_tw_allh_test_cal": {
+    "auroc": 0.5963760614395142,
+    "auprc": 0.21793517470359802,
+    "recall@95spec": 0.17967914438502675
+  },
+  "linear_last_mu_logvar_tw_allh_valid": {
+    "auroc": 0.6225130558013916,
+    "auprc": 0.2204204946756363,
+    "recall@95spec": 0.1511627906976744
+  },
+  "linear_last_mu_logvar_tw_allh_valid_cal": {
+    "auroc": 0.6225128173828125,
+    "auprc": 0.22041989862918854,
+    "recall@95spec": 0.1511627906976744
+  },
+  "linear_last_mu_logvar_tw_allh_test": {
+    "auroc": 0.5990650653839111,
+    "auprc": 0.22179672122001648,
+    "recall@95spec": 0.17647058823529413
+  },
+  "linear_last_mu_logvar_tw_allh_test_cal": {
+    "auroc": 0.5990670919418335,
+    "auprc": 0.2217971384525299,
+    "recall@95spec": 0.17647058823529413
+  },
+  "mlp_mean_tw_allh_valid": {
+    "auroc": 0.7578728795051575,
+    "auprc": 0.3464142382144928,
+    "recall@95spec": 0.2713178294573643
+  },
+  "mlp_mean_tw_allh_valid_cal": {
+    "auroc": 0.7578728795051575,
+    "auprc": 0.3464142382144928,
+    "recall@95spec": 0.2713178294573643
+  },
+  "mlp_mean_tw_allh_test": {
+    "auroc": 0.7500214576721191,
+    "auprc": 0.3406822681427002,
+    "recall@95spec": 0.28449197860962566
+  },
+  "mlp_mean_tw_allh_test_cal": {
+    "auroc": 0.7500214576721191,
+    "auprc": 0.3406822681427002,
+    "recall@95spec": 0.28449197860962566
+  },
+  "mlp_poe_tw_allh_valid": {
+    "auroc": 0.5043807029724121,
+    "auprc": 0.1148405447602272,
+    "recall@95spec": 0.021963824289405683
+  },
+  "mlp_poe_tw_allh_valid_cal": {
+    "auroc": 0.5050248503684998,
+    "auprc": 0.11524944752454758,
+    "recall@95spec": 0.021963824289405683
+  },
+  "mlp_poe_tw_allh_test": {
+    "auroc": 0.5187051296234131,
+    "auprc": 0.11758589744567871,
+    "recall@95spec": 0.027807486631016044
+  },
+  "mlp_poe_tw_allh_test_cal": {
+    "auroc": 0.5192731022834778,
+    "auprc": 0.11758720874786377,
+    "recall@95spec": 0.027807486631016044
+  },
+  "mlp_w2_tw_allh_valid": {
+    "auroc": 0.758908212184906,
+    "auprc": 0.3530932068824768,
+    "recall@95spec": 0.26098191214470284
+  },
+  "mlp_w2_tw_allh_valid_cal": {
+    "auroc": 0.7589082717895508,
+    "auprc": 0.3530932068824768,
+    "recall@95spec": 0.26098191214470284
+  },
+  "mlp_w2_tw_allh_test": {
+    "auroc": 0.753230631351471,
+    "auprc": 0.3590439558029175,
+    "recall@95spec": 0.2877005347593583
+  },
+  "mlp_w2_tw_allh_test_cal": {
+    "auroc": 0.753230631351471,
+    "auprc": 0.3590439558029175,
+    "recall@95spec": 0.2877005347593583
+  },
+  "logistic_gaussian_poe_tw_allh_valid": {
+    "auroc": 0.7253626585006714,
+    "auprc": 0.3073060214519501,
+    "recall@95spec": 0.24289405684754523
+  },
+  "logistic_gaussian_poe_tw_allh_valid_cal": {
+    "auroc": 0.7253626585006714,
+    "auprc": 0.30730605125427246,
+    "recall@95spec": 0.24289405684754523
+  },
+  "logistic_gaussian_poe_tw_allh_test": {
+    "auroc": 0.7110026478767395,
+    "auprc": 0.2948477566242218,
+    "recall@95spec": 0.23315508021390374
+  },
+  "logistic_gaussian_poe_tw_allh_test_cal": {
+    "auroc": 0.7110025882720947,
+    "auprc": 0.2948477268218994,
+    "recall@95spec": 0.23315508021390374
+  },
+  "gaussian_mil_tw_allh_valid": {
+    "auroc": 0.7780264019966125,
+    "auprc": 0.373997300863266,
+    "recall@95spec": 0.31912144702842377
+  },
+  "gaussian_mil_tw_allh_valid_cal": {
+    "auroc": 0.7780264019966125,
+    "auprc": 0.373997300863266,
+    "recall@95spec": 0.31912144702842377
+  },
+  "gaussian_mil_tw_allh_test": {
+    "auroc": 0.7617677450180054,
+    "auprc": 0.3496750295162201,
+    "recall@95spec": 0.3048128342245989
+  },
+  "gaussian_mil_tw_allh_test_cal": {
+    "auroc": 0.7617677450180054,
+    "auprc": 0.3496750295162201,
+    "recall@95spec": 0.3048128342245989
+  },
+  "mlp_mc_mean_tw_allh_valid": {
+    "auroc": 0.7439660429954529,
+    "auprc": 0.31965136528015137,
+    "recall@95spec": 0.2248062015503876
+  },
+  "mlp_mc_mean_tw_allh_valid_cal": {
+    "auroc": 0.7439660429954529,
+    "auprc": 0.31965136528015137,
+    "recall@95spec": 0.2248062015503876
+  },
+  "mlp_mc_mean_tw_allh_test": {
+    "auroc": 0.7256043553352356,
+    "auprc": 0.2967177927494049,
+    "recall@95spec": 0.21818181818181817
+  },
+  "mlp_mc_mean_tw_allh_test_cal": {
+    "auroc": 0.7256043553352356,
+    "auprc": 0.2967177629470825,
+    "recall@95spec": 0.21818181818181817
+  },
+  "linear_last_mu_tw_24h_valid": {
+    "auroc": 0.5465500354766846,
+    "auprc": 0.15218614041805267,
+    "recall@95spec": 0.10981912144702842
+  },
+  "linear_last_mu_tw_24h_valid_cal": {
+    "auroc": 0.5465681552886963,
+    "auprc": 0.15219441056251526,
+    "recall@95spec": 0.10981912144702842
+  },
+  "linear_last_mu_tw_24h_test": {
+    "auroc": 0.5522032976150513,
+    "auprc": 0.1412505954504013,
+    "recall@95spec": 0.10481283422459893
+  },
+  "linear_last_mu_tw_24h_test_cal": {
+    "auroc": 0.5522079467773438,
+    "auprc": 0.1412716507911682,
+    "recall@95spec": 0.10481283422459893
+  },
+  "linear_last_mu_logvar_tw_24h_valid": {
+    "auroc": 0.5492463111877441,
+    "auprc": 0.15758530795574188,
+    "recall@95spec": 0.10723514211886305
+  },
+  "linear_last_mu_logvar_tw_24h_valid_cal": {
+    "auroc": 0.5492680668830872,
+    "auprc": 0.15759286284446716,
+    "recall@95spec": 0.10723514211886305
+  },
+  "linear_last_mu_logvar_tw_24h_test": {
+    "auroc": 0.5356226563453674,
+    "auprc": 0.1417289674282074,
+    "recall@95spec": 0.09946524064171124
+  },
+  "linear_last_mu_logvar_tw_24h_test_cal": {
+    "auroc": 0.535637617111206,
+    "auprc": 0.14173603057861328,
+    "recall@95spec": 0.09946524064171124
+  },
+  "mlp_mean_tw_24h_valid": {
+    "auroc": 0.7418736219406128,
+    "auprc": 0.35309508442878723,
+    "recall@95spec": 0.27002583979328165
+  },
+  "mlp_mean_tw_24h_valid_cal": {
+    "auroc": 0.7418736219406128,
+    "auprc": 0.35309508442878723,
+    "recall@95spec": 0.27002583979328165
+  },
+  "mlp_mean_tw_24h_test": {
+    "auroc": 0.7372599840164185,
+    "auprc": 0.3510483503341675,
+    "recall@95spec": 0.28449197860962566
+  },
+  "mlp_mean_tw_24h_test_cal": {
+    "auroc": 0.7372599244117737,
+    "auprc": 0.35104840993881226,
+    "recall@95spec": 0.28449197860962566
+  },
+  "mlp_poe_tw_24h_valid": {
+    "auroc": 0.49718040227890015,
+    "auprc": 0.1154746487736702,
+    "recall@95spec": 0.003875968992248062
+  },
+  "mlp_poe_tw_24h_valid_cal": {
+    "auroc": 0.49816441535949707,
+    "auprc": 0.11404256522655487,
+    "recall@95spec": 0.003875968992248062
+  },
+  "mlp_poe_tw_24h_test": {
+    "auroc": 0.4958007335662842,
+    "auprc": 0.11200433224439621,
+    "recall@95spec": 0.0
+  },
+  "mlp_poe_tw_24h_test_cal": {
+    "auroc": 0.49300986528396606,
+    "auprc": 0.10884768515825272,
+    "recall@95spec": 0.0
+  },
+  "mlp_w2_tw_24h_valid": {
+    "auroc": 0.747711181640625,
+    "auprc": 0.36093956232070923,
+    "recall@95spec": 0.29844961240310075
+  },
+  "mlp_w2_tw_24h_valid_cal": {
+    "auroc": 0.7477111220359802,
+    "auprc": 0.36093956232070923,
+    "recall@95spec": 0.29844961240310075
+  },
+  "mlp_w2_tw_24h_test": {
+    "auroc": 0.7478172183036804,
+    "auprc": 0.35967421531677246,
+    "recall@95spec": 0.29518716577540105
+  },
+  "mlp_w2_tw_24h_test_cal": {
+    "auroc": 0.7478172183036804,
+    "auprc": 0.3596741557121277,
+    "recall@95spec": 0.29518716577540105
+  },
+  "logistic_gaussian_poe_tw_24h_valid": {
+    "auroc": 0.7244071960449219,
+    "auprc": 0.32059717178344727,
+    "recall@95spec": 0.25839793281653745
+  },
+  "logistic_gaussian_poe_tw_24h_valid_cal": {
+    "auroc": 0.7244072556495667,
+    "auprc": 0.32059717178344727,
+    "recall@95spec": 0.25839793281653745
+  },
+  "logistic_gaussian_poe_tw_24h_test": {
+    "auroc": 0.7120359539985657,
+    "auprc": 0.3088439702987671,
+    "recall@95spec": 0.24812834224598931
+  },
+  "logistic_gaussian_poe_tw_24h_test_cal": {
+    "auroc": 0.7120359539985657,
+    "auprc": 0.3088439702987671,
+    "recall@95spec": 0.24812834224598931
+  },
+  "gaussian_mil_tw_24h_valid": {
+    "auroc": 0.592674732208252,
+    "auprc": 0.16929247975349426,
+    "recall@95spec": 0.12661498708010335
+  },
+  "gaussian_mil_tw_24h_valid_cal": {
+    "auroc": 0.592674732208252,
+    "auprc": 0.16929249465465546,
+    "recall@95spec": 0.12661498708010335
+  },
+  "gaussian_mil_tw_24h_test": {
+    "auroc": 0.5825960636138916,
+    "auprc": 0.15128794312477112,
+    "recall@95spec": 0.10160427807486631
+  },
+  "gaussian_mil_tw_24h_test_cal": {
+    "auroc": 0.5825960040092468,
+    "auprc": 0.15128779411315918,
+    "recall@95spec": 0.10160427807486631
+  },
+  "mlp_mc_mean_tw_24h_valid": {
+    "auroc": 0.742321252822876,
+    "auprc": 0.32637012004852295,
+    "recall@95spec": 0.25064599483204136
+  },
+  "mlp_mc_mean_tw_24h_valid_cal": {
+    "auroc": 0.742321252822876,
+    "auprc": 0.32637014985084534,
+    "recall@95spec": 0.25064599483204136
+  },
+  "mlp_mc_mean_tw_24h_test": {
+    "auroc": 0.7258397936820984,
+    "auprc": 0.31141939759254456,
+    "recall@95spec": 0.25882352941176473
+  },
+  "mlp_mc_mean_tw_24h_test_cal": {
+    "auroc": 0.7258397936820984,
+    "auprc": 0.31141939759254456,
+    "recall@95spec": 0.25882352941176473
+  },
+  "linear_last_mu_tw_72h_valid": {
+    "auroc": 0.6249634027481079,
+    "auprc": 0.219053253531456,
+    "recall@95spec": 0.14728682170542637
+  },
+  "linear_last_mu_tw_72h_valid_cal": {
+    "auroc": 0.6249635219573975,
+    "auprc": 0.2190532386302948,
+    "recall@95spec": 0.14728682170542637
+  },
+  "linear_last_mu_tw_72h_test": {
+    "auroc": 0.5943304300308228,
+    "auprc": 0.21505054831504822,
+    "recall@95spec": 0.17433155080213902
+  },
+  "linear_last_mu_tw_72h_test_cal": {
+    "auroc": 0.5943300127983093,
+    "auprc": 0.21505042910575867,
+    "recall@95spec": 0.17433155080213902
+  },
+  "linear_last_mu_logvar_tw_72h_valid": {
+    "auroc": 0.6305568218231201,
+    "auprc": 0.2254856377840042,
+    "recall@95spec": 0.1524547803617571
+  },
+  "linear_last_mu_logvar_tw_72h_valid_cal": {
+    "auroc": 0.6305574774742126,
+    "auprc": 0.22550034523010254,
+    "recall@95spec": 0.1524547803617571
+  },
+  "linear_last_mu_logvar_tw_72h_test": {
+    "auroc": 0.6030370593070984,
+    "auprc": 0.22788086533546448,
+    "recall@95spec": 0.18502673796791444
+  },
+  "linear_last_mu_logvar_tw_72h_test_cal": {
+    "auroc": 0.6030315160751343,
+    "auprc": 0.22786837816238403,
+    "recall@95spec": 0.18502673796791444
+  },
+  "mlp_mean_tw_72h_valid": {
+    "auroc": 0.7429274320602417,
+    "auprc": 0.3344942629337311,
+    "recall@95spec": 0.268733850129199
+  },
+  "mlp_mean_tw_72h_valid_cal": {
+    "auroc": 0.7429273724555969,
+    "auprc": 0.3344942629337311,
+    "recall@95spec": 0.268733850129199
+  },
+  "mlp_mean_tw_72h_test": {
+    "auroc": 0.7370519042015076,
+    "auprc": 0.33835944533348083,
+    "recall@95spec": 0.26844919786096255
+  },
+  "mlp_mean_tw_72h_test_cal": {
+    "auroc": 0.7370519042015076,
+    "auprc": 0.33835944533348083,
+    "recall@95spec": 0.26844919786096255
+  },
+  "mlp_poe_tw_72h_valid": {
+    "auroc": 0.5059064626693726,
+    "auprc": 0.11676125228404999,
+    "recall@95spec": 0.0012919896640826874
+  },
+  "mlp_poe_tw_72h_valid_cal": {
+    "auroc": 0.5059289932250977,
+    "auprc": 0.11720457673072815,
+    "recall@95spec": 0.0012919896640826874
+  },
+  "mlp_poe_tw_72h_test": {
+    "auroc": 0.5091144442558289,
+    "auprc": 0.11748918145895004,
+    "recall@95spec": 0.0053475935828877
+  },
+  "mlp_poe_tw_72h_test_cal": {
+    "auroc": 0.5091260671615601,
+    "auprc": 0.11733773350715637,
+    "recall@95spec": 0.0053475935828877
+  },
+  "mlp_w2_tw_72h_valid": {
+    "auroc": 0.7550022602081299,
+    "auprc": 0.3468397259712219,
+    "recall@95spec": 0.2842377260981912
+  },
+  "mlp_w2_tw_72h_valid_cal": {
+    "auroc": 0.7550022602081299,
+    "auprc": 0.34683966636657715,
+    "recall@95spec": 0.2842377260981912
+  },
+  "mlp_w2_tw_72h_test": {
+    "auroc": 0.7461833357810974,
+    "auprc": 0.33591407537460327,
+    "recall@95spec": 0.279144385026738
+  },
+  "mlp_w2_tw_72h_test_cal": {
+    "auroc": 0.7461833953857422,
+    "auprc": 0.3359140455722809,
+    "recall@95spec": 0.279144385026738
+  },
+  "logistic_gaussian_poe_tw_72h_valid": {
+    "auroc": 0.7251725196838379,
+    "auprc": 0.30734652280807495,
+    "recall@95spec": 0.2441860465116279
+  },
+  "logistic_gaussian_poe_tw_72h_valid_cal": {
+    "auroc": 0.7251725196838379,
+    "auprc": 0.30734655261039734,
+    "recall@95spec": 0.2441860465116279
+  },
+  "logistic_gaussian_poe_tw_72h_test": {
+    "auroc": 0.7107636332511902,
+    "auprc": 0.2947196066379547,
+    "recall@95spec": 0.2374331550802139
+  },
+  "logistic_gaussian_poe_tw_72h_test_cal": {
+    "auroc": 0.7107635736465454,
+    "auprc": 0.2947196066379547,
+    "recall@95spec": 0.2374331550802139
+  },
+  "gaussian_mil_tw_72h_valid": {
+    "auroc": 0.7783204913139343,
+    "auprc": 0.3722536265850067,
+    "recall@95spec": 0.32170542635658916
+  },
+  "gaussian_mil_tw_72h_valid_cal": {
+    "auroc": 0.7783204913139343,
+    "auprc": 0.3722536265850067,
+    "recall@95spec": 0.32170542635658916
+  },
+  "gaussian_mil_tw_72h_test": {
+    "auroc": 0.7630817294120789,
+    "auprc": 0.35378298163414,
+    "recall@95spec": 0.306951871657754
+  },
+  "gaussian_mil_tw_72h_test_cal": {
+    "auroc": 0.7630817294120789,
+    "auprc": 0.35378298163414,
+    "recall@95spec": 0.306951871657754
+  },
+  "mlp_mc_mean_tw_72h_valid": {
+    "auroc": 0.7332119941711426,
+    "auprc": 0.3083670139312744,
+    "recall@95spec": 0.2351421188630491
+  },
+  "mlp_mc_mean_tw_72h_valid_cal": {
+    "auroc": 0.7332119941711426,
+    "auprc": 0.3083670139312744,
+    "recall@95spec": 0.2351421188630491
+  },
+  "mlp_mc_mean_tw_72h_test": {
+    "auroc": 0.7129586935043335,
+    "auprc": 0.2893156111240387,
+    "recall@95spec": 0.2267379679144385
+  },
+  "mlp_mc_mean_tw_72h_test_cal": {
+    "auroc": 0.7129586935043335,
+    "auprc": 0.2893156111240387,
+    "recall@95spec": 0.2267379679144385
+  }
+}
