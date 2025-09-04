@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchmetrics.classification import AUROC, AveragePrecision
+from tqdm import tqdm
 
 import sys
 # Ensure main module directory is importable when running from exp/
@@ -286,15 +287,17 @@ def main():
         # last mu
         lin = nn.Linear(D, 1).to(device)
         opt = torch.optim.AdamW(lin.parameters(), lr=5e-3, weight_decay=1e-4)
-        for _ in range(args.epochs_linear):
+        for epoch_idx in range(1, args.epochs_linear + 1):
             lin.train()
-            for batch in train_loader:
+            pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"linear_last_mu {tag} epoch {epoch_idx}/{args.epochs_linear}", leave=False)
+            for batch_idx, batch in pbar:
                 mu, _, _, pm = tw_apply(batch, hours)
                 y = batch["label"].float().to(device)
                 x = masked_select_last(mu, pm)
                 logit = lin(x).squeeze(-1)
                 loss = F.binary_cross_entropy_with_logits(logit, y, pos_weight=torch.tensor(args.pos_weight, device=device))
                 opt.zero_grad(); loss.backward(); opt.step()
+                pbar.set_postfix(epoch=epoch_idx, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
         lin.eval()
         # Clean evaluation using a properly defined function (removes placeholder logic)
         def lin_fn(b):
@@ -310,15 +313,17 @@ def main():
         # last [mu||logvar]
         lin2 = nn.Linear(2*D, 1).to(device)
         opt2 = torch.optim.AdamW(lin2.parameters(), lr=5e-3, weight_decay=1e-4)
-        for _ in range(args.epochs_linear):
+        for epoch_idx in range(1, args.epochs_linear + 1):
             lin2.train()
-            for batch in train_loader:
+            pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"linear_last_mu_logvar {tag} epoch {epoch_idx}/{args.epochs_linear}", leave=False)
+            for batch_idx, batch in pbar:
                 mu, logvar, _, pm = tw_apply(batch, hours)
                 y = batch["label"].float().to(device)
                 x = torch.cat([masked_select_last(mu, pm), masked_select_last(logvar, pm)], dim=-1)
                 logit = lin2(x).squeeze(-1)
                 loss = F.binary_cross_entropy_with_logits(logit, y, pos_weight=torch.tensor(args.pos_weight, device=device))
                 opt2.zero_grad(); loss.backward(); opt2.step()
+                pbar.set_postfix(epoch=epoch_idx, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
         def lin2_fn(b):
             mu, logvar, _, pm = tw_apply(b, hours)
             x = torch.cat([masked_select_last(mu, pm), masked_select_last(logvar, pm)], dim=-1)
@@ -334,9 +339,10 @@ def main():
         def run_mlp(pool_fn, name: str):
             mlp = MLPHead(in_dim=2*D).to(device)
             opt = torch.optim.AdamW(mlp.parameters(), lr=3e-3, weight_decay=1e-4)
-            for _ in range(args.epochs_mlp):
+            for epoch_idx in range(1, args.epochs_mlp + 1):
                 mlp.train()
-                for batch in train_loader:
+                pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"mlp_{name} {tag} epoch {epoch_idx}/{args.epochs_mlp}", leave=False)
+                for batch_idx, batch in pbar:
                     mu, logvar, _, pm = tw_apply(batch, hours)
                     y = batch["label"].float().to(device)
                     mu_p, logvar_p = pool_fn(mu, logvar, pm)
@@ -344,6 +350,7 @@ def main():
                     logit = mlp(x)
                     loss = F.binary_cross_entropy_with_logits(logit, y, pos_weight=torch.tensor(args.pos_weight, device=device))
                     opt.zero_grad(); loss.backward(); opt.step()
+                    pbar.set_postfix(epoch=epoch_idx, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
             def fn(b):
                 mu, logvar, _, pm = tw_apply(b, hours)
                 mu_p, logvar_p = pool_fn(mu, logvar, pm)
@@ -362,15 +369,17 @@ def main():
         # 3) Closed-form Logistic–Gaussian on PoE aggregate
         lg = LogisticGaussianHead(in_dim=D).to(device)
         opt_lg = torch.optim.AdamW(lg.parameters(), lr=3e-3, weight_decay=1e-4)
-        for _ in range(args.epochs_mlp):
+        for epoch_idx in range(1, args.epochs_mlp + 1):
             lg.train()
-            for batch in train_loader:
+            pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"logistic_gaussian_poe {tag} epoch {epoch_idx}/{args.epochs_mlp}", leave=False)
+            for batch_idx, batch in pbar:
                 mu, logvar, _, pm = tw_apply(batch, hours)
                 y = batch["label"].float().to(device)
                 mu_p, logvar_p = pool_poe(mu, logvar, pm)
                 logit = lg(mu_p, logvar_p)
                 loss = F.binary_cross_entropy_with_logits(logit, y, pos_weight=torch.tensor(args.pos_weight, device=device))
                 opt_lg.zero_grad(); loss.backward(); opt_lg.step()
+                pbar.set_postfix(epoch=epoch_idx, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
         def lg_fn(b):
             mu, logvar, _, pm = tw_apply(b, hours)
             mu_p, logvar_p = pool_poe(mu, logvar, pm)
@@ -385,9 +394,10 @@ def main():
         # 4) Gaussian-MIL head
         mil = GaussianMILHead(latent_dim=D, num_classes=2, use_time=True, gate_hidden_dim=128).to(device)
         opt_mil = torch.optim.AdamW(mil.parameters(), lr=3e-3, weight_decay=1e-4)
-        for _ in range(args.epochs_mil):
+        for epoch_idx in range(1, args.epochs_mil + 1):
             mil.train()
-            for batch in train_loader:
+            pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"gaussian_mil {tag} epoch {epoch_idx}/{args.epochs_mil}", leave=False)
+            for batch_idx, batch in pbar:
                 mu, logvar, minutes, pm = tw_apply(batch, hours)
                 y = batch["label"].float().to(device)
                 mu = mu.masked_fill(pm.unsqueeze(-1), 0.0)
@@ -397,6 +407,7 @@ def main():
                 logit_pos = logits[:, 1]
                 loss = F.binary_cross_entropy_with_logits(logit_pos, y, pos_weight=torch.tensor(args.pos_weight, device=device))
                 opt_mil.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(mil.parameters(), 1.0); opt_mil.step()
+                pbar.set_postfix(epoch=epoch_idx, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
         def mil_fn(b):
             mu, logvar, minutes, pm = tw_apply(b, hours)
             mu = mu.masked_fill(pm.unsqueeze(-1), 0.0)
@@ -414,9 +425,10 @@ def main():
         # 5) Light MC sampling + mean pooling + MLP
         mlp_mc = MLPHead(in_dim=D).to(device)
         opt_mc = torch.optim.AdamW(mlp_mc.parameters(), lr=3e-3, weight_decay=1e-4)
-        for _ in range(args.epochs_mlp):
+        for epoch_idx in range(1, args.epochs_mlp + 1):
             mlp_mc.train()
-            for batch in train_loader:
+            pbar = tqdm(enumerate(train_loader, 1), total=len(train_loader), desc=f"mlp_mc_mean {tag} epoch {epoch_idx}/{args.epochs_mlp}", leave=False)
+            for batch_idx, batch in pbar:
                 mu, logvar, _, pm = tw_apply(batch, hours)
                 y = batch["label"].float().to(device)
                 var = logvar.exp().clamp(min=1e-6)
@@ -431,6 +443,7 @@ def main():
                 logit = logits_acc / float(args.mc_k)
                 loss = F.binary_cross_entropy_with_logits(logit, y, pos_weight=torch.tensor(args.pos_weight, device=device))
                 opt_mc.zero_grad(); loss.backward(); opt_mc.step()
+                pbar.set_postfix(epoch=epoch_idx, batch=f"{batch_idx}/{len(train_loader)}", loss=f"{loss.item():.4f}")
         def mlp_mc_fn(b):
             mu, logvar, _, pm = tw_apply(b, hours)
             var = logvar.exp().clamp(min=1e-6)
