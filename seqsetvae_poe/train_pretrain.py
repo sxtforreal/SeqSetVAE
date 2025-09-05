@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 import os
+import sys
 import argparse
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from . import config
-from .dataset import DataModule
-from .model import PoESeqSetVAEPretrain
+# Make script runnable both as package and as a standalone file
+PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+if PKG_DIR not in sys.path:
+    sys.path.insert(0, PKG_DIR)
+
+try:
+    from . import config  # type: ignore
+    from .dataset import DataModule  # type: ignore
+    from .model import PoESeqSetVAEPretrain  # type: ignore
+except Exception:
+    import config
+    from dataset import DataModule
+    from model import PoESeqSetVAEPretrain
 
 
 def main():
