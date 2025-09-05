@@ -9,7 +9,7 @@ What this script does (time window = all only):
 - Runs the focused Gaussian-MIL ablations (10 small variants) and aggregates
   metrics across seeds.
 - Reports AUROC/AUPRC/Recall@95% specificity on valid/test (+ temperature calibration)
-- Saves a single JSON with all results and an English guide describing tests.
+- Saves a single JSON with all results.
 
 Inputs:
 - --cached_dir: directory produced by exp/cache_features.py with train/valid/test
@@ -842,7 +842,7 @@ def main():
         results[f"ablation.{name}_test_cal"] = reduce_stats(seed_results_test_cal)
 
     # --------------------------
-    # Save results and guide
+    # Save results
     # --------------------------
     print("\n=== Combined Results (Feasibility + Gaussian-MIL Ablations) ===")
     for k, v in results.items():
@@ -858,52 +858,6 @@ def main():
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Saved results to {out_json}")
-
-    guide_path = os.path.join(args.cached_dir, "combined_tests_guide.md")
-    guide_text = _build_english_guide()
-    with open(guide_path, "w") as f:
-        f.write(guide_text)
-    print(f"Saved guide to {guide_path}")
-
-
-def _build_english_guide() -> str:
-    return (
-        "# Combined Feasibility + Gaussian-MIL Ablation Tests\n\n"
-        "This run evaluates only the full history (time window = all). No 24h/72h truncation is used.\n\n"
-        "## Datasets and Inputs\n"
-        "- Cached per-set posteriors produced by `exp/cache_features.py` under `train/valid/test`.\n"
-        "- Each sample contains tensors: `mu [S,D]`, `logvar [S,D]`, `minutes [S]`, `label`, and a padding mask is derived at collate time.\n\n"
-        "## Metrics\n"
-        "- AUROC, AUPRC, and Recall at 95% specificity are reported.\n"
-        "- We also perform temperature calibration on the validation split and report calibrated metrics.\n\n"
-        "## Part A — Feasibility Suite (single pass, all-time)\n"
-        "1. Linear probe (last mu):\n"
-        "   - Selects the last non-padded time step's latent mean per sequence and fits a single linear layer.\n"
-        "2. Linear probe (last [mu||logvar]):\n"
-        "   - Concatenates last-step `mu` and `logvar` and trains a linear head.\n"
-        "3. Pooled MLPs over per-set posteriors: mean / Product-of-Experts (PoE) / W2:\n"
-        "   - Pools `mu` and `logvar` across sets via mean, precision-weighted PoE, or Wasserstein-2 style average; then feeds `[mu_pool||logvar_pool]` to a small MLP.\n"
-        "4. Closed-form Logistic–Gaussian on PoE aggregate:\n"
-        "   - Applies a MacKay-style scaling for a logistic head directly on PoE `(mu, logvar)` aggregates.\n"
-        "5. Baseline Gaussian-MIL head:\n"
-        "   - Uses the project’s `model.GaussianMILHead` with time as an input, trained with BCE-with-logits.\n"
-        "6. Light Monte-Carlo (MC) sampling + mean pooling + MLP:\n"
-        "   - Draws K samples from each per-set Gaussian, mean-pools sampled `z`, and feeds to an MLP; logits are averaged over K.\n\n"
-        "## Part B — Gaussian-MIL Ablations (all-time)\n"
-        "Each ablation modifies the Gaussian-MIL variant head while keeping the dataset and training loop fixed. Results are averaged across multiple seeds.\n\n"
-        "- baseline_mean_or: Mean aggregation mixed with a Noisy-OR branch.\n"
-        "- lse_or: LogSumExp aggregation mixed with Noisy-OR.\n"
-        "- pmean_or: Learnable power-mean aggregation mixed with Noisy-OR.\n"
-        "- topk2_mean_or / topk3_mean_or: Keep only the top-2/top-3 instances according to the gate, then normalize weights and aggregate with mean, mixed with Noisy-OR.\n"
-        "- precision_attention: Interpolates gate weights with precision-based attention (`mu^2/var`).\n"
-        "- snr_features: Augments gate inputs with three SNR-like features: `||mu||/sqrt(D)`, `mean(logvar)`, and `mean(mu^2/var)`.\n"
-        "- group_lasso: Adds a group lasso penalty on the first gate layer’s input groups (controlled by `--group_lasso_lambda`).\n"
-        "- deepsets_ctx: Adds a DeepSets context vector computed from per-instance `[mu||logvar]`.\n"
-        "- focal_bce_hinge: Optionally swaps BCE for focal loss (controlled by flags) and adds a small hinge penalty nudging negatives below a batch-wise specificity threshold.\n\n"
-        "## Outputs\n"
-        "- JSON: `combined_results.json` aggregates all metrics for both Part A and Part B.\n"
-        "- Guide: `combined_tests_guide.md` (this file) summarizes what was tested.\n"
-    )
 
 
 if __name__ == "__main__":
