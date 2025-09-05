@@ -146,7 +146,14 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
 def _apply_embeddings(df: pd.DataFrame, emb_df: pd.DataFrame, key_col: str) -> pd.DataFrame:
     # Merge on variable name
     merged = df.merge(emb_df, how="left", left_on="variable", right_on=key_col)
-    if key_col in merged.columns:
+    # Ensure we always carry a single column named 'variable' after merge.
+    # When key_col == 'variable', pandas will create 'variable_x'/'variable_y'.
+    if "variable_x" in merged.columns:
+        merged = merged.rename(columns={"variable_x": "variable"})
+    if "variable_y" in merged.columns:
+        merged = merged.drop(columns=["variable_y"]) 
+    # If the right key column is present with a different name, drop it.
+    if key_col in merged.columns and key_col != "variable":
         merged = merged.drop(columns=[key_col])
     # Fill missing embeddings with zeros
     vcols = [c for c in merged.columns if c.startswith("v") and c[1:].isdigit()]
@@ -158,14 +165,19 @@ def _apply_embeddings(df: pd.DataFrame, emb_df: pd.DataFrame, key_col: str) -> p
 
 
 def _apply_value_normalization(df: pd.DataFrame, stats_df: pd.DataFrame, key_col: str) -> pd.DataFrame:
-    df = df.merge(stats_df, how="left", left_on="variable", right_on=key_col)
-    if key_col in df.columns:
-        df = df.drop(columns=[key_col])
+    merged = df.merge(stats_df, how="left", left_on="variable", right_on=key_col)
+    # Normalize duplicate key columns to a single 'variable'
+    if "variable_x" in merged.columns:
+        merged = merged.rename(columns={"variable_x": "variable"})
+    if "variable_y" in merged.columns:
+        merged = merged.drop(columns=["variable_y"]) 
+    if key_col in merged.columns and key_col != "variable":
+        merged = merged.drop(columns=[key_col])
     # If std is zero/NaN, use 1.0 to avoid division by zero
-    std_safe = df["std"].replace(0, np.nan).fillna(1.0).astype(np.float32)
-    mean_safe = df["mean"].fillna(0.0).astype(np.float32)
-    df["value"] = (df["value_raw"].astype(np.float32) - mean_safe) / std_safe
-    return df.drop(columns=["mean", "std"])
+    std_safe = merged["std"].replace(0, np.nan).fillna(1.0).astype(np.float32)
+    mean_safe = merged["mean"].fillna(0.0).astype(np.float32)
+    merged["value"] = (merged["value_raw"].astype(np.float32) - mean_safe) / std_safe
+    return merged.drop(columns=["mean", "std"])
 
 
 def _validate_output(df: pd.DataFrame, emb_dim: int) -> None:
@@ -198,6 +210,10 @@ def _process_one_file(
     stats_key: str,
 ) -> pd.DataFrame:
     raw = pd.read_parquet(fp, engine="pyarrow")
+    # Drop irrelevant columns if present
+    drop_cols = [c for c in ["TABLE", "abnormal"] if c in raw.columns]
+    if drop_cols:
+        raw = raw.drop(columns=drop_cols)
     if not {"variable", "value", "minute"}.issubset(set(raw.columns)):
         raise ValueError(f"Input parquet {fp} must contain columns ['variable','value','minute']")
     exp = expand_patient(raw, lvcf_minutes)
