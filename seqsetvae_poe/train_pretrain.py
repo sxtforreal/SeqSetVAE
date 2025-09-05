@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--precision", type=str, default="16-mixed")
+    parser.add_argument("--smoke", action="store_true", help="Build one train batch of 10 random samples for smoke test")
     args = parser.parse_args()
 
     dm = DataModule(
@@ -37,6 +38,8 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
+        smoke=args.smoke,
+        smoke_batch_size=10,
     )
 
     model = PoESeqSetVAEPretrain(

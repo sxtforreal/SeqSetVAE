@@ -1,25 +1,22 @@
 import os
 import glob
+import random
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import lightning.pytorch as pl
 from typing import Dict, Any, List, Tuple, Optional
 
 
 class PatientDataset(Dataset):
     """
-    Per-patient Parquet reader. Each file contains a full patient timeline with
-    at least the following columns:
-      - variable: categorical code key matching `cached.csv` embeddings
-      - value: numeric value
-      - minute: absolute minute since admission
-      - set_index: integer set id per unique minute (monotonic non-decreasing)
-      - is_carry: 1 if the value is carry-forwarded from last observation
-      - age: patient age at the event time (years)
+    Per-patient Parquet reader compatible with LVCF outputs.
 
-    File name (without extension) is the patient id.
+    Each parquet must include columns:
+      - variable, value, time, set_index, age, is_carry, v0..v{D-1}
+
+    File name (without extension) is used as the patient id.
     """
 
     def __init__(self, partition: str, saved_dir: str):
@@ -38,49 +35,45 @@ class PatientDataset(Dataset):
         return df, self.ids[idx]
 
 
-def _normalize_vals(df: pd.DataFrame, params_map: Dict[str, Dict[str, float]]) -> torch.Tensor:
-    raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
-    norm_vals = torch.zeros_like(raw_vals)
-    for i, ev in enumerate(df["variable"].to_numpy()):
-        if ev in params_map:
-            m, s = params_map[ev]["mean"], params_map[ev]["std"]
-            norm_vals[i] = (raw_vals[i] - m) / (s if s > 0 else 1.0)
-        else:
-            norm_vals[i] = raw_vals[i]
-    return norm_vals
+def _detect_vcols(df: pd.DataFrame) -> List[str]:
+    vcols = [c for c in df.columns if c.startswith("v") and c[1:].isdigit()]
+    if len(vcols) == 0:
+        raise RuntimeError("No embedding columns found (expected v0..v{D-1})")
+    # sort by numeric suffix to ensure correct order
+    vcols = sorted(vcols, key=lambda c: int(c[1:]))
+    return vcols
 
 
-def _collate_with_padding(
-    batch: List[Tuple[pd.DataFrame, str]],
-    cached_embs: Dict[str, torch.Tensor],
-    params_map: Dict[str, Dict[str, float]],
-) -> Dict[str, Any]:
+def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Dict[str, Any]:
     B = len(batch)
-    embed_dim = next(iter(cached_embs.values())).shape[0]
+    embed_dim = len(vcols)
     max_len = max(len(df) for df, _ in batch)
-    var = torch.zeros(B, max_len, embed_dim)
-    val = torch.zeros(B, max_len, 1)
-    minute = torch.zeros(B, max_len, 1)
+    var = torch.zeros(B, max_len, embed_dim, dtype=torch.float32)
+    val = torch.zeros(B, max_len, 1, dtype=torch.float32)
+    minute = torch.zeros(B, max_len, 1, dtype=torch.float32)
     set_id = torch.zeros(B, max_len, 1, dtype=torch.long)
-    age = torch.zeros(B, max_len, 1)
-    carry_mask = torch.zeros(B, max_len, 1)
+    age = torch.zeros(B, max_len, 1, dtype=torch.float32)
+    carry_mask = torch.zeros(B, max_len, 1, dtype=torch.float32)
     padding_mask = torch.ones(B, max_len, dtype=torch.bool)
 
     for b, (df, _) in enumerate(batch):
         n = len(df)
         if n == 0:
             continue
-        var[b, :n] = torch.stack([cached_embs[v] for v in df["variable"]])
-        val[b, :n] = _normalize_vals(df, params_map)
-        minute[b, :n] = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(-1, 1)
-        if "set_index" in df.columns:
-            set_id[b, :n] = torch.tensor(df["set_index"].to_numpy(dtype=np.int64)).view(-1, 1)
-        else:
-            set_id[b, :n] = torch.tensor((df["minute"].diff().fillna(0) != 0).cumsum().to_numpy(dtype=np.int64)).view(-1, 1)
+        # embeddings
+        var_np = df[vcols].to_numpy(dtype=np.float32, copy=False)
+        var[b, :n] = torch.from_numpy(var_np)
+        # values already normalized by LVCF
+        val[b, :n] = torch.from_numpy(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
+        # time -> minute key expected by the model
+        minute[b, :n] = torch.from_numpy(df["time"].to_numpy(dtype=np.float32)).view(-1, 1)
+        # set index
+        set_id[b, :n] = torch.from_numpy(df["set_index"].to_numpy(dtype=np.int64)).view(-1, 1)
+        # optional extras
         if "age" in df.columns:
-            age[b, :n] = torch.tensor(df["age"].to_numpy(dtype=np.float32)).view(-1, 1)
+            age[b, :n] = torch.from_numpy(df["age"].to_numpy(dtype=np.float32)).view(-1, 1)
         if "is_carry" in df.columns:
-            carry_mask[b, :n] = torch.tensor(df["is_carry"].to_numpy(dtype=np.float32)).view(-1, 1)
+            carry_mask[b, :n] = torch.from_numpy(df["is_carry"].to_numpy(dtype=np.float32)).view(-1, 1)
         padding_mask[b, :n] = False
 
     return {
@@ -98,45 +91,70 @@ class DataModule(pl.LightningDataModule):
     def __init__(
         self,
         saved_dir: str,
-        params_map_path: str,
+        params_map_path: Optional[str] = None,
         batch_size: int = 4,
         num_workers: int = 4,
         pin_memory: bool = True,
+        smoke: bool = False,
+        smoke_batch_size: int = 10,
+        seed: Optional[int] = None,
     ):
         super().__init__()
         self.saved_dir = saved_dir
+        # params_map_path kept for backward-compatibility; not used with LVCF outputs
         self.params_map_path = params_map_path
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.smoke = smoke
+        self.smoke_batch_size = smoke_batch_size
+        self.seed = seed
 
-        cached = pd.read_csv(os.path.join(saved_dir, "../cached.csv"))
-        self.cached_embs: Dict[str, torch.Tensor] = {
-            row["Key"]: torch.tensor(row.iloc[1:].to_numpy(dtype=np.float32))
-            for _, row in cached.iterrows()
-        }
-        self.params_map: Optional[Dict[str, Dict[str, float]]] = None
+        self.vcols: Optional[List[str]] = None
+        self._rng = random.Random(seed)
 
     def setup(self, stage=None):
-        stats = pd.read_csv(self.params_map_path)
-        self.params_map = {
-            r["variable"]: {"mean": r["mean"], "std": r["std"]} for _, r in stats.iterrows()
-        }
+        # Instantiate datasets
         self.train = PatientDataset("train", self.saved_dir)
         self.valid = PatientDataset("valid", self.saved_dir)
         self.test = PatientDataset("test", self.saved_dir)
 
+        # Detect embedding columns from the first available file
+        sample_df, _ = self.train[0]
+        self.vcols = _detect_vcols(sample_df)
+
+        # Optionally prepare smoke subset indices
+        if self.smoke:
+            n = len(self.train)
+            k = min(self.smoke_batch_size, n)
+            self._smoke_indices = self._rng.sample(range(n), k)
+        else:
+            self._smoke_indices = None
+
     def _loader(self, ds, shuffle):
+        vcols = self.vcols
+        assert vcols is not None, "DataModule.setup() must be called before creating dataloaders"
         return DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda b: _collate_with_padding(b, self.cached_embs, self.params_map),
+            collate_fn=lambda b: _collate_lvcf(b, vcols),
         )
 
     def train_dataloader(self):
+        if getattr(self, "_smoke_indices", None) is not None:
+            subset = Subset(self.train, self._smoke_indices)
+            # ensure one batch containing exactly smoke_batch_size samples
+            return DataLoader(
+                subset,
+                batch_size=len(subset),
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                collate_fn=lambda b: _collate_lvcf(b, self.vcols),
+            )
         return self._loader(self.train, True)
 
     def val_dataloader(self):
@@ -144,4 +162,19 @@ class DataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         return self._loader(self.test, False)
+
+    def build_smoke_batch(self) -> Dict[str, Any]:
+        """
+        Build and return a single collated batch of `smoke_batch_size` random
+        train samples for quick end-to-end testing without a Trainer.
+        """
+        if self.vcols is None:
+            # lazily call setup if not run
+            self.setup()
+        assert self.vcols is not None
+        n = len(self.train)
+        k = min(self.smoke_batch_size, n)
+        idxs = self._rng.sample(range(n), k)
+        batch_items: List[Tuple[pd.DataFrame, str]] = [self.train[i] for i in idxs]
+        return _collate_lvcf(batch_items, self.vcols)
 
