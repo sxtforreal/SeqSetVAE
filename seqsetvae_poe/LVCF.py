@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 LVCF: Expand per-patient raw EHR Parquet with Last-Value-Carry-Forward and enrich.
 
@@ -14,7 +13,7 @@ Pipeline per patient Parquet:
 
 Input directory layout:
   input_dir/
-    train/*.parquet  # one file per patient
+    train/*.parquet
     valid/*.parquet
     test/*.parquet
 
@@ -26,7 +25,14 @@ CSV expectations:
 Outputs mirror the input split layout and include columns:
   [variable, value, time, set_index, age, is_carry, v0..v767]
 
-Use --smoke to process and validate one sample (first file under train).
+Use
+python -u /home/sunx/data/aiiih/projects/sunx/projects/SSV/main/LVCF.py \
+  --input_dir /home/sunx/data/aiiih/data/mimic/processed/patient_ehr \
+  --output_dir /home/sunx/data/aiiih/data/mimic/processed/SeqSetVAE \
+  --event_emb_csv /home/sunx/data/aiiih/data/mimic/processed/cached.csv \
+  --value_stats_csv /home/sunx/data/aiiih/data/mimic/processed/stats.csv \
+  --lvcf_minutes 60 \
+  --overwrite
 """
 
 import os
@@ -52,7 +58,11 @@ def _load_event_embeddings(csv_path: str) -> Tuple[pd.DataFrame, str, int]:
     cache = pd.read_csv(csv_path)
     key_col = _detect_key_column(cache)
     # Keep only numeric columns for embeddings
-    numeric_cols = [c for c in cache.columns if c != key_col and pd.api.types.is_numeric_dtype(cache[c])]
+    numeric_cols = [
+        c
+        for c in cache.columns
+        if c != key_col and pd.api.types.is_numeric_dtype(cache[c])
+    ]
     if len(numeric_cols) == 0:
         raise ValueError("No numeric embedding columns found in event_emb_csv")
     # Ensure deterministic order for columns
@@ -111,14 +121,16 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
         for _, r in cur.iterrows():
             v = r["variable"]
             val = r["value"]
-            rows.append({
-                "variable": v,
-                "value": val,  # temporary; will be normalized later
-                "time": float(m),
-                "set_index": int(set_idx),
-                "age": 0.0,
-                "is_carry": 0.0,
-            })
+            rows.append(
+                {
+                    "variable": v,
+                    "value": val,  # temporary; will be normalized later
+                    "time": float(m),
+                    "set_index": int(set_idx),
+                    "age": 0.0,
+                    "is_carry": 0.0,
+                }
+            )
             last_seen_time[v] = float(m)
             last_seen_val[v] = val
 
@@ -128,20 +140,26 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
                 continue
             if v in last_seen_time and (float(m) - last_seen_time[v]) <= window:
                 dt = float(m) - last_seen_time[v]
-                rows.append({
-                    "variable": v,
-                    "value": last_seen_val[v],  # temporary; will be normalized later
-                    "time": float(m),
-                    "set_index": int(set_idx),
-                    "age": float(dt),
-                    "is_carry": 1.0,
-                })
+                rows.append(
+                    {
+                        "variable": v,
+                        "value": last_seen_val[
+                            v
+                        ],  # temporary; will be normalized later
+                        "time": float(m),
+                        "set_index": int(set_idx),
+                        "age": float(dt),
+                        "is_carry": 1.0,
+                    }
+                )
 
     out = pd.DataFrame(rows).sort_values(["time", "variable"]).reset_index(drop=True)
     return out
 
 
-def _apply_embeddings(df: pd.DataFrame, emb_df: pd.DataFrame, key_col: str) -> pd.DataFrame:
+def _apply_embeddings(
+    df: pd.DataFrame, emb_df: pd.DataFrame, key_col: str
+) -> pd.DataFrame:
     # Merge on variable name
     merged = df.merge(emb_df, how="left", left_on="variable", right_on=key_col)
     # Ensure we always carry a single column named 'variable' after merge.
@@ -149,7 +167,7 @@ def _apply_embeddings(df: pd.DataFrame, emb_df: pd.DataFrame, key_col: str) -> p
     if "variable_x" in merged.columns:
         merged = merged.rename(columns={"variable_x": "variable"})
     if "variable_y" in merged.columns:
-        merged = merged.drop(columns=["variable_y"]) 
+        merged = merged.drop(columns=["variable_y"])
     # If the right key column is present with a different name, drop it.
     if key_col in merged.columns and key_col != "variable":
         merged = merged.drop(columns=[key_col])
@@ -162,13 +180,15 @@ def _apply_embeddings(df: pd.DataFrame, emb_df: pd.DataFrame, key_col: str) -> p
     return merged
 
 
-def _apply_value_normalization(df: pd.DataFrame, stats_df: pd.DataFrame, key_col: str) -> pd.DataFrame:
+def _apply_value_normalization(
+    df: pd.DataFrame, stats_df: pd.DataFrame, key_col: str
+) -> pd.DataFrame:
     merged = df.merge(stats_df, how="left", left_on="variable", right_on=key_col)
     # Normalize duplicate key columns to a single 'variable'
     if "variable_x" in merged.columns:
         merged = merged.rename(columns={"variable_x": "variable"})
     if "variable_y" in merged.columns:
-        merged = merged.drop(columns=["variable_y"]) 
+        merged = merged.drop(columns=["variable_y"])
     if key_col in merged.columns and key_col != "variable":
         merged = merged.drop(columns=[key_col])
     # If std is zero/NaN, use 1.0 to avoid division by zero
@@ -213,7 +233,9 @@ def _process_one_file(
     if drop_cols:
         raw = raw.drop(columns=drop_cols)
     if not {"variable", "value", "minute"}.issubset(set(raw.columns)):
-        raise ValueError(f"Input parquet {fp} must contain columns ['variable','value','minute']")
+        raise ValueError(
+            f"Input parquet {fp} must contain columns ['variable','value','minute']"
+        )
     exp = expand_patient(raw, lvcf_minutes)
     exp = _apply_embeddings(exp, emb_df, emb_key)
     exp = _apply_value_normalization(exp, stats_df, stats_key)
@@ -222,13 +244,35 @@ def _process_one_file(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input_dir", required=True, help="Root directory with train/valid/test per-patient Parquets")
-    ap.add_argument("--output_dir", required=True, help="Output root directory (mirrors train/valid/test)")
-    ap.add_argument("--event_emb_csv", required=True, help="CSV mapping event name -> 768-d embedding")
-    ap.add_argument("--value_stats_csv", required=True, help="CSV mapping event name -> value mean/std")
-    ap.add_argument("--lvcf_minutes", type=float, default=60.0, help="LVCF window size in minutes")
+    ap.add_argument(
+        "--input_dir",
+        required=True,
+        help="Root directory with train/valid/test per-patient Parquets",
+    )
+    ap.add_argument(
+        "--output_dir",
+        required=True,
+        help="Output root directory (mirrors train/valid/test)",
+    )
+    ap.add_argument(
+        "--event_emb_csv",
+        required=True,
+        help="CSV mapping event name -> 768-d embedding",
+    )
+    ap.add_argument(
+        "--value_stats_csv",
+        required=True,
+        help="CSV mapping event name -> value mean/std",
+    )
+    ap.add_argument(
+        "--lvcf_minutes", type=float, default=60.0, help="LVCF window size in minutes"
+    )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-    ap.add_argument("--smoke", action="store_true", help="Process and validate a single sample (first train file)")
+    ap.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Process and validate a single sample (first train file)",
+    )
     args = ap.parse_args()
 
     emb_df, emb_key, emb_dim = _load_event_embeddings(args.event_emb_csv)
@@ -239,15 +283,21 @@ def main():
         os.makedirs(os.path.join(args.output_dir, part), exist_ok=True)
 
     if args.smoke:
-        train_files = sorted(glob.glob(os.path.join(args.input_dir, "train", "*.parquet")))
+        train_files = sorted(
+            glob.glob(os.path.join(args.input_dir, "train", "*.parquet"))
+        )
         if len(train_files) == 0:
             raise FileNotFoundError("No train parquet files found for smoke test")
         fp = train_files[0]
-        out_df = _process_one_file(fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key)
+        out_df = _process_one_file(
+            fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key
+        )
         _validate_output(out_df, emb_dim)
         out_fp = os.path.join(args.output_dir, "train", os.path.basename(fp))
         out_df.to_parquet(out_fp, engine="pyarrow", index=False)
-        print(f"[SMOKE] Success. Wrote: {out_fp} with shape {out_df.shape} and emb_dim={emb_dim}")
+        print(
+            f"[SMOKE] Success. Wrote: {out_fp} with shape {out_df.shape} and emb_dim={emb_dim}"
+        )
         return
 
     # Full processing with a single global tqdm over all splits
@@ -270,7 +320,9 @@ def main():
             if (not args.overwrite) and os.path.exists(out_fp):
                 pbar.update(1)
                 continue
-            out_df = _process_one_file(fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key)
+            out_df = _process_one_file(
+                fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key
+            )
             _validate_output(out_df, emb_dim)
             out_df.to_parquet(out_fp, engine="pyarrow", index=False)
             pbar.update(1)
@@ -278,4 +330,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
