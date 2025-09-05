@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, Subset
 import lightning.pytorch as pl
 import os
 import glob
@@ -307,6 +307,33 @@ class SetVAEDataModule(pl.LightningDataModule):
 
 ##### SeqSetVAE Dataset Classes
 
+# -------------------- LVCF-aware helpers --------------------
+def _has_v_columns(df: pd.DataFrame) -> bool:
+    """Detect whether DataFrame contains materialized embedding columns v0..v{D-1}."""
+    return any(c.startswith("v") and c[1:].isdigit() for c in df.columns)
+
+
+def _v_columns(df: pd.DataFrame) -> List[str]:
+    """Return sorted embedding column names v0..v{D-1} if present."""
+    vcols = [c for c in df.columns if c.startswith("v") and c[1:].isdigit()]
+    vcols.sort(key=lambda x: int(x[1:]))
+    return vcols
+
+
+def _extract_time_tensor(df: pd.DataFrame) -> torch.Tensor:
+    """Return time tensor [N,1] using 'time' if present else 'minute'."""
+    if "time" in df.columns:
+        return torch.tensor(df["time"].to_numpy(dtype=np.float32)).view(-1, 1)
+    return torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(-1, 1)
+
+
+def _compute_set_ids(df: pd.DataFrame) -> torch.Tensor:
+    """Return set ids [N,1] using 'set_index' if present, else derive from time changes."""
+    if "set_index" in df.columns:
+        return torch.tensor(df["set_index"].to_numpy(dtype=np.int64)).view(-1, 1)
+    time_col = "time" if "time" in df.columns else "minute"
+    return torch.tensor((df[time_col].diff().fillna(0) != 0).cumsum().to_numpy(dtype=np.int64)).view(-1, 1)
+
 class SeqSetVAEDataset(Dataset):
     """
     Dataset class for Sequential SetVAE that handles patient-level medical data.
@@ -395,44 +422,53 @@ def dynamic_collate_fn(batch: List[Tuple[pd.DataFrame, str]], cached_embs: Dict,
     batch_size = len(batch)
     
     # Process each patient in the batch
-    all_vars, all_vals, all_minutes, all_set_ids, all_labels = [], [], [], [], []
+    all_vars, all_vals, all_minutes, all_set_ids, all_ages, all_carries, all_labels = [], [], [], [], [], [], []
     max_events = 0
     
     for df, tsid in batch:
-        # Process variable embeddings
-        var_tensors = [cached_embs[v] for v in df["variable"]]
-        var_tsr = torch.stack(var_tensors) if var_tensors else torch.empty(0, cached_embs[next(iter(cached_embs))].shape[0])
-        
-        # Normalize medical values using pre-computed statistics
-        raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
-        norm_vals = torch.zeros_like(raw_vals)
-        for i, ev in enumerate(df["variable"].to_numpy()):
-            if ev in params_map:
-                m, s = params_map[ev]["mean"], params_map[ev]["std"]
-                norm_vals[i] = (raw_vals[i] - m) / s
-            else:
-                norm_vals[i] = raw_vals[i]
-        
-        # Process time information
-        minute_tsr = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(-1, 1)
-        
-        # Process set IDs (derive from minute changes if not present)
-        if "set_index" in df.columns:
-            setids = torch.tensor(df["set_index"].to_numpy(dtype=np.int64)).view(-1, 1)
+        # Prefer materialized v* embeddings
+        if _has_v_columns(df):
+            vcols = _v_columns(df)
+            var_tsr = torch.tensor(df[vcols].to_numpy(dtype=np.float32))
+            # Values are already normalized by LVCF pipeline
+            norm_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
         else:
-            # Create set IDs based on time changes (new set when time changes)
-            setids = torch.tensor(
-                (df["minute"].diff().fillna(0) != 0).cumsum().to_numpy(dtype=np.int64)
-            ).view(-1, 1)
-        
+            var_tensors = [cached_embs[v] for v in df["variable"]]
+            var_tsr = torch.stack(var_tensors) if var_tensors else torch.empty(0, next(iter(cached_embs.values())).shape[0])
+            # Normalize with stats
+            raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
+            norm_vals = torch.zeros_like(raw_vals)
+            for i, ev in enumerate(df["variable"].to_numpy()):
+                if ev in params_map:
+                    m, s = params_map[ev]["mean"], params_map[ev]["std"]
+                    norm_vals[i] = (raw_vals[i] - m) / (s if s > 0 else 1.0)
+                else:
+                    norm_vals[i] = raw_vals[i]
+
+        # Time and set ids (prefer 'time' and 'set_index')
+        minute_tsr = _extract_time_tensor(df)
+        setids = _compute_set_ids(df)
+
+        # Ancillary features
+        if "age" in df.columns:
+            age_tsr = torch.tensor(df["age"].to_numpy(dtype=np.float32)).view(-1, 1)
+        else:
+            age_tsr = torch.zeros_like(minute_tsr)
+        if "is_carry" in df.columns:
+            carry_tsr = torch.tensor(df["is_carry"].to_numpy(dtype=np.float32)).view(-1, 1)
+        else:
+            carry_tsr = torch.zeros_like(minute_tsr)
+
         # Look up outcome label
         label_val = label_map.get(int(float(tsid)), 0)  # Default to 0 if not found
-        
+
         # Collect all processed data
         all_vars.append(var_tsr)
         all_vals.append(norm_vals)
         all_minutes.append(minute_tsr)
         all_set_ids.append(setids)
+        all_ages.append(age_tsr)
+        all_carries.append(carry_tsr)
         all_labels.append(label_val)
         
         # Track maximum sequence length for padding
@@ -447,26 +483,33 @@ def dynamic_collate_fn(batch: List[Tuple[pd.DataFrame, str]], cached_embs: Dict,
             "minute": torch.zeros(batch_size, 1, 1),
             "set_id": torch.zeros(batch_size, 1, 1, dtype=torch.long),
             "label": torch.tensor(all_labels, dtype=torch.long),
+            "age": torch.zeros(batch_size, 1, 1),
+            "carry_mask": torch.zeros(batch_size, 1, 1),
             "padding_mask": torch.ones(batch_size, 1, dtype=torch.bool)
         }
     
     # Create padded tensors for the batch
-    embed_dim = all_vars[0].shape[1] if len(all_vars[0]) > 0 else cached_embs[next(iter(cached_embs))].shape[0]
+    first_non_empty = next((v for v in all_vars if v.numel() > 0), None)
+    embed_dim = first_non_empty.shape[1] if first_non_empty is not None else cached_embs[next(iter(cached_embs))].shape[0]
     
     padded_vars = torch.zeros(batch_size, max_events, embed_dim)
     padded_vals = torch.zeros(batch_size, max_events, 1)
     padded_minutes = torch.zeros(batch_size, max_events, 1)
     padded_set_ids = torch.zeros(batch_size, max_events, 1, dtype=torch.long)
+    padded_ages = torch.zeros(batch_size, max_events, 1)
+    padded_carries = torch.zeros(batch_size, max_events, 1)
     padding_mask = torch.ones(batch_size, max_events, dtype=torch.bool)
     
     # Fill in actual data and create padding mask
-    for i, (var_tsr, val_tsr, min_tsr, set_tsr) in enumerate(zip(all_vars, all_vals, all_minutes, all_set_ids)):
+    for i, (var_tsr, val_tsr, min_tsr, set_tsr, age_tsr, carry_tsr) in enumerate(zip(all_vars, all_vals, all_minutes, all_set_ids, all_ages, all_carries)):
         seq_len = len(var_tsr)
         if seq_len > 0:
             padded_vars[i, :seq_len] = var_tsr
             padded_vals[i, :seq_len] = val_tsr
             padded_minutes[i, :seq_len] = min_tsr
             padded_set_ids[i, :seq_len] = set_tsr
+            padded_ages[i, :seq_len] = age_tsr
+            padded_carries[i, :seq_len] = carry_tsr
             padding_mask[i, :seq_len] = False  # False indicates real data
     
     return {
@@ -474,6 +517,8 @@ def dynamic_collate_fn(batch: List[Tuple[pd.DataFrame, str]], cached_embs: Dict,
         "val": padded_vals,
         "minute": padded_minutes,
         "set_id": padded_set_ids,
+        "age": padded_ages,
+        "carry_mask": padded_carries,
         "label": torch.tensor(all_labels, dtype=torch.long),
         "padding_mask": padding_mask
     }
@@ -503,6 +548,9 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         use_dynamic_padding: bool = True,  # New: Whether to use dynamic padding
         num_workers: int = 4,  # Number of data loader workers
         pin_memory: bool = True,  # Whether to use pin memory
+        smoke: bool = False,  # Smoke mode: build a single test batch from train
+        smoke_size: int = 10,  # Number of patients in smoke batch
+        smoke_random: bool = True,  # Randomly sample patients for smoke batch
     ):
         super().__init__()
         self.saved_dir = saved_dir
@@ -513,6 +561,10 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         self.use_dynamic_padding = use_dynamic_padding
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.smoke = smoke
+        self.smoke_size = smoke_size
+        self.smoke_random = smoke_random
+        self._smoke_indices: Optional[List[int]] = None
 
         # Load pre-computed embeddings for medical variables
         cached = pd.read_csv(os.path.join(saved_dir, "../cached.csv"))
@@ -550,6 +602,16 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         self.val_dataset = SeqSetVAEDataset("valid", self.saved_dir)
         self.test_dataset = SeqSetVAEDataset("test", self.saved_dir)
 
+        # Prepare smoke indices from train split if enabled
+        if self.smoke:
+            total = len(self.train_dataset)
+            k = min(self.smoke_size, total)
+            if self.smoke_random:
+                rng = np.random.default_rng(42)
+                self._smoke_indices = rng.choice(total, size=k, replace=False).tolist()
+            else:
+                self._smoke_indices = list(range(k))
+
     def _create_loader(self, ds, shuffle=False):
         """
         Create a data loader with appropriate collate function and optimized settings.
@@ -585,6 +647,33 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
         )
 
+    def smoke_dataloader(self):
+        """
+        Build a single test dataloader from 'train' split with `smoke_size` patients.
+        Returns a DataLoader that yields one batch collated with dynamic padding.
+        """
+        if not self.smoke:
+            raise ValueError("Smoke mode is disabled. Initialize with smoke=True to use smoke_dataloader().")
+        if self._smoke_indices is None or len(self._smoke_indices) == 0:
+            raise RuntimeError("Smoke indices are not prepared. Call setup() before smoke_dataloader().")
+        subset = Subset(self.train_dataset, self._smoke_indices)
+        # Force dynamic collate for batch > 1
+        return DataLoader(
+            subset,
+            batch_size=len(self._smoke_indices),
+            shuffle=False,
+            num_workers=min(2, self.num_workers),
+            collate_fn=lambda batch: self._dynamic_collate_fn(batch),
+            pin_memory=self.pin_memory,
+            drop_last=False,
+            persistent_workers=False,
+        )
+
+    def get_smoke_batch(self) -> Dict[str, Any]:
+        """Convenience helper to return a single smoke batch dict."""
+        loader = self.smoke_dataloader()
+        return next(iter(loader))
+
     def _dynamic_collate_fn(self, batch: List[Tuple[pd.DataFrame, str]]) -> Dict[str, Any]:
         """
         Improved dynamic collate function that supports batch training and dynamic padding.
@@ -598,7 +687,7 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         batch_size = len(batch)
         
         # Collect all data and calculate maximum length
-        all_vars, all_vals, all_minutes, all_set_ids, all_labels = [], [], [], [], []
+        all_vars, all_vals, all_minutes, all_set_ids, all_ages, all_carries, all_labels = [], [], [], [], [], [], []
         max_events = 0
         
         for df, tsid in batch:
@@ -606,30 +695,39 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             if self.max_sequence_length and len(df) > self.max_sequence_length:
                 df = df.head(self.max_sequence_length)
             
-            # Process variable embeddings
-            var_tensors = [self.cached_embs[v] for v in df["variable"]]
-            var_tsr = torch.stack(var_tensors) if var_tensors else torch.empty(0, next(iter(self.cached_embs.values())).shape[0])
-            
-            # Normalize medical values
-            raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
-            norm_vals = torch.zeros_like(raw_vals)
-            for i, ev in enumerate(df["variable"].to_numpy()):
-                if ev in self.params_map:
-                    m, s = self.params_map[ev]["mean"], self.params_map[ev]["std"]
-                    norm_vals[i] = (raw_vals[i] - m) / s
-                else:
-                    norm_vals[i] = raw_vals[i]
-            
-            # Process time information
-            minute_tsr = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(-1, 1)
-            
-            # Process set IDs
-            if "set_index" in df.columns:
-                setids = torch.tensor(df["set_index"].to_numpy(dtype=np.int64)).view(-1, 1)
+            # Process variable embeddings (prefer LVCF v* columns)
+            if _has_v_columns(df):
+                vcols = _v_columns(df)
+                var_tsr = torch.tensor(df[vcols].to_numpy(dtype=np.float32))
+                norm_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
             else:
-                setids = torch.tensor(
-                    (df["minute"].diff().fillna(0) != 0).cumsum().to_numpy(dtype=np.int64)
-                ).view(-1, 1)
+                var_tensors = [self.cached_embs[v] for v in df["variable"]]
+                var_tsr = torch.stack(var_tensors) if var_tensors else torch.empty(0, next(iter(self.cached_embs.values())).shape[0])
+                # Normalize
+                raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
+                norm_vals = torch.zeros_like(raw_vals)
+                for i, ev in enumerate(df["variable"].to_numpy()):
+                    if ev in self.params_map:
+                        m, s = self.params_map[ev]["mean"], self.params_map[ev]["std"]
+                        norm_vals[i] = (raw_vals[i] - m) / (s if s > 0 else 1.0)
+                    else:
+                        norm_vals[i] = raw_vals[i]
+
+            # Process time information
+            minute_tsr = _extract_time_tensor(df)
+
+            # Process set IDs
+            setids = _compute_set_ids(df)
+
+            # Ancillary features
+            if "age" in df.columns:
+                age_tsr = torch.tensor(df["age"].to_numpy(dtype=np.float32)).view(-1, 1)
+            else:
+                age_tsr = torch.zeros_like(minute_tsr)
+            if "is_carry" in df.columns:
+                carry_tsr = torch.tensor(df["is_carry"].to_numpy(dtype=np.float32)).view(-1, 1)
+            else:
+                carry_tsr = torch.zeros_like(minute_tsr)
             
             # Look up outcome label
             label_val = self.label_map.get(int(float(tsid)), 0)
@@ -639,6 +737,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             all_vals.append(norm_vals)
             all_minutes.append(minute_tsr)
             all_set_ids.append(setids)
+            all_ages.append(age_tsr)
+            all_carries.append(carry_tsr)
             all_labels.append(label_val)
             
             # Track maximum sequence length
@@ -663,16 +763,20 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         padded_vals = torch.zeros(batch_size, max_events, 1)
         padded_minutes = torch.zeros(batch_size, max_events, 1)
         padded_set_ids = torch.zeros(batch_size, max_events, 1, dtype=torch.long)
+        padded_ages = torch.zeros(batch_size, max_events, 1)
+        padded_carries = torch.zeros(batch_size, max_events, 1)
         padding_mask = torch.ones(batch_size, max_events, dtype=torch.bool)  # True indicates padding positions
         
         # Fill in actual data and create padding mask
-        for i, (var_tsr, val_tsr, min_tsr, set_tsr) in enumerate(zip(all_vars, all_vals, all_minutes, all_set_ids)):
+        for i, (var_tsr, val_tsr, min_tsr, set_tsr, age_tsr, carry_tsr) in enumerate(zip(all_vars, all_vals, all_minutes, all_set_ids, all_ages, all_carries)):
             seq_len = len(var_tsr)
             if seq_len > 0:
                 padded_vars[i, :seq_len] = var_tsr
                 padded_vals[i, :seq_len] = val_tsr
                 padded_minutes[i, :seq_len] = min_tsr
                 padded_set_ids[i, :seq_len] = set_tsr
+                padded_ages[i, :seq_len] = age_tsr
+                padded_carries[i, :seq_len] = carry_tsr
                 padding_mask[i, :seq_len] = False  # False indicates real data
         
         return {
@@ -680,6 +784,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             "val": padded_vals,
             "minute": padded_minutes,
             "set_id": padded_set_ids,
+            "age": padded_ages,
+            "carry_mask": padded_carries,
             "label": torch.tensor(all_labels, dtype=torch.long),
             "padding_mask": padding_mask
         }
@@ -721,30 +827,39 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         if self.max_sequence_length and len(df) > self.max_sequence_length:
             df = df.head(self.max_sequence_length)
 
-        # Process variable embeddings
-        var_tsr = torch.stack([self.cached_embs[v] for v in df["variable"]]).unsqueeze(0)
-
-        # Normalize medical values
-        raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
-        norm_vals = torch.zeros_like(raw_vals)
-        for i, ev in enumerate(df["variable"].to_numpy()):
-            if ev in self.params_map:
-                m, s = self.params_map[ev]["mean"], self.params_map[ev]["std"]
-                norm_vals[i] = (raw_vals[i] - m) / s
-            else:
-                norm_vals[i] = raw_vals[i]
-        norm_vals = norm_vals.unsqueeze(0)
+        # Process variable embeddings (prefer LVCF v* columns)
+        if _has_v_columns(df):
+            vcols = _v_columns(df)
+            var_tsr = torch.tensor(df[vcols].to_numpy(dtype=np.float32)).unsqueeze(0)
+            norm_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(1, -1, 1)
+        else:
+            var_tsr = torch.stack([self.cached_embs[v] for v in df["variable"]]).unsqueeze(0)
+            # Normalize medical values
+            raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
+            norm_vals = torch.zeros_like(raw_vals)
+            for i, ev in enumerate(df["variable"].to_numpy()):
+                if ev in self.params_map:
+                    m, s = self.params_map[ev]["mean"], self.params_map[ev]["std"]
+                    norm_vals[i] = (raw_vals[i] - m) / (s if s > 0 else 1.0)
+                else:
+                    norm_vals[i] = raw_vals[i]
+            norm_vals = norm_vals.unsqueeze(0)
 
         # Process time information
-        minute_tsr = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(1, -1, 1)
+        minute_tsr = _extract_time_tensor(df).view(1, -1, 1)
 
-        # Process set IDs (derive from minute changes if not present)
-        if "set_index" in df.columns:
-            setids = torch.tensor(df["set_index"].to_numpy(dtype=np.int64)).view(1, -1, 1)
+        # Process set IDs (derive from time changes if not present)
+        setids = _compute_set_ids(df).view(1, -1, 1)
+
+        # Ancillary features
+        if "age" in df.columns:
+            age_tsr = torch.tensor(df["age"].to_numpy(dtype=np.float32)).view(1, -1, 1)
         else:
-            setids = torch.tensor(
-                (df["minute"].diff().fillna(0) != 0).cumsum().to_numpy(dtype=np.int64)
-            ).view(1, -1, 1)
+            age_tsr = torch.zeros_like(minute_tsr)
+        if "is_carry" in df.columns:
+            carry_tsr = torch.tensor(df["is_carry"].to_numpy(dtype=np.float32)).view(1, -1, 1)
+        else:
+            carry_tsr = torch.zeros_like(minute_tsr)
 
         # Look up outcome label
         label_val = self.label_map.get(int(float(tsid)), 0)
@@ -755,6 +870,8 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             "val": norm_vals,
             "minute": minute_tsr,
             "set_id": setids,
+            "age": age_tsr,
+            "carry_mask": carry_tsr,
             "label": label_tsr,
         }
 
