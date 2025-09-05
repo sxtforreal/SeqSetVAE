@@ -250,19 +250,30 @@ def main():
         print(f"[SMOKE] Success. Wrote: {out_fp} with shape {out_df.shape} and emb_dim={emb_dim}")
         return
 
-    # Full processing
+    # Full processing with a single global tqdm over all splits
+    all_files: List[Tuple[str, str]] = []
     for part in ["train", "valid", "test"]:
         files = sorted(glob.glob(os.path.join(args.input_dir, part, "*.parquet")))
         if len(files) == 0:
             print(f"[WARN] No files under {part}")
             continue
-        for fp in tqdm(files, desc=f"{part}"):
+        for fp in files:
+            all_files.append((part, fp))
+
+    if len(all_files) == 0:
+        print("[WARN] No parquet files found under input_dir")
+        return
+
+    with tqdm(total=len(all_files), desc="all_splits") as pbar:
+        for part, fp in all_files:
             out_fp = os.path.join(args.output_dir, part, os.path.basename(fp))
             if (not args.overwrite) and os.path.exists(out_fp):
+                pbar.update(1)
                 continue
             out_df = _process_one_file(fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key)
             _validate_output(out_df, emb_dim)
             out_df.to_parquet(out_fp, engine="pyarrow", index=False)
+            pbar.update(1)
 
 
 if __name__ == "__main__":
