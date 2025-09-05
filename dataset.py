@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, Subset
 import lightning.pytorch as pl
 import os
 import glob
@@ -548,6 +548,9 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         use_dynamic_padding: bool = True,  # New: Whether to use dynamic padding
         num_workers: int = 4,  # Number of data loader workers
         pin_memory: bool = True,  # Whether to use pin memory
+        smoke: bool = False,  # Smoke mode: build a single test batch from train
+        smoke_size: int = 10,  # Number of patients in smoke batch
+        smoke_random: bool = True,  # Randomly sample patients for smoke batch
     ):
         super().__init__()
         self.saved_dir = saved_dir
@@ -558,6 +561,10 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         self.use_dynamic_padding = use_dynamic_padding
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.smoke = smoke
+        self.smoke_size = smoke_size
+        self.smoke_random = smoke_random
+        self._smoke_indices: Optional[List[int]] = None
 
         # Load pre-computed embeddings for medical variables
         cached = pd.read_csv(os.path.join(saved_dir, "../cached.csv"))
@@ -595,6 +602,16 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
         self.val_dataset = SeqSetVAEDataset("valid", self.saved_dir)
         self.test_dataset = SeqSetVAEDataset("test", self.saved_dir)
 
+        # Prepare smoke indices from train split if enabled
+        if self.smoke:
+            total = len(self.train_dataset)
+            k = min(self.smoke_size, total)
+            if self.smoke_random:
+                rng = np.random.default_rng(42)
+                self._smoke_indices = rng.choice(total, size=k, replace=False).tolist()
+            else:
+                self._smoke_indices = list(range(k))
+
     def _create_loader(self, ds, shuffle=False):
         """
         Create a data loader with appropriate collate function and optimized settings.
@@ -629,6 +646,33 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             drop_last=False,  # Don't drop the last incomplete batch
             persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
         )
+
+    def smoke_dataloader(self):
+        """
+        Build a single test dataloader from 'train' split with `smoke_size` patients.
+        Returns a DataLoader that yields one batch collated with dynamic padding.
+        """
+        if not self.smoke:
+            raise ValueError("Smoke mode is disabled. Initialize with smoke=True to use smoke_dataloader().")
+        if self._smoke_indices is None or len(self._smoke_indices) == 0:
+            raise RuntimeError("Smoke indices are not prepared. Call setup() before smoke_dataloader().")
+        subset = Subset(self.train_dataset, self._smoke_indices)
+        # Force dynamic collate for batch > 1
+        return DataLoader(
+            subset,
+            batch_size=len(self._smoke_indices),
+            shuffle=False,
+            num_workers=min(2, self.num_workers),
+            collate_fn=lambda batch: self._dynamic_collate_fn(batch),
+            pin_memory=self.pin_memory,
+            drop_last=False,
+            persistent_workers=False,
+        )
+
+    def get_smoke_batch(self) -> Dict[str, Any]:
+        """Convenience helper to return a single smoke batch dict."""
+        loader = self.smoke_dataloader()
+        return next(iter(loader))
 
     def _dynamic_collate_fn(self, batch: List[Tuple[pd.DataFrame, str]]) -> Dict[str, Any]:
         """
