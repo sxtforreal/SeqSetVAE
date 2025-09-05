@@ -16,17 +16,20 @@ This repo intentionally removes multi-type decoders and random training windows.
 - `modules.py`: SetVAE components copied from the original codebase.
 - `model.py`: `PoESeqSetVAEPretrain` implementing PoE + stale-dropout.
 - `train_pretrain.py`: CLI to run pretraining.
-- `preprocess_expand.py`: Build expanded Parquet with LVCF (bag_exp), `age`, `is_carry`, `set_index` from raw per-patient Parquet.
+- `LVCF.py`: Build expanded Parquet with LVCF (bag_exp), `age`, `is_carry`, `set_index`, map event embeddings, and normalize values.
 
 #### Quickstart
 
 1) Prepare expanded Parquet (optional if you already have it):
 
 ```bash
-python preprocess_expand.py \
+python LVCF.py \
   --input_dir /path/to/patient_ehr \
   --output_dir /path/to/patient_expanded \
-  --lvcf_hours 48
+  --event_emb_csv /path/to/event_name_to_768d.csv \
+  --value_stats_csv /path/to/event_value_mean_std.csv \
+  --lvcf_minutes 2880 \
+  --smoke
 ```
 
 2) Pretrain with PoE:
