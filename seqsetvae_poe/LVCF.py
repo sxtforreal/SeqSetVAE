@@ -10,8 +10,7 @@ Pipeline per patient Parquet:
    - age = minutes since last observation (0 for raw events), is_carry in {0,1};
    - time = minute of the set.
 4) Map event names to 768-d vectors from an offline CSV and materialize as columns v0..v767.
-5) Normalize values using offline per-variable mean/std CSV. Preserve original in value_raw,
-   and overwrite value with normalized values.
+5) Normalize values using offline per-variable mean/std CSV and overwrite 'value' in place.
 
 Input directory layout:
   input_dir/
@@ -25,7 +24,7 @@ CSV expectations:
 - value_stats_csv: contains columns [variable, mean, std]. Key column is detected same as above.
 
 Outputs mirror the input split layout and include columns:
-  [variable, value_raw, value, minute, time, set_index, age, is_carry, v0..v767]
+  [variable, value, time, set_index, age, is_carry, v0..v767]
 
 Use --smoke to process and validate one sample (first file under train).
 """
@@ -103,6 +102,9 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
     for m in unique_minutes:
         set_idx = minute_to_setidx[m]
         cur = df[df["minute"] == m]
+        # Ensure each set has unique variables: keep the last observation for duplicates
+        if len(cur) > 1:
+            cur = cur.drop_duplicates(subset=["variable"], keep="last")
         present = set(cur["variable"].tolist())
 
         # Raw events
@@ -111,9 +113,7 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
             val = r["value"]
             rows.append({
                 "variable": v,
-                "value_raw": val,
                 "value": val,  # temporary; will be normalized later
-                "minute": float(m),
                 "time": float(m),
                 "set_index": int(set_idx),
                 "age": 0.0,
@@ -130,16 +130,14 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
                 dt = float(m) - last_seen_time[v]
                 rows.append({
                     "variable": v,
-                    "value_raw": last_seen_val[v],
                     "value": last_seen_val[v],  # temporary; will be normalized later
-                    "minute": float(m),
                     "time": float(m),
                     "set_index": int(set_idx),
                     "age": float(dt),
                     "is_carry": 1.0,
                 })
 
-    out = pd.DataFrame(rows).sort_values(["minute", "variable"]).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["time", "variable"]).reset_index(drop=True)
     return out
 
 
@@ -176,13 +174,13 @@ def _apply_value_normalization(df: pd.DataFrame, stats_df: pd.DataFrame, key_col
     # If std is zero/NaN, use 1.0 to avoid division by zero
     std_safe = merged["std"].replace(0, np.nan).fillna(1.0).astype(np.float32)
     mean_safe = merged["mean"].fillna(0.0).astype(np.float32)
-    merged["value"] = (merged["value_raw"].astype(np.float32) - mean_safe) / std_safe
+    merged["value"] = (merged["value"].astype(np.float32) - mean_safe) / std_safe
     return merged.drop(columns=["mean", "std"])
 
 
 def _validate_output(df: pd.DataFrame, emb_dim: int) -> None:
     # Basic column presence
-    expect = ["variable", "value_raw", "value", "minute", "time", "set_index", "age", "is_carry"]
+    expect = ["variable", "value", "time", "set_index", "age", "is_carry"]
     missing = [c for c in expect if c not in df.columns]
     if missing:
         raise AssertionError(f"Missing expected columns: {missing}")
@@ -252,19 +250,30 @@ def main():
         print(f"[SMOKE] Success. Wrote: {out_fp} with shape {out_df.shape} and emb_dim={emb_dim}")
         return
 
-    # Full processing
+    # Full processing with a single global tqdm over all splits
+    all_files: List[Tuple[str, str]] = []
     for part in ["train", "valid", "test"]:
         files = sorted(glob.glob(os.path.join(args.input_dir, part, "*.parquet")))
         if len(files) == 0:
             print(f"[WARN] No files under {part}")
             continue
-        for fp in tqdm(files, desc=f"{part}"):
+        for fp in files:
+            all_files.append((part, fp))
+
+    if len(all_files) == 0:
+        print("[WARN] No parquet files found under input_dir")
+        return
+
+    with tqdm(total=len(all_files), desc="all_splits") as pbar:
+        for part, fp in all_files:
             out_fp = os.path.join(args.output_dir, part, os.path.basename(fp))
             if (not args.overwrite) and os.path.exists(out_fp):
+                pbar.update(1)
                 continue
             out_df = _process_one_file(fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key)
             _validate_output(out_df, emb_dim)
             out_df.to_parquet(out_fp, engine="pyarrow", index=False)
+            pbar.update(1)
 
 
 if __name__ == "__main__":
