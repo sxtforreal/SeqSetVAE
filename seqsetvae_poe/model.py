@@ -65,6 +65,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         free_bits: float = 0.03,
         stale_dropout_p: float = 0.2,
         set_mae_ratio: float = 0.0,
+        # Task C: next-step distributional forecast (here: next set has any new event?)
+        enable_next_change: bool = True,
+        next_change_weight: float = 0.3,
     ):
         super().__init__()
 
@@ -116,6 +119,18 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self.set_mae_ratio = set_mae_ratio
         self.latent_dim = latent_dim
         self._step = 0
+        self.enable_next_change = enable_next_change
+        self.next_change_weight = next_change_weight
+
+        # Task C head: predict whether next set contains any new (non-carry) event
+        if enable_next_change:
+            self.next_change_head = nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(latent_dim, 1),
+            )
+            self._bce = nn.BCEWithLogitsLoss(reduction="mean")
         self.save_hyperparameters()
 
     # --- helpers ---
@@ -161,7 +176,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         return self.max_beta
 
     # --- core ---
-    def _split_sets(self, var, val, minutes, set_id, padding_mask=None):
+    def _split_sets(self, var, val, minutes, set_id, padding_mask=None, carry_mask=None):
         B = var.size(0)
         all_sets = []
         for b in range(B):
@@ -169,20 +184,29 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             x = val[b]
             t = minutes[b]
             s = set_id[b]
+            c = carry_mask[b] if carry_mask is not None else None
             if padding_mask is not None:
                 mask = ~padding_mask[b]
                 v, x, t, s = v[mask], x[mask], t[mask], s[mask]
+                if c is not None:
+                    c = c[mask]
             if s.dim() > 1:
                 s = s.squeeze(-1)
             uniq, counts = torch.unique_consecutive(s.long(), return_counts=True)
             idx_splits = torch.split(torch.arange(len(s), device=s.device), [int(c) for c in counts])
             patient_sets = []
             for idx in idx_splits:
+                # has_change: any token in this set that is not carried (is_carry==0)
+                if c is not None and len(idx) > 0:
+                    has_change = (c[idx].squeeze(-1) < 0.5).any().float().view(1)
+                else:
+                    has_change = torch.tensor(0.0, device=v.device).view(1)
                 patient_sets.append({
                     "var": v[idx].unsqueeze(0),
                     "val": x[idx].unsqueeze(0),
                     "minute": t[idx].unsqueeze(0),
                     "set_time": t[idx].max().view(1),
+                    "has_change": has_change,  # 1 if any real event exists in this set
                 })
             all_sets.append(patient_sets)
         return all_sets
@@ -192,11 +216,13 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         device = self.device
         if S == 0:
             z = torch.zeros(1, 0, self.latent_dim, device=device)
-            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
         z_mu_list, z_logvar_list, pos_list = [], [], []
         z_mu_post_list, z_logvar_post_list = [], []
         kl_total = 0.0
+        next_change_loss = torch.tensor(0.0, device=device)
+        next_change_targets = []
 
         # encode per set: q_x(z|x)
         for i, s in enumerate(sets):
@@ -242,6 +268,15 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         kl = torch.clamp(kl, min=min_kl)
         kl_total = kl.mean()
 
+        # Task C: next-step change prediction using h_t
+        if self.enable_next_change and S > 1:
+            # Build targets from set t+1 has_change for t in [0..S-2]
+            for idx in range(1, S):
+                next_change_targets.append(sets[idx]["has_change"])  # shape [1]
+            targets = torch.stack(next_change_targets, dim=1).to(h.dtype)  # [1, S-1]
+            logits = self.next_change_head(h[:, :-1, :]).squeeze(-1)  # [1, S-1]
+            next_change_loss = self._bce(logits, targets)
+
         # reconstruct from h (use h_t)
         recon_total = 0.0
         for idx, s in enumerate(sets):
@@ -256,7 +291,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             target_x = reduced_normalized * s["val"]
             recon_total += chamfer_recon(recon, target_x)
         recon_total = recon_total / max(1, S)
-        return recon_total, kl_total
+        return recon_total, kl_total, next_change_loss
 
     def forward(self, batch):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
@@ -265,33 +300,46 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         # stale-dropout on values
         val = self._apply_stale_dropout(val, carry_mask)
         # split into sets per patient
-        all_sets = self._split_sets(var, val, minutes, set_id, padding_mask)
-        total_recon, total_kl, count = 0.0, 0.0, 0
+        all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
+        total_recon, total_kl, total_c, count = 0.0, 0.0, 0.0, 0
         for sets in all_sets:
-            recon, kl = self._forward_single(sets)
+            recon, kl, next_c = self._forward_single(sets)
             total_recon += recon
             total_kl += kl
+            total_c += next_c
             count += 1
         if count == 0:
             device = var.device
-            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
-        return total_recon / count, total_kl / count
+            zero = torch.tensor(0.0, device=device)
+            return zero, zero, zero
+        return total_recon / count, total_kl / count, total_c / count
 
     # training hooks
     def training_step(self, batch, batch_idx):
-        recon, kl = self.forward(batch)
+        recon, kl, next_c = self.forward(batch)
         beta = self._beta()
-        loss = recon + beta * kl
-        self.log_dict({"train_loss": loss, "train_recon": recon, "train_kl": kl, "train_beta": beta}, prog_bar=True)
+        total = recon + beta * kl + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        log_dict = {
+            "train_loss": total,
+            "train_recon": recon,
+            "train_kl": kl,
+            "train_beta": beta,
+        }
+        if self.enable_next_change:
+            log_dict["train_next_change"] = next_c
+        self.log_dict(log_dict, prog_bar=True)
         self._step += 1
-        return loss
+        return total
 
     def validation_step(self, batch, batch_idx):
-        recon, kl = self.forward(batch)
+        recon, kl, next_c = self.forward(batch)
         beta = self._beta()
-        loss = recon + beta * kl
-        self.log_dict({"val_loss": loss, "val_recon": recon, "val_kl": kl, "val_beta": beta}, prog_bar=True, on_epoch=True)
-        return loss
+        total = recon + beta * kl + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_beta": beta}
+        if self.enable_next_change:
+            log_dict["val_next_change"] = next_c
+        self.log_dict(log_dict, prog_bar=True, on_epoch=True)
+        return total
 
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)
