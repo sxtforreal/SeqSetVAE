@@ -6,6 +6,7 @@ import lightning.pytorch as pl
 from torch.optim import AdamW
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from transformers import get_linear_schedule_with_warmup
+from typing import Optional
 
 from .modules import SetVAEModule, AttentiveBottleneckLayer, elbo_loss as base_elbo, recon_loss as chamfer_recon
 
@@ -133,6 +134,17 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         drop = (torch.rand_like(val) < self.stale_dropout_p) & (carry_mask > 0.5)
         return val.masked_fill(drop, 0.0)
 
+    def _apply_set_mae(self, val: torch.Tensor, mask_ratio: float) -> torch.Tensor:
+        """
+        Randomly mask a fraction of tokens within a set by zeroing their values.
+        Expects `val` shape [1, N, 1] for a single set. No-op if not training or ratio<=0.
+        """
+        if mask_ratio <= 0.0 or not self.training or val.numel() == 0:
+            return val
+        token_probs = torch.rand(val.shape[:2], device=val.device)
+        mask = (token_probs < mask_ratio).unsqueeze(-1)  # [1,N,1]
+        return val.masked_fill(mask, 0.0)
+
     def _poe(self, mu_qx, logvar_qx, mu_p, logvar_p):
         var_qx = logvar_qx.exp()
         var_p = logvar_p.exp()
@@ -170,6 +182,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                     "var": v[idx].unsqueeze(0),
                     "val": x[idx].unsqueeze(0),
                     "minute": t[idx].unsqueeze(0),
+                    "set_time": t[idx].max().view(1),
                 })
             all_sets.append(patient_sets)
         return all_sets
@@ -188,12 +201,15 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         # encode per set: q_x(z|x)
         for i, s in enumerate(sets):
             var, val, minute = s["var"], s["val"], s["minute"]
+            # Optional Set-MAE masking on input values
+            val_inp = self._apply_set_mae(val, self.set_mae_ratio)
             # normalize and stale-dropout already handled upstream; here encode
-            _, z_list, _ = self.set_encoder(var, val)
+            _, z_list, _ = self.set_encoder(var, val_inp)
             _, mu_qx, logvar_qx = z_list[-1]
             z_mu_list.append(mu_qx.squeeze(1))
             z_logvar_list.append(logvar_qx.squeeze(1))
-            pos_list.append(minute.unique().float())
+            # use a single scalar time per set (e.g., last timestamp)
+            pos_list.append(s["set_time"].float())
 
         z_mu = torch.stack(z_mu_list, dim=1)  # [1,S,D]
         z_logvar = torch.stack(z_logvar_list, dim=1)  # [1,S,D]
@@ -217,7 +233,13 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
 
         # KL between q_x and q_post as regularizer (encourage using prior)
         var_qx, var_post = z_logvar.exp(), logvar_post.exp()
-        kl = 0.5 * torch.sum(var_post / var_qx + (mu_post - z_mu) ** 2 / var_qx - 1 + (z_logvar - logvar_post), dim=-1)
+        kl = 0.5 * torch.sum(
+            var_post / var_qx + (mu_post - z_mu) ** 2 / var_qx - 1 + (z_logvar - logvar_post),
+            dim=-1,
+        )  # [1,S]
+        # Apply free-bits threshold per step
+        min_kl = self.free_bits * self.latent_dim
+        kl = torch.clamp(kl, min=min_kl)
         kl_total = kl.mean()
 
         # reconstruct from h (use h_t)
