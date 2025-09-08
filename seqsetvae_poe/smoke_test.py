@@ -1,10 +1,19 @@
 import os
+import sys
 import math
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 
-from .model import PoESeqSetVAEPretrain
+# Make runnable both as package (python -m seqsetvae_poe.smoke_test)
+# and as a standalone script (python seqsetvae_poe/smoke_test.py)
+PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+if PKG_DIR not in sys.path:
+    sys.path.insert(0, PKG_DIR)
+try:
+    from .model import PoESeqSetVAEPretrain  # type: ignore
+except Exception:
+    from model import PoESeqSetVAEPretrain  # type: ignore
 
 
 def build_synthetic_batch(batch_size: int = 2, max_sets: int = 8, tokens_per_set: int = 16, embed_dim: int = 768):
