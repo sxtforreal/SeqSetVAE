@@ -56,7 +56,10 @@ def _compress_like_raw(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
     device = batch["var"].device
     B, N, D = batch["var"].shape
     set_id = batch["set_id"].long().squeeze(-1)
-    carry = (batch.get("carry_mask") or torch.zeros(B, N, 1, device=device)).squeeze(-1) > 0.5
+    carry_mask = batch.get("carry_mask", None)
+    if carry_mask is None:
+        carry_mask = torch.zeros(B, N, 1, device=device)
+    carry = carry_mask.squeeze(-1) > 0.5
     minute = batch["minute"].squeeze(-1)
     var = batch["var"]
     val = batch["val"].squeeze(-1)
@@ -138,8 +141,11 @@ def _calc_batch_stats(batch: Dict[str, torch.Tensor]) -> Tuple[float, float, flo
     if pad is None:
         pad = torch.zeros(batch["var"].shape[:2], dtype=torch.bool, device=batch["var"].device)
     total = (~pad).sum().item()
-    carry = (batch.get("carry_mask") is not None) and (batch["carry_mask"] > 0.5)
-    carry_num = int(carry.sum().item()) if isinstance(carry, torch.Tensor) else 0
+    carry_mask = batch.get("carry_mask", None)
+    if carry_mask is None:
+        carry_num = 0
+    else:
+        carry_num = int((carry_mask > 0.5).sum().item())
     eff = (batch["val"].abs() > 1e-8).sum().item()
     return (
         carry_num / max(1, total),  # staleness ratio
