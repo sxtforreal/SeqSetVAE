@@ -87,6 +87,87 @@ def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Di
     }
 
 
+def _compress_like_raw(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Variant A: reverse expansion (exp->raw). Drop carry-forward tokens per set; drop empty sets.
+    Operates on an already-collated batch dictionary.
+    """
+    device = batch["var"].device
+    B, N, D = batch["var"].shape
+    set_id = batch["set_id"].long().squeeze(-1)
+    carry_mask = batch.get("carry_mask", None)
+    if carry_mask is None:
+        carry_mask = torch.zeros(B, N, 1, device=device)
+    carry = carry_mask.squeeze(-1) > 0.5
+    minute = batch["minute"].squeeze(-1)
+    var = batch["var"]
+    val = batch["val"].squeeze(-1)
+    padding = batch.get("padding_mask", torch.zeros(B, N, dtype=torch.bool, device=device))
+
+    new_vars: List[torch.Tensor] = []
+    new_vals: List[torch.Tensor] = []
+    new_minutes: List[torch.Tensor] = []
+    new_setids: List[torch.Tensor] = []
+    for b in range(B):
+        mask_valid = ~padding[b]
+        sid = set_id[b, mask_valid]
+        car = carry[b, mask_valid]
+        t = minute[b, mask_valid]
+        v = var[b, mask_valid]
+        x = val[b, mask_valid]
+        uniq, counts = torch.unique_consecutive(sid, return_counts=True)
+        idx_splits = torch.split(torch.arange(len(sid), device=device), [int(c) for c in counts])
+        kept_tokens: List[torch.Tensor] = []
+        kept_minutes: List[torch.Tensor] = []
+        kept_setids: List[torch.Tensor] = []
+        running_sid = 0
+        for idx in idx_splits:
+            keep = ~car[idx]
+            if keep.sum() == 0:
+                continue
+            kept_tokens.append(v[idx][keep])
+            kept_minutes.append(t[idx][keep])
+            kept_setids.append(torch.full((int(keep.sum()),), running_sid, dtype=torch.long, device=device))
+            running_sid += 1
+        if len(kept_tokens) == 0:
+            kept_tokens = [torch.zeros(1, D, device=device)]
+            kept_minutes = [torch.zeros(1, device=device)]
+            kept_setids = [torch.zeros(1, dtype=torch.long, device=device)]
+        v_new = torch.cat(kept_tokens, dim=0)
+        t_new = torch.cat(kept_minutes, dim=0)
+        s_new = torch.cat(kept_setids, dim=0)
+        x_new = torch.ones(len(v_new), device=device)
+        new_vars.append(v_new)
+        new_vals.append(x_new)
+        new_minutes.append(t_new)
+        new_setids.append(s_new)
+
+    max_len = max(v.shape[0] for v in new_vars)
+    out_var = torch.zeros(B, max_len, D, device=device)
+    out_val = torch.zeros(B, max_len, 1, device=device)
+    out_minute = torch.zeros(B, max_len, 1, device=device)
+    out_setid = torch.zeros(B, max_len, 1, dtype=torch.long, device=device)
+    out_age = torch.zeros(B, max_len, 1, device=device)
+    out_carry = torch.zeros(B, max_len, 1, device=device)
+    out_pad = torch.ones(B, max_len, dtype=torch.bool, device=device)
+    for b in range(B):
+        n = new_vars[b].shape[0]
+        out_var[b, :n] = new_vars[b]
+        out_val[b, :n, 0] = new_vals[b]
+        out_minute[b, :n, 0] = new_minutes[b]
+        out_setid[b, :n, 0] = new_setids[b]
+        out_pad[b, :n] = False
+    return {
+        "var": out_var,
+        "val": out_val,
+        "minute": out_minute,
+        "set_id": out_setid,
+        "age": out_age,
+        "carry_mask": out_carry,
+        "padding_mask": out_pad,
+    }
+
+
 class DataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -98,6 +179,7 @@ class DataModule(pl.LightningDataModule):
         smoke: bool = False,
         smoke_batch_size: int = 10,
         seed: Optional[int] = None,
+        apply_A: bool = False,
     ):
         super().__init__()
         self.saved_dir = saved_dir
@@ -109,6 +191,7 @@ class DataModule(pl.LightningDataModule):
         self.smoke = smoke
         self.smoke_batch_size = smoke_batch_size
         self.seed = seed
+        self.apply_A = apply_A
 
         self.vcols: Optional[List[str]] = None
         self._rng = random.Random(seed)
@@ -134,26 +217,36 @@ class DataModule(pl.LightningDataModule):
     def _loader(self, ds, shuffle):
         vcols = self.vcols
         assert vcols is not None, "DataModule.setup() must be called before creating dataloaders"
+        def _collate(b):
+            out = _collate_lvcf(b, vcols)
+            if self.apply_A:
+                out = _compress_like_raw(out)
+            return out
         return DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=lambda b: _collate_lvcf(b, vcols),
+            collate_fn=_collate,
         )
 
     def train_dataloader(self):
         if getattr(self, "_smoke_indices", None) is not None:
             subset = Subset(self.train, self._smoke_indices)
             # ensure one batch containing exactly smoke_batch_size samples
+            def _collate(b):
+                out = _collate_lvcf(b, self.vcols)
+                if self.apply_A:
+                    out = _compress_like_raw(out)
+                return out
             return DataLoader(
                 subset,
                 batch_size=len(subset),
                 shuffle=False,
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
-                collate_fn=lambda b: _collate_lvcf(b, self.vcols),
+                collate_fn=_collate,
             )
         return self._loader(self.train, True)
 
