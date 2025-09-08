@@ -41,6 +41,8 @@ def main():
     parser.add_argument("--precision", type=str, default="16-mixed")
     parser.add_argument("--smoke", action="store_true", help="Build one train batch of 10 random samples for smoke test")
     parser.add_argument("--run_name", type=str, default=config.name, help="TensorBoard run name subfolder")
+    parser.add_argument("--output_dir", type=str, default=None, help="Experiment output directory. If not set, defaults to ./outputs/<run_name>")
+    parser.add_argument("--log_every_n_steps", type=int, default=getattr(config, "log_every_n_steps", 50), help="Frequency (in steps) for logging")
 
     # Task toggles
     parser.add_argument("--enable_A", action="store_true", help="Apply A: reverse expansion compression (drop carry tokens)")
@@ -99,11 +101,16 @@ def main():
     ckpt = ModelCheckpoint(save_top_k=1, monitor="val_loss", mode="min", filename="poe_pretrain")
     early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
     lrmon = LearningRateMonitor(logging_interval="step")
-    logger = TensorBoardLogger(save_dir=os.path.join("./outputs", args.run_name), name="")
+
+    # Prepare experiment output directory
+    experiment_output_dir = args.output_dir if args.output_dir else os.path.join("./outputs", args.run_name)
+    os.makedirs(experiment_output_dir, exist_ok=True)
+
+    logger = TensorBoardLogger(save_dir=experiment_output_dir, name="")
 
     callbacks = [ckpt, early, lrmon]
     if args.monitor_posterior and PosteriorMetricsMonitor is not None:
-        callbacks.append(PosteriorMetricsMonitor(update_frequency=50, plot_frequency=500, log_dir=os.path.join("./outputs", args.run_name, "posterior")))
+        callbacks.append(PosteriorMetricsMonitor(update_frequency=50, plot_frequency=500, log_dir=os.path.join(experiment_output_dir, "posterior")))
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
@@ -112,7 +119,7 @@ def main():
         logger=logger,
         gradient_clip_val=args.gradient_clip_val,
         val_check_interval=0.1,
-        log_every_n_steps=50,
+        log_every_n_steps=args.log_every_n_steps,
     )
     trainer.fit(model, datamodule=dm)
 
