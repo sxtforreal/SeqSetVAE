@@ -20,50 +20,7 @@ except Exception:
     from dataset import DataModule  # type: ignore
 
 
-def build_synthetic_batch(batch_size: int = 2, max_sets: int = 8, tokens_per_set: int = 16, embed_dim: int = 768):
-    """
-    Create a synthetic batch compatible with DataModule/_collate_lvcf outputs.
-    Shapes:
-      - var: [B, N, D]
-      - val: [B, N, 1]
-      - minute: [B, N, 1]
-      - set_id: [B, N, 1]
-      - age: [B, N, 1]
-      - carry_mask: [B, N, 1]
-      - padding_mask: [B, N]
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B = batch_size
-    # total tokens N per patient
-    S = max_sets
-    n_per_set = tokens_per_set
-    N = S * n_per_set
-
-    var = torch.randn(B, N, embed_dim, device=device)
-    # values: mostly small; some zeros for masked
-    val = (torch.randn(B, N, 1, device=device) * 0.5).clamp_(-3, 3)
-    # time: minutes increasing; each set one minute apart
-    base = torch.arange(S, device=device).float().view(1, S, 1)
-    minute = base.repeat(B, 1, 1).repeat_interleave(n_per_set, dim=1)
-    minute = minute + torch.zeros(B, N, 1, device=device)
-    # set ids
-    set_id = torch.arange(S, device=device).view(1, S, 1).repeat(B, 1, 1).repeat_interleave(n_per_set, dim=1)
-    # age (time since last observation for carry-forwarded tokens)
-    age = torch.zeros(B, N, 1, device=device)
-    # carry mask: within each set, randomly mark ~40% as carry
-    carry_mask = (torch.rand(B, N, 1, device=device) < 0.4).float()
-    # padding mask: no padding in synthetic batch
-    padding_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
-
-    return {
-        "var": var,
-        "val": val,
-        "minute": minute,
-        "set_id": set_id,
-        "age": age,
-        "carry_mask": carry_mask,
-        "padding_mask": padding_mask,
-    }
+ 
 
 
 class NoPoESeqSetVAE(PoESeqSetVAEPretrain):
@@ -235,7 +192,7 @@ def _build_model(variant: str, device: torch.device, set_mae_ratio: float, enabl
     return model.to(device)
 
 
-def run_variant(variant: str, use_real: bool, data_dir: str, steps: int, mask_ratio: float):
+def run_variant(variant: str, data_dir: str, steps: int, mask_ratio: float):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # choose set_mae_ratio
@@ -245,17 +202,14 @@ def run_variant(variant: str, use_real: bool, data_dir: str, steps: int, mask_ra
     model = _build_model(variant, device, set_mae_ratio=set_mae_ratio, enable_c=enable_c)
     optimizer = AdamW(model.parameters(), lr=3e-4)
 
-    # batch source
-    if use_real:
-        dm = DataModule(saved_dir=data_dir, batch_size=8, num_workers=0, smoke=True, smoke_batch_size=8)
-        dm.setup()
-        batch = dm.build_smoke_batch()
-        # move to device
-        for k, v in list(batch.items()):
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.to(device)
-    else:
-        batch = build_synthetic_batch()
+    # batch source (real data only)
+    dm = DataModule(saved_dir=data_dir, batch_size=8, num_workers=0, smoke=True, smoke_batch_size=8)
+    dm.setup()
+    batch = dm.build_smoke_batch()
+    # move to device
+    for k, v in list(batch.items()):
+        if isinstance(v, torch.Tensor):
+            batch[k] = v.to(device)
 
     # Variant A: reverse expansion
     if variant in {"A", "AB", "AB_poe", "AB_concat", "ABC"}:
@@ -302,16 +256,12 @@ def main():
     parser.add_argument("--variant", type=str, default="AB_poe", choices=[
         "baseline", "A", "B", "AB", "AB_poe", "AB_concat", "ABC",
     ])
-    parser.add_argument("--use_real_batch", action="store_true")
-    parser.add_argument("--data_dir", type=str, default=os.environ.get("SEQSET_PTN_DATA", ""))
+    parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--mask_ratio", type=float, default=0.25, help="Set-MAE mask ratio for B variants (0.2-0.4 suggested)")
     args = parser.parse_args()
 
-    if args.use_real_batch and not args.data_dir:
-        raise SystemExit("--data_dir must be provided when --use_real_batch is set")
-
-    run_variant(args.variant, args.use_real_batch, args.data_dir, args.steps, args.mask_ratio)
+    run_variant(args.variant, args.data_dir, args.steps, args.mask_ratio)
 
 
 if __name__ == "__main__":
