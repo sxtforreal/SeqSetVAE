@@ -174,6 +174,8 @@ class SetVAE(pl.LightningModule):
         self.lr = lr
         self.warmup_steps = kwargs.get("warmup_steps", 10_000)
         self.max_steps = kwargs.get("max_steps", 1_000_000)
+        # Step-based LR schedulers should step only on optimizer steps. Allow configuration via kwargs.
+        self.scheduler_frequency = int(kwargs.get("scheduler_frequency", 1))
 
     def forward(self, var, val):
         return self.setvae(var, val)
@@ -214,7 +216,7 @@ class SetVAE(pl.LightningModule):
         )
         return {
             "optimizer": opt,
-            "lr_scheduler": {"scheduler": sch, "interval": "step"},
+            "lr_scheduler": {"scheduler": sch, "interval": "step", "frequency": self.scheduler_frequency},
         }
 
 
@@ -654,6 +656,8 @@ class SeqSetVAE(pl.LightningModule):
         medical_scenario: str = "multi_condition_screening",  # SOTA: Medical scenario for loss strategy
         head_type: str = "advanced",  # "advanced" | "gaussian_mil"
         gaussian_use_time: bool = True,
+        # Ensure step-based schedulers align with optimizer steps
+        scheduler_frequency: int = 1,
     ):
 
         super().__init__()
@@ -874,6 +878,8 @@ class SeqSetVAE(pl.LightningModule):
         self.medical_scenario = medical_scenario  # Store for SOTA loss strategy
         
         self.save_hyperparameters(ignore=["setvae"])
+        # Save scheduler frequency for step-based schedulers (e.g., cosine warm restarts in finetune mode)
+        self.scheduler_frequency = int(scheduler_frequency)
  
     def _build_advanced_classifier(self, latent_dim: int, num_classes: int):
         """
@@ -1924,7 +1930,8 @@ class SeqSetVAE(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "step" if self.classification_only else "epoch",  # Step-wise for advanced training
-                "frequency": 1,
+                # Align scheduler stepping with optimizer steps when using gradient accumulation
+                "frequency": (self.scheduler_frequency if self.classification_only else 1),
                 "monitor": "val_auc" if self.classification_only else "val_loss",  # Monitor AUC for finetune
             },
         }

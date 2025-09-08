@@ -121,6 +121,8 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self._step = 0
         self.enable_next_change = enable_next_change
         self.next_change_weight = next_change_weight
+        # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
+        self._manual_scheduler = None
 
         # Task C head: predict whether next set contains any new (non-carry) event
         if enable_next_change:
@@ -343,6 +345,28 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
 
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)
-        sch = get_linear_schedule_with_warmup(opt, num_warmup_steps=2_000, num_training_steps=200_000)
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step"}}
+        # Create step-based scheduler but step it manually after actual optimizer steps
+        self._manual_scheduler = get_linear_schedule_with_warmup(
+            opt, num_warmup_steps=2_000, num_training_steps=200_000
+        )
+        # Return only the optimizer to Lightning to avoid it stepping the scheduler early
+        return opt
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Step scheduler ONLY when an optimizer step occurred (respect gradient accumulation)
+        if self._manual_scheduler is None or self.trainer is None:
+            return
+        try:
+            accumulate = int(getattr(self.trainer, "accumulate_grad_batches", 1))
+        except Exception:
+            accumulate = 1
+        is_last_batch = False
+        try:
+            num_batches = int(getattr(self.trainer, "num_training_batches", 0) or 0)
+            is_last_batch = (batch_idx + 1) >= num_batches and num_batches > 0
+        except Exception:
+            pass
+        should_step = ((batch_idx + 1) % max(1, accumulate) == 0) or is_last_batch
+        if should_step:
+            self._manual_scheduler.step()
 
