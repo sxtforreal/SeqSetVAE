@@ -6,6 +6,7 @@ Pipeline per patient Parquet:
 2) Clamp minute<0 to 0, sort by [minute, variable], assign set_index per unique minute.
 3) Apply LVCF within a time window (minutes):
    - For variables missing at current minute, carry most recent value within window;
+   - Variables in --always_carry_vars bypass the window and are carried indefinitely;
    - age = minutes since last observation (0 for raw events), is_carry in {0,1};
    - time = minute of the set.
 4) Map event names to 768-d vectors from an offline CSV and materialize as columns v0..v767.
@@ -32,13 +33,14 @@ python -u /home/sunx/data/aiiih/projects/sunx/projects/SSV/main/LVCF.py \
   --event_emb_csv /home/sunx/data/aiiih/data/mimic/processed/cached.csv \
   --value_stats_csv /home/sunx/data/aiiih/data/mimic/processed/stats.csv \
   --lvcf_minutes 60 \
+  --always_carry_vars "/path/to/always_vars.txt" \
   --overwrite
 """
 
 import os
 import glob
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -91,7 +93,11 @@ def _load_value_stats(csv_path: str) -> Tuple[pd.DataFrame, str]:
     return stats[[key_col, "mean", "std"]], key_col
 
 
-def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
+def expand_patient(
+    df: pd.DataFrame,
+    lvcf_minutes: float,
+    always_carry_vars: Optional[List[str]] = None,
+) -> pd.DataFrame:
     df = df.copy()
     # Clamp minute
     df["minute"] = df["minute"].astype(float)
@@ -104,6 +110,7 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
     df["set_index"] = df["minute"].map(minute_to_setidx).astype(int)
 
     window = float(lvcf_minutes)
+    always_carry_set: Set[str] = set(always_carry_vars) if always_carry_vars else set()
     last_seen_time: Dict[str, float] = {}
     last_seen_val: Dict[str, float] = {}
     variables: List[str] = sorted(df["variable"].unique().tolist())
@@ -138,7 +145,9 @@ def expand_patient(df: pd.DataFrame, lvcf_minutes: float) -> pd.DataFrame:
         for v in variables:
             if v in present:
                 continue
-            if v in last_seen_time and (float(m) - last_seen_time[v]) <= window:
+            if v in last_seen_time and (
+                (float(m) - last_seen_time[v]) <= window or v in always_carry_set
+            ):
                 dt = float(m) - last_seen_time[v]
                 rows.append(
                     {
@@ -226,6 +235,7 @@ def _process_one_file(
     emb_key: str,
     stats_df: pd.DataFrame,
     stats_key: str,
+    always_carry_vars: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     raw = pd.read_parquet(fp, engine="pyarrow")
     # Drop irrelevant columns if present
@@ -236,7 +246,7 @@ def _process_one_file(
         raise ValueError(
             f"Input parquet {fp} must contain columns ['variable','value','minute']"
         )
-    exp = expand_patient(raw, lvcf_minutes)
+    exp = expand_patient(raw, lvcf_minutes, always_carry_vars)
     exp = _apply_embeddings(exp, emb_df, emb_key)
     exp = _apply_value_normalization(exp, stats_df, stats_key)
     return exp
@@ -267,6 +277,15 @@ def main():
     ap.add_argument(
         "--lvcf_minutes", type=float, default=60.0, help="LVCF window size in minutes"
     )
+    ap.add_argument(
+        "--always_carry_vars",
+        type=str,
+        default=None,
+        help=(
+            "Optional: comma-separated variable names or a file path (one per line) "
+            "to always carry-forward without time limit"
+        ),
+    )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     ap.add_argument(
         "--smoke",
@@ -277,6 +296,16 @@ def main():
 
     emb_df, emb_key, emb_dim = _load_event_embeddings(args.event_emb_csv)
     stats_df, stats_key = _load_value_stats(args.value_stats_csv)
+
+    always_carry_list: Optional[List[str]] = None
+    if args.always_carry_vars:
+        if os.path.exists(args.always_carry_vars):
+            with open(args.always_carry_vars, "r") as f:
+                always_carry_list = [line.strip() for line in f if line.strip()]
+        else:
+            always_carry_list = [
+                s.strip() for s in args.always_carry_vars.split(",") if s.strip()
+            ]
 
     os.makedirs(args.output_dir, exist_ok=True)
     for part in ["train", "valid", "test"]:
@@ -290,7 +319,7 @@ def main():
             raise FileNotFoundError("No train parquet files found for smoke test")
         fp = train_files[0]
         out_df = _process_one_file(
-            fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key
+            fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key, always_carry_list
         )
         _validate_output(out_df, emb_dim)
         out_fp = os.path.join(args.output_dir, "train", os.path.basename(fp))
@@ -321,7 +350,7 @@ def main():
                 pbar.update(1)
                 continue
             out_df = _process_one_file(
-                fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key
+                fp, args.lvcf_minutes, emb_df, emb_key, stats_df, stats_key, always_carry_list
             )
             _validate_output(out_df, emb_dim)
             out_df.to_parquet(out_fp, engine="pyarrow", index=False)
