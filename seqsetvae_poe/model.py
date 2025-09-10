@@ -174,8 +174,12 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
     def _beta(self):
         if not self.warmup_beta:
             return self.max_beta
-        if self._step < self.beta_warmup_steps:
-            return self.max_beta * (self._step / self.beta_warmup_steps)
+        try:
+            step = int(getattr(self, "global_step", 0))
+        except Exception:
+            step = 0
+        if step < self.beta_warmup_steps:
+            return self.max_beta * (step / self.beta_warmup_steps)
         return self.max_beta
 
     # --- core ---
@@ -508,7 +512,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         out[live_mask] = 0.0
         return out
 
-    def _apply_set_mae_inplace(self, val: torch.Tensor, carry: torch.Tensor):
+    def _apply_set_mae_inplace(self, val: torch.Tensor, carry: torch.Tensor, original_val: torch.Tensor):
         """
         Mask a small number of tokens in-place.
         - For N <= small_set_threshold: with probability small_set_mask_prob, mask exactly 1 token
@@ -533,7 +537,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             if k > 0:
                 idx = torch.randperm(N, device=device)[:k]
                 val[:, idx, :] = 0.0
-        # guarantee at least one non-carry token not zeroed if possible
+        # guarantee at least one non-carry token not zeroed if possible (restore original value)
         non_carry = (carry <= 0.5).squeeze(-1)
         if non_carry.any():
             # if all non-carry got zeroed, restore one
@@ -541,8 +545,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             if torch.all(mask_zero | (~non_carry)):
                 indices = torch.nonzero(non_carry, as_tuple=False).squeeze(-1)
                 pick = indices[torch.randint(0, len(indices), (1,), device=device)]
-                # restore original magnitude to 1.0 scale (keep original val if available)
-                val[:, pick, :] = 1.0
+                val[:, pick, :] = original_val[:, pick, :]
 
     def _forward_single(self, s):
         # target (clean)
@@ -550,11 +553,12 @@ class SetVAEOnlyPretrain(pl.LightningModule):
 
         # build noisy input
         val_in = s["val"].clone()
+        original_val = val_in.clone()
         carry = s.get("carry", torch.zeros_like(val_in))
         # value dropout by stale/live
         val_in = self._apply_value_dropout(val_in, carry)
         # token masking (Set-MAE)
-        self._apply_set_mae_inplace(val_in, carry)
+        self._apply_set_mae_inplace(val_in, carry, original_val)
         # additive value noise
         if self.training and self.val_noise_std > 0:
             val_in = val_in + self.val_noise_std * torch.randn_like(val_in)
@@ -610,6 +614,24 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         beta = self._beta()
         total = recon + beta * kl
         self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_beta": beta}, prog_bar=True, on_epoch=True)
+        # Per-dim KL stats on clean inputs (no perturbations)
+        try:
+            kl_dim = self._compute_kl_dim_stats(batch)  # [D]
+            if hasattr(self, "logger") and getattr(self.logger, "experiment", None) is not None:
+                tb = self.logger.experiment
+                tb.add_histogram("val/kl_per_dim", kl_dim.detach().cpu().numpy(), global_step=getattr(self, "global_step", 0))
+            # coverage metrics
+            kd = kl_dim.detach()
+            total_kl = float(kd.sum().item() + 1e-8)
+            if total_kl > 0:
+                sorted_vals, _ = torch.sort(kd, descending=True)
+                cumsum = torch.cumsum(sorted_vals, dim=0) / sorted_vals.sum()
+                d90 = int((cumsum < 0.90).sum().item() + 1)
+                d95 = int((cumsum < 0.95).sum().item() + 1)
+                self.log("val_kl_dim90", d90, prog_bar=True, on_epoch=True)
+                self.log("val_kl_dim95", d95, prog_bar=True, on_epoch=True)
+        except Exception:
+            pass
         return total
 
     def configure_optimizers(self):
@@ -635,3 +657,33 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         should_step = ((batch_idx + 1) % max(1, accumulate) == 0) or is_last_batch
         if should_step:
             self._manual_scheduler.step()
+
+    def _compute_kl_dim_stats(self, batch: dict) -> torch.Tensor:
+        var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
+        padding_mask = batch.get("padding_mask", None)
+        carry_mask = batch.get("carry_mask", None)
+        all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
+        kl_dim_sum = None
+        count = 0
+        for sets in all_sets:
+            for s in sets:
+                # clean input
+                if self.set_encoder.dim_reducer is not None:
+                    reduced = self.set_encoder.dim_reducer(s["var"])  # [1,N,R]
+                else:
+                    reduced = s["var"]
+                norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+                v_norm = reduced / (norms + 1e-8)
+                x_clean = v_norm * s["val"]
+                z_list, _ = self.set_encoder.encode(x_clean)
+                _z, mu, logvar = z_list[-1]
+                # [1,1,D] -> [D]
+                kl_dim = 0.5 * (logvar.exp().squeeze(0).squeeze(0) + mu.squeeze(0).squeeze(0).pow(2) - 1.0 - logvar.squeeze(0).squeeze(0))
+                if kl_dim_sum is None:
+                    kl_dim_sum = kl_dim
+                else:
+                    kl_dim_sum = kl_dim_sum + kl_dim
+                count += 1
+        if kl_dim_sum is None or count == 0:
+            return torch.zeros(self.latent_dim, device=var.device)
+        return kl_dim_sum / float(count)
