@@ -7,9 +7,10 @@ import math
 
 # MAB - Multi-head Attention Block
 class MAB(nn.Module):
-    def __init__(self, dim, heads):
+    def __init__(self, dim, heads, dropout: float = 0.1):
         super().__init__()
-        self.multihead = nn.MultiheadAttention(dim, heads)
+        self.multihead = nn.MultiheadAttention(dim, heads, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
         self.ln1 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
             nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
@@ -21,9 +22,10 @@ class MAB(nn.Module):
         kv_t = kv.transpose(0, 1)
         attn_output, _ = self.multihead(q_t, kv_t, kv_t)
         attn_output = attn_output.transpose(0, 1)
-        a = self.ln1(attn_output)
+        # Residual + Pre-LN
+        a = self.ln1(q + self.dropout(attn_output))
         ff_out = self.ff(a)
-        return self.ln2(ff_out)
+        return self.ln2(a + self.dropout(ff_out))
 
 
 # ISAB - Induced Set Attention Block
@@ -45,16 +47,18 @@ class ISAB(nn.Module):
 class PoolingByMultiheadAttention(nn.Module):
     def __init__(self, dim, heads, dropout=0.1):
         super().__init__()
-        self.mab = MAB(dim, heads)
+        self.mab = MAB(dim, heads, dropout=dropout)
         self.ff = nn.Linear(dim, dim)
         self.ln = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
+        # Learnable base query to make decoding deterministic; tiled to target_n
+        self.base_query = nn.Parameter(torch.zeros(1, 1, dim))
 
     def forward(self, z, target_n, noise_std=0.5):
         batch_size = z.size(0)
-        seed = torch.randn(batch_size, target_n, z.size(-1), device=z.device)
-        noise = torch.randn_like(seed) * noise_std
-        seed = seed + noise
+        seed = self.base_query.expand(batch_size, target_n, -1)
+        if self.training and noise_std > 0:
+            seed = seed + torch.randn_like(seed) * noise_std
         ff_z = F.gelu(self.ff(z))
         ln_ff = self.ln(ff_z)
         mab_out = self.mab(seed, ln_ff)
@@ -78,10 +82,11 @@ class AttentiveBottleneckLayer(nn.Module):
 
 # SetVAE Module
 class SetVAEModule(nn.Module):
-    def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m):
+    def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m, enable_posterior_std_augmentation: bool = True):
         super().__init__()
         self.reduced_dim = reduced_dim
         self.levels = levels
+        self.enable_posterior_std_augmentation = enable_posterior_std_augmentation
         if reduced_dim is not None:
             self.dim_reducer = nn.Linear(input_dim, reduced_dim)
             embed_input = reduced_dim
@@ -114,8 +119,7 @@ class SetVAEModule(nn.Module):
         )
         
         self.out = nn.Sequential(
-            nn.Linear(latent_dim, out_output),
-            nn.Tanh()  # Add output activation function to limit output range
+            nn.Linear(latent_dim, out_output)
         )
 
         # Improved initialization
@@ -152,8 +156,8 @@ class SetVAEModule(nn.Module):
             logvar = torch.clamp(logvar, min=-10, max=10)
             std = torch.exp(0.5 * logvar)
             
-            # Add noise to prevent overfitting
-            if self.training:
+            # Optional std augmentation (disabled for truthful SetVAE-only)
+            if self.training and self.enable_posterior_std_augmentation:
                 eps = torch.randn_like(std) * 0.1
                 std = std + eps.abs()
                 
@@ -222,7 +226,7 @@ def recon_loss(
     alpha=1.0,
     beta=1.0,
     gamma=3.0,
-    beta_var=0.1,
+    beta_var=0.0,
     epsilon=1e-8,
 ):
     """
@@ -277,7 +281,7 @@ def recon_loss(
     # Variance regularization: Encourage higher variance in recon (negative to minimize)
     var_term = (
         -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
-    )  # Mean over dims, tokens, batch
+    )
 
     # Total loss
     total_loss = (
@@ -288,31 +292,16 @@ def recon_loss(
 
 def elbo_loss(recon, target, z_list, free_bits=0.1):
     """
-    Improved ELBO loss function to prevent posterior collapse
+    ELBO with pure KL (to N(0,I)) and free-bits. No extra regularizers.
     """
     r_loss = recon_loss(recon, target)
-    
-    total_kl = 0
     latent_dim = z_list[0][1].size(-1)
     min_kl = free_bits * latent_dim
-    
-    for layer_idx, (z_sample, mu, logvar) in enumerate(z_list):
-        # Standard KL divergence
-        kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
-        
-        # Apply free bits
+    kl_accum = 0.0
+    for (_z, mu, logvar) in z_list:
+        kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)
         kl_div = torch.clamp(kl_div, min=min_kl)
-        
-        # Add layer weights, deeper layers have higher KL loss weights
-        layer_weight = (layer_idx + 1) / len(z_list)
-        
-        # Regularization term to prevent variance collapse
-        var_reg = -0.1 * torch.mean(logvar)  # Encourage larger variance
-        
-        # Regularization term to prevent mean collapse
-        mean_reg = 0.01 * torch.mean(mu.pow(2))  # Slightly penalize large means
-        
-        total_kl += layer_weight * (kl_div.mean() + var_reg + mean_reg)
-    
+        kl_accum = kl_accum + kl_div.mean()
+    total_kl = kl_accum / max(1, len(z_list))
     return r_loss, total_kl
 
