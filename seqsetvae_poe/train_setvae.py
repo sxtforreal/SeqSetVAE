@@ -1,58 +1,118 @@
-#!/usr/bin/env python3
+""" 
+python /home/sunx/data/aiiih/projects/sunx/projects/SSV/main/_setvae_PT.py \
+  --data_dir /home/sunx/data/aiiih/data/mimic/processed/SeqSetVAE \
+  --output_dir /home/sunx/data/aiiih/projects/sunx/projects/SSV/output/setvae-PT \
+  --batch_size 10 \
+  --max_epochs 50 \
+  --num_workers 1 \
+  --precision 16-mixed \
+  --lr 3e-4 \
+  --warmup_beta --max_beta 0.2 --beta_warmup_steps 8000 --free_bits 0.05 \
+  --p_stale 0.5 --p_live 0.05 \
+  --set_mae_ratio 0.15 --small_set_mask_prob 0.4 --small_set_threshold 5 --max_masks_per_set 2 \
+  --val_noise_std 0.07 --dir_noise_std 0.01 \
+  --train_decoder_noise_std 0.3 --eval_decoder_noise_std 0.05 \
+  --gradient_clip_val 0.2 \
+  --run_name SetVAE-Only-PT
+"""
+
 import os
-import sys
 import argparse
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from lightning.pytorch.callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    LearningRateMonitor,
+)
 from lightning.pytorch.loggers import TensorBoardLogger
 
-# Make script runnable both as package and as a standalone file
-PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(PKG_DIR)
-if PKG_DIR not in sys.path:
-    sys.path.insert(0, PKG_DIR)
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
 
-try:
-    from . import config  # type: ignore
-    from .dataset import DataModule  # type: ignore
-    from .model import SetVAEOnlyPretrain  # type: ignore
-except Exception:
-    import config
-    from dataset import DataModule
-    from model import SetVAEOnlyPretrain
+import config
+from dataset import DataModule
+from model import SetVAEOnlyPretrain
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SetVAE-only pretraining over LVCF-expanded sets")
+    parser = argparse.ArgumentParser(
+        description="SetVAE-only pretraining over LVCF-expanded sets"
+    )
     # Data & loader
     parser.add_argument("--data_dir", type=str, default=getattr(config, "data_dir", ""))
-    parser.add_argument("--params_map_path", type=str, default=getattr(config, "params_map_path", ""))
-    parser.add_argument("--batch_size", type=int, default=getattr(config, "batch_size", 4))
+    parser.add_argument(
+        "--params_map_path", type=str, default=getattr(config, "params_map_path", "")
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=getattr(config, "batch_size", 4)
+    )
     parser.add_argument("--max_epochs", type=int, default=50)
-    parser.add_argument("--num_workers", type=int, default=getattr(config, "num_workers", 4))
+    parser.add_argument(
+        "--num_workers", type=int, default=getattr(config, "num_workers", 4)
+    )
     parser.add_argument("--precision", type=str, default="16-mixed")
-    parser.add_argument("--smoke", action="store_true", help="Build one train batch for smoke test")
-    parser.add_argument("--run_name", type=str, default="SetVAE-Only-PT", help="TensorBoard run name subfolder")
-    parser.add_argument("--output_dir", type=str, default=None, help="Experiment output dir (default ./outputs/<run_name>)")
-    parser.add_argument("--log_every_n_steps", type=int, default=getattr(config, "log_every_n_steps", 50))
+    parser.add_argument(
+        "--smoke", action="store_true", help="Build one train batch for smoke test"
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default="SetVAE-Only-PT",
+        help="TensorBoard run name subfolder",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Experiment output dir (default ./outputs/<run_name>)",
+    )
+    parser.add_argument(
+        "--log_every_n_steps",
+        type=int,
+        default=getattr(config, "log_every_n_steps", 50),
+    )
 
     # Optim & regularization
     parser.add_argument("--lr", type=float, default=getattr(config, "lr", 3e-4))
-    parser.add_argument("--gradient_clip_val", type=float, default=getattr(config, "gradient_clip_val", 0.2))
+    parser.add_argument(
+        "--gradient_clip_val",
+        type=float,
+        default=getattr(config, "gradient_clip_val", 0.2),
+    )
 
     # Anti posterior-collapse
-    parser.add_argument("--warmup_beta", action="store_true", default=getattr(config, "warmup_beta", True))
+    parser.add_argument(
+        "--warmup_beta",
+        action="store_true",
+        default=getattr(config, "warmup_beta", True),
+    )
     parser.add_argument("--max_beta", type=float, default=0.2)
-    parser.add_argument("--beta_warmup_steps", type=int, default=getattr(config, "beta_warmup_steps", 8000))
-    parser.add_argument("--free_bits", type=float, default=0.05, help="Per-dim free bits (nats) for KL")
+    parser.add_argument(
+        "--beta_warmup_steps",
+        type=int,
+        default=getattr(config, "beta_warmup_steps", 8000),
+    )
+    parser.add_argument(
+        "--free_bits", type=float, default=0.05, help="Per-dim free bits (nats) for KL"
+    )
 
     # Perturbations
-    parser.add_argument("--p_stale", type=float, default=0.5, help="Dropout prob for carried values")
-    parser.add_argument("--p_live", type=float, default=0.05, help="Dropout prob for non-carried values")
-    parser.add_argument("--set_mae_ratio", type=float, default=0.15, help="Mask ratio for larger sets (> small_set_threshold)")
-    parser.add_argument("--small_set_mask_prob", type=float, default=0.4, help="Prob to mask exactly 1 token if N<=threshold")
+    parser.add_argument(
+        "--p_stale", type=float, default=0.5, help="Dropout prob for carried values"
+    )
+    parser.add_argument(
+        "--p_live", type=float, default=0.05, help="Dropout prob for non-carried values"
+    )
+    parser.add_argument(
+        "--set_mae_ratio",
+        type=float,
+        default=0.15,
+        help="Mask ratio for larger sets (> small_set_threshold)",
+    )
+    parser.add_argument(
+        "--small_set_mask_prob",
+        type=float,
+        default=0.4,
+        help="Prob to mask exactly 1 token if N<=threshold",
+    )
     parser.add_argument("--small_set_threshold", type=int, default=5)
     parser.add_argument("--max_masks_per_set", type=int, default=2)
     parser.add_argument("--val_noise_std", type=float, default=0.07)
@@ -98,12 +158,16 @@ def main():
         eval_decoder_noise_std=args.eval_decoder_noise_std,
     )
 
-    ckpt = ModelCheckpoint(save_top_k=1, monitor="val_loss", mode="min", filename="setvae_pretrain")
+    ckpt = ModelCheckpoint(
+        save_top_k=1, monitor="val_loss", mode="min", filename="setvae_PT"
+    )
     early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
     lrmon = LearningRateMonitor(logging_interval="step")
 
     # Prepare experiment output directory
-    experiment_output_dir = args.output_dir if args.output_dir else os.path.join("./outputs", args.run_name)
+    experiment_output_dir = (
+        args.output_dir if args.output_dir else os.path.join("./outputs", args.run_name)
+    )
     os.makedirs(experiment_output_dir, exist_ok=True)
     logger = TensorBoardLogger(save_dir=experiment_output_dir, name="")
 
@@ -121,4 +185,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
