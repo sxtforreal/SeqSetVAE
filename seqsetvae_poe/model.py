@@ -8,7 +8,7 @@ from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from transformers import get_linear_schedule_with_warmup
 from typing import Optional
 
-from .modules import SetVAEModule, AttentiveBottleneckLayer, elbo_loss as base_elbo, recon_loss as chamfer_recon
+from modules import SetVAEModule, AttentiveBottleneckLayer, elbo_loss as base_elbo, recon_loss as chamfer_recon
 
 
 class _SetDecoder(nn.Module):
