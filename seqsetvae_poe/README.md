@@ -43,3 +43,36 @@ python train_pretrain.py \
 
 Parquet remains the storage format for fastest dataloading. The SetVAE, causal Transformer, and decoder are preserved.
 
+### SetVAE-only Pretraining
+
+This trains only the SetVAE on LVCF-expanded sets with a truthful, task-agnostic objective and small, mechanism-aligned perturbations.
+
+Objective:
+- Reconstruction: permutation-invariant Chamfer loss on x_target = normalize(var) * val
+- KL: q(z|x) vs N(0,I) with free-bits and beta warmup
+
+Training-time perturbations (all sets):
+- Value dropout: stronger on carried tokens (p_stale≈0.5), light on live tokens (p_live≈0.05)
+- Token masking (Set-MAE): for N<=5, mask 1 token with prob 0.4; for larger sets, mask ceil(0.15*N), capped at 2
+- Additive value noise: Normal(0, 0.07)
+- Directional jitter on normalized variable vectors: Normal(0, 0.01) then renormalize
+- Decoder noise during training: 0.3 (eval: 0–0.05)
+
+Run:
+```bash
+python train_setvae.py \
+  --data_dir /path/to/patient_expanded \
+  --batch_size 4 --max_epochs 50 \
+  --p_stale 0.5 --p_live 0.05 \
+  --set_mae_ratio 0.15 --small_set_mask_prob 0.4 --small_set_threshold 5 --max_masks_per_set 2 \
+  --val_noise_std 0.07 --dir_noise_std 0.01 \
+  --warmup_beta --max_beta 0.2 --free_bits 0.05
+```
+
+Outputs:
+- TensorBoard logs under `./outputs/SetVAE-Only-PT/` (default)
+- Best checkpoint `setvae_pretrain.ckpt`
+
+Usage after pretraining:
+- Load the SetVAE encoder/decoder and freeze them for likelihood estimation. Use per-set NELBO (Recon + beta*KL) or per-step KL between q_x(z|x) and a separate prior to trigger anomaly alarms when the distributional gap is large.
+
