@@ -49,7 +49,7 @@ This trains only the SetVAE on LVCF-expanded sets with a truthful, task-agnostic
 
 Objective:
 - Reconstruction: permutation-invariant Chamfer loss on x_target = normalize(var) * val
-- KL: q(z|x) vs N(0,I) with free-bits and beta warmup
+- KL: q(z|x) vs N(0,I) with free-bits and beta warmup (pure KL, no extra regularizers)
 
 Training-time perturbations (all sets):
 - Value dropout: stronger on carried tokens (p_stale≈0.5), light on live tokens (p_live≈0.05)
@@ -75,4 +75,9 @@ Outputs:
 
 Usage after pretraining:
 - Load the SetVAE encoder/decoder and freeze them for likelihood estimation. Use per-set NELBO (Recon + beta*KL) or per-step KL between q_x(z|x) and a separate prior to trigger anomaly alarms when the distributional gap is large.
+
+Notes:
+- Decoder head no longer uses Tanh to avoid saturation; outputs are linear.
+- Attention blocks now have residual connections and dropout for stability.
+- Decoding queries are learnable and deterministic (plus optional small noise during training).
 

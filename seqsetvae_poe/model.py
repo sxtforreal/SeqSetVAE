@@ -79,6 +79,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             levels=levels,
             heads=heads,
             m=m,
+            enable_posterior_std_augmentation=False,
         )
 
         # Causal transformer producing p(z_t|history)
