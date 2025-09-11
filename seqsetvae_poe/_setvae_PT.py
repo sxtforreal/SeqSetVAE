@@ -1,19 +1,14 @@
 """ 
-python /home/sunx/data/aiiih/projects/sunx/projects/SSV/main/_setvae_PT.py \
+python -u /home/sunx/data/aiiih/projects/sunx/projects/SSV/main/_setvae_PT.py \
   --data_dir /home/sunx/data/aiiih/data/mimic/processed/SeqSetVAE \
-  --output_dir /home/sunx/data/aiiih/projects/sunx/projects/SSV/output/setvae-PT \
-  --batch_size 10 \
-  --max_epochs 50 \
-  --num_workers 1 \
-  --precision 16-mixed \
-  --lr 3e-4 \
-  --warmup_beta --max_beta 0.2 --beta_warmup_steps 8000 --free_bits 0.05 \
-  --p_stale 0.5 --p_live 0.05 \
-  --set_mae_ratio 0.15 --small_set_mask_prob 0.4 --small_set_threshold 5 --max_masks_per_set 2 \
-  --val_noise_std 0.07 --dir_noise_std 0.01 \
-  --train_decoder_noise_std 0.3 --eval_decoder_noise_std 0.05 \
-  --gradient_clip_val 0.2 \
-  --run_name SetVAE-Only-PT
+  --params_map_path /home/sunx/data/aiiih/data/mimic/processed/stats.csv \
+  --batch_size 10 --max_epochs 50 --num_workers 1 \
+  --precision 16-mixed --lr 3e-4 \
+  --warmup_beta --max_beta 0.05 --beta_warmup_steps 8000 --free_bits 0.03 \
+  --use_kl_capacity --capacity_per_dim_end 0.03 --capacity_warmup_steps 20000 \
+  --limit_val_batches 0.25 --val_check_interval 0.2 \
+  --init_ckpt /home/sunx/data/aiiih/projects/sunx/projects/SSV/output/setvae-PT/version_0/checkpoints/setvae_PT.ckpt \
+  --run_name SetVAE-PT-capacity-init
 """
 
 import os
@@ -119,9 +114,21 @@ def main():
         "--free_bits", type=float, default=0.05, help="Per-dim free bits (nats) for KL"
     )
     # KL capacity schedule
-    parser.add_argument("--use_kl_capacity", action="store_true", default=getattr(config, "use_kl_capacity", True))
-    parser.add_argument("--capacity_per_dim_end", type=float, default=getattr(config, "capacity_per_dim_end", 0.03))
-    parser.add_argument("--capacity_warmup_steps", type=int, default=getattr(config, "capacity_warmup_steps", 20000))
+    parser.add_argument(
+        "--use_kl_capacity",
+        action="store_true",
+        default=getattr(config, "use_kl_capacity", True),
+    )
+    parser.add_argument(
+        "--capacity_per_dim_end",
+        type=float,
+        default=getattr(config, "capacity_per_dim_end", 0.03),
+    )
+    parser.add_argument(
+        "--capacity_warmup_steps",
+        type=int,
+        default=getattr(config, "capacity_warmup_steps", 20000),
+    )
 
     # Perturbations
     parser.add_argument(
@@ -197,7 +204,9 @@ def main():
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
             missing, unexpected = model.load_state_dict(state, strict=False)
-            print(f"🔁 Initialized model from weights: missing={len(missing)}, unexpected={len(unexpected)}")
+            print(
+                f"🔁 Initialized model from weights: missing={len(missing)}, unexpected={len(unexpected)}"
+            )
         except Exception as e:
             print(f"⚠️  Failed to initialize from init_ckpt: {e}")
 
