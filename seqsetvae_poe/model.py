@@ -77,6 +77,8 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         poe_beta_max: float = 3.0,
         # Freeze SetVAE encoder during dynamics pretraining (two-stage training)
         freeze_set_encoder: bool = True,
+        # PoE mode: 'conditional' uses a learned likelihood expert; 'naive' uses set encoder posterior
+        poe_mode: str = "conditional",
     ):
         super().__init__()
 
@@ -93,6 +95,10 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         if freeze_set_encoder:
             for p in self.set_encoder.parameters():
                 p.requires_grad = False
+
+        # PoE mode
+        assert poe_mode in {"conditional", "naive"}
+        self.poe_mode = poe_mode
 
         # GRU-based dynamics producing p(z_t | history)
         self.gru_cell = nn.GRUCell(latent_dim, latent_dim)
@@ -121,6 +127,16 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 nn.Linear(3, latent_dim // 2),
                 nn.GELU(),
                 nn.Linear(latent_dim // 2, 1),
+            )
+
+        # Conditional likelihood expert head (natural parameters)
+        # Input at time t: [set_agg_t, mu_p_t, logvar_p_t] (concat over last dim)
+        # Outputs: [log_prec_like_t, h_like_t]
+        if self.poe_mode == "conditional":
+            self.like_head = nn.Sequential(
+                nn.Linear(latent_dim * 3, latent_dim),
+                nn.GELU(),
+                nn.Linear(latent_dim, latent_dim * 2),
             )
 
         # Training hparams
@@ -283,12 +299,17 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             # Optional Set-MAE masking on input values
             val_inp = self._apply_set_mae(val, self.set_mae_ratio)
             # Encode q_x(z|x)
-            z_list_enc, _ = self.set_encoder.encode_from_var_val(var, val_inp)
+            z_list_enc, enc_tokens = self.set_encoder.encode_from_var_val(var, val_inp)
             _z, mu_qx, logvar_qx = z_list_enc[-1]
             z_mu_list.append(mu_qx.squeeze(1))
             z_logvar_list.append(logvar_qx.squeeze(1))
             # use a single scalar time per set (e.g., last timestamp)
             pos_list.append(s["set_time"].float())
+            # aggregate token features for conditional likelihood expert
+            if self.poe_mode == "conditional":
+                # enc_tokens shape [1,N,D]; mean pool to [1,D]
+                agg = enc_tokens.mean(dim=1) if enc_tokens is not None else mu_qx.squeeze(1)
+                z_mu_post_list.append(agg)  # temporarily stash set agg; will be replaced later
 
         z_mu = torch.stack(z_mu_list, dim=1)  # [1,S,D]
         z_logvar = torch.stack(z_logvar_list, dim=1)  # [1,S,D]
@@ -302,6 +323,10 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         time_emb = self._relative_time_bucket_embedding(minutes)  # [1,S,D]
         mu_p_seq: list[torch.Tensor] = []
         logvar_p_seq: list[torch.Tensor] = []
+        # Pre-extract aggregated set features if conditional mode
+        if self.poe_mode == "conditional":
+            set_aggs = torch.stack([z_mu_post_list[t] for t in range(S)], dim=1)  # [B,S,D]
+            z_mu_post_list = []  # clear
         for t in range(S):
             # Prior from previous hidden
             prior_params_t = self.prior_head(h)  # [B, 2D]
@@ -324,9 +349,28 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             else:
                 beta_t = None
             # PoE merge
-            mu_post_t, logvar_post_t = self._poe(
-                z_mu[:, t, :], z_logvar[:, t, :], mu_p_t, logvar_p_t, beta_t
-            )
+            if self.poe_mode == "conditional":
+                # Build likelihood natural params from set agg and prior
+                set_agg_t = set_aggs[:, t, :]
+                like_inp = torch.cat([set_agg_t, mu_p_t, logvar_p_t], dim=-1)
+                like_out = self.like_head(like_inp)
+                log_prec_like_t, h_like_t = like_out.chunk(2, dim=-1)
+                # precision must be positive; stabilize scale
+                prec_like_t = F.softplus(log_prec_like_t) + 1e-4  # [B,D]
+                Lambda_p_t = torch.exp(-logvar_p_t)  # [B,D]
+                if beta_t is not None:
+                    # scale likelihood contribution
+                    beta_val = beta_t  # [B,1]
+                    prec_like_t = prec_like_t * beta_val
+                    h_like_t = h_like_t * beta_val
+                Lambda_post_t = Lambda_p_t + prec_like_t
+                h_post_t = Lambda_p_t * mu_p_t + h_like_t
+                mu_post_t = h_post_t / (Lambda_post_t + 1e-8)
+                logvar_post_t = -torch.log(Lambda_post_t + 1e-8)
+            else:
+                mu_post_t, logvar_post_t = self._poe(
+                    z_mu[:, t, :], z_logvar[:, t, :], mu_p_t, logvar_p_t, beta_t
+                )
             z_mu_post_list.append(mu_post_t.unsqueeze(1))
             z_logvar_post_list.append(logvar_post_t.unsqueeze(1))
             # KL(q_post || p_prior)

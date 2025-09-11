@@ -124,6 +124,9 @@ def main():
     grp.add_argument("--no_freeze_set_encoder", dest="freeze_set_encoder", action="store_false")
     parser.set_defaults(freeze_set_encoder=True)
 
+    # PoE mode
+    parser.add_argument("--poe_mode", type=str, choices=["conditional", "naive"], default="conditional")
+
     args = parser.parse_args()
 
     dm = DataModule(
@@ -165,6 +168,7 @@ def main():
         poe_beta_min=args.poe_beta_min,
         poe_beta_max=args.poe_beta_max,
         freeze_set_encoder=args.freeze_set_encoder,
+        poe_mode=args.poe_mode,
     )
 
     # Optional: initialize weights from checkpoint (weights only)
