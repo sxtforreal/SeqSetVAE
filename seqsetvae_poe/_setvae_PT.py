@@ -18,6 +18,7 @@ python /home/sunx/data/aiiih/projects/sunx/projects/SSV/main/_setvae_PT.py \
 
 import os
 import argparse
+import torch
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import (
     ModelCheckpoint,
@@ -65,9 +66,33 @@ def main():
         help="Experiment output dir (default ./outputs/<run_name>)",
     )
     parser.add_argument(
+        "--resume_ckpt",
+        type=str,
+        default=None,
+        help="Resume training from a Lightning checkpoint (.ckpt). Restores optimizer/scheduler state",
+    )
+    parser.add_argument(
+        "--init_ckpt",
+        type=str,
+        default=None,
+        help="Initialize weights from a checkpoint (weights only). Does NOT restore optimizer/scheduler",
+    )
+    parser.add_argument(
         "--log_every_n_steps",
         type=int,
         default=getattr(config, "log_every_n_steps", 50),
+    )
+    parser.add_argument(
+        "--limit_val_batches",
+        type=float,
+        default=getattr(config, "limit_val_batches", 1.0),
+        help="Fraction/number of validation batches to run each check (Lightning's limit_val_batches)",
+    )
+    parser.add_argument(
+        "--val_check_interval",
+        type=float,
+        default=getattr(config, "val_check_interval", 0.1),
+        help="How often to run validation within an epoch (fraction of train epoch)",
     )
 
     # Optim & regularization
@@ -93,6 +118,10 @@ def main():
     parser.add_argument(
         "--free_bits", type=float, default=0.05, help="Per-dim free bits (nats) for KL"
     )
+    # KL capacity schedule
+    parser.add_argument("--use_kl_capacity", action="store_true", default=getattr(config, "use_kl_capacity", True))
+    parser.add_argument("--capacity_per_dim_end", type=float, default=getattr(config, "capacity_per_dim_end", 0.03))
+    parser.add_argument("--capacity_warmup_steps", type=int, default=getattr(config, "capacity_warmup_steps", 20000))
 
     # Perturbations
     parser.add_argument(
@@ -146,6 +175,9 @@ def main():
         max_beta=args.max_beta,
         beta_warmup_steps=args.beta_warmup_steps,
         free_bits=args.free_bits,
+        use_kl_capacity=args.use_kl_capacity,
+        capacity_per_dim_end=args.capacity_per_dim_end,
+        capacity_warmup_steps=args.capacity_warmup_steps,
         p_stale=args.p_stale,
         p_live=args.p_live,
         set_mae_ratio=args.set_mae_ratio,
@@ -157,6 +189,17 @@ def main():
         train_decoder_noise_std=args.train_decoder_noise_std,
         eval_decoder_noise_std=args.eval_decoder_noise_std,
     )
+
+    # Optional: initialize weights from checkpoint (weights only)
+    if args.init_ckpt is not None and os.path.isfile(args.init_ckpt):
+        try:
+            state = torch.load(args.init_ckpt, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            print(f"🔁 Initialized model from weights: missing={len(missing)}, unexpected={len(unexpected)}")
+        except Exception as e:
+            print(f"⚠️  Failed to initialize from init_ckpt: {e}")
 
     ckpt = ModelCheckpoint(
         save_top_k=1, monitor="val_loss", mode="min", filename="setvae_PT"
@@ -177,10 +220,13 @@ def main():
         callbacks=[ckpt, early, lrmon],
         logger=logger,
         gradient_clip_val=args.gradient_clip_val,
-        val_check_interval=0.1,
+        val_check_interval=args.val_check_interval,
+        limit_val_batches=args.limit_val_batches,
         log_every_n_steps=args.log_every_n_steps,
     )
-    trainer.fit(model, datamodule=dm)
+    # Resume if provided; if both resume and init are passed, resume takes precedence
+    ckpt_path = args.resume_ckpt if args.resume_ckpt else None
+    trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,10 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         max_beta: float = 0.05,
         beta_warmup_steps: int = 8000,
         free_bits: float = 0.03,
+        # KL capacity schedule (Burgess et al. 2018)
+        use_kl_capacity: bool = True,
+        capacity_per_dim_end: float = 0.03,
+        capacity_warmup_steps: int = 20000,
         stale_dropout_p: float = 0.2,
         set_mae_ratio: float = 0.0,
         # Task C: next-step distributional forecast (here: next set has any new event?)
@@ -116,6 +120,10 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self.warmup_beta = warmup_beta
         self.max_beta = max_beta
         self.beta_warmup_steps = beta_warmup_steps
+        # Capacity schedule
+        self.use_kl_capacity = use_kl_capacity
+        self.capacity_per_dim_end = capacity_per_dim_end
+        self.capacity_warmup_steps = capacity_warmup_steps
         self.stale_dropout_p = stale_dropout_p
         self.set_mae_ratio = set_mae_ratio
         self.latent_dim = latent_dim
@@ -181,6 +189,18 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         if step < self.beta_warmup_steps:
             return self.max_beta * (step / self.beta_warmup_steps)
         return self.max_beta
+
+    def _capacity(self):
+        if not self.use_kl_capacity:
+            return 0.0
+        try:
+            step = int(getattr(self, "global_step", 0))
+        except Exception:
+            step = 0
+        cap_end = float(self.capacity_per_dim_end) * float(self.latent_dim)
+        if step >= self.capacity_warmup_steps:
+            return cap_end
+        return cap_end * (float(step) / float(max(1, self.capacity_warmup_steps)))
 
     # --- core ---
     def _split_sets(self, var, val, minutes, set_id, padding_mask=None, carry_mask=None):
@@ -325,12 +345,17 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         recon, kl, next_c = self.forward(batch)
         beta = self._beta()
-        total = recon + beta * kl + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        # Capacity annealing: encourage KL to reach target capacity
+        cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
+        kl_objective = torch.clamp(kl - cap, min=0.0)
+        total = recon + beta * kl_objective + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
         log_dict = {
             "train_loss": total,
             "train_recon": recon,
             "train_kl": kl,
+            "train_kl_obj": kl_objective,
             "train_beta": beta,
+            "train_capacity": cap,
         }
         if self.enable_next_change:
             log_dict["train_next_change"] = next_c
@@ -341,8 +366,10 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         recon, kl, next_c = self.forward(batch)
         beta = self._beta()
-        total = recon + beta * kl + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
-        log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_beta": beta}
+        cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
+        kl_objective = torch.clamp(kl - cap, min=0.0)
+        total = recon + beta * kl_objective + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap}
         if self.enable_next_change:
             log_dict["val_next_change"] = next_c
         self.log_dict(log_dict, prog_bar=True, on_epoch=True)
@@ -406,6 +433,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         max_beta: float = 0.2,
         beta_warmup_steps: int = 8000,
         free_bits: float = 0.05,
+        # KL capacity schedule (Burgess et al. 2018)
+        use_kl_capacity: bool = True,
+        capacity_per_dim_end: float = 0.03,
+        capacity_warmup_steps: int = 20000,
         # perturbation params
         p_stale: float = 0.5,
         p_live: float = 0.05,
@@ -437,6 +468,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self.free_bits = free_bits
         self.latent_dim = latent_dim
         self._step = 0
+        # Capacity schedule
+        self.use_kl_capacity = use_kl_capacity
+        self.capacity_per_dim_end = capacity_per_dim_end
+        self.capacity_warmup_steps = capacity_warmup_steps
 
         # Perturbation hparams
         self.p_stale = p_stale
@@ -461,6 +496,14 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         if self._step < self.beta_warmup_steps:
             return self.max_beta * (self._step / self.beta_warmup_steps)
         return self.max_beta
+
+    def _capacity(self):
+        if not self.use_kl_capacity:
+            return 0.0
+        cap_end = float(self.capacity_per_dim_end) * float(self.latent_dim)
+        if self._step >= self.capacity_warmup_steps:
+            return cap_end
+        return cap_end * (float(self._step) / float(max(1, self.capacity_warmup_steps)))
 
     def _split_sets(self, var, val, minutes, set_id, padding_mask=None, carry_mask=None):
         B = var.size(0)
@@ -604,16 +647,20 @@ class SetVAEOnlyPretrain(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         recon, kl = self.forward(batch)
         beta = self._beta()
-        total = recon + beta * kl
-        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl": kl, "train_beta": beta}, prog_bar=True)
+        cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
+        kl_objective = torch.clamp(kl - cap, min=0.0)
+        total = recon + beta * kl_objective
+        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl": kl, "train_kl_obj": kl_objective, "train_beta": beta, "train_capacity": cap}, prog_bar=True)
         self._step += 1
         return total
 
     def validation_step(self, batch, batch_idx):
         recon, kl = self.forward(batch)
         beta = self._beta()
-        total = recon + beta * kl
-        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_beta": beta}, prog_bar=True, on_epoch=True)
+        cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
+        kl_objective = torch.clamp(kl - cap, min=0.0)
+        total = recon + beta * kl_objective
+        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap}, prog_bar=True, on_epoch=True)
         # Per-dim KL stats on clean inputs (no perturbations)
         try:
             kl_dim = self._compute_kl_dim_stats(batch)  # [D]
