@@ -22,6 +22,14 @@ warmup_beta = True
 max_beta = 0.05
 beta_warmup_steps = 8000
 gradient_clip_val = 0.2
+# KL capacity schedule (helps prevent posterior collapse)
+use_kl_capacity = True
+capacity_per_dim_end = 0.03  # target KL per-dimension in nats
+capacity_warmup_steps = 20000
+
+# Validation speed controls
+limit_val_batches = 0.25  # run 25% of validation per check for speed
+val_check_interval = 0.2  # validate 5 times per epoch (approx)
 
 # Data
 batch_size = 10
