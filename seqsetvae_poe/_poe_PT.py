@@ -44,7 +44,7 @@ def main():
         "--run_name", type=str, default="PoE-GRU-PT", help="TensorBoard run name subfolder"
     )
     parser.add_argument(
-        "--output_dir", type=str, default=None, help="Experiment output dir (default ./outputs/<run_name>)"
+        "--output_dir", type=str, default="./output", help="Root out_dir for experiments (saves to out_dir/setvae-PT/version_X/{logs,checkpoints,eval})"
     )
     parser.add_argument(
         "--resume_ckpt",
@@ -182,14 +182,31 @@ def main():
         except Exception as e:
             print(f"⚠️  Failed to initialize from init_ckpt: {e}")
 
-    ckpt = ModelCheckpoint(save_top_k=1, monitor="val_loss", mode="min", filename="poe_GRU_PT")
+    # Loggers & callbacks with standardized directory layout:
+    # out_dir/setvae-PT/version_X/{logs,checkpoints,eval}
+    out_root = args.output_dir if args.output_dir else "./output"
+    project_dir = os.path.join(out_root, "setvae-PT")
+    os.makedirs(project_dir, exist_ok=True)
+    try:
+        logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
+    except TypeError:
+        # Fallback if sub_dir is unsupported
+        logger = TensorBoardLogger(save_dir=project_dir, name="")
+    # Determine the version directory regardless of whether sub_dir is supported
+    log_dir = getattr(logger, "log_dir", project_dir)
+    if log_dir.endswith(os.sep + "logs") or log_dir.endswith("/logs"):
+        version_dir = os.path.dirname(log_dir)
+    else:
+        version_dir = log_dir
+    # Ensure required subfolders exist
+    ckpt_dir = os.path.join(version_dir, "checkpoints")
+    eval_dir = os.path.join(version_dir, "eval")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(eval_dir, exist_ok=True)
+
     early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
     lrmon = LearningRateMonitor(logging_interval="step")
-
-    # Prepare experiment output directory
-    experiment_output_dir = args.output_dir if args.output_dir else os.path.join("./outputs", args.run_name)
-    os.makedirs(experiment_output_dir, exist_ok=True)
-    logger = TensorBoardLogger(save_dir=experiment_output_dir, name="")
+    ckpt = ModelCheckpoint(save_top_k=1, monitor="val_loss", mode="min", filename="poe_GRU_PT", dirpath=ckpt_dir)
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
