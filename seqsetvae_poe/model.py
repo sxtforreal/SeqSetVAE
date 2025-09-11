@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
 from torch.optim import AdamW
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from transformers import get_linear_schedule_with_warmup
 from typing import Optional
 
@@ -72,6 +71,12 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         # Task C: next-step distributional forecast (here: next set has any new event?)
         enable_next_change: bool = True,
         next_change_weight: float = 0.3,
+        # Adaptive PoE gate (observation weight)
+        use_adaptive_poe: bool = True,
+        poe_beta_min: float = 0.1,
+        poe_beta_max: float = 3.0,
+        # Freeze SetVAE encoder during dynamics pretraining (two-stage training)
+        freeze_set_encoder: bool = True,
     ):
         super().__init__()
 
@@ -85,19 +90,12 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             m=m,
             enable_posterior_std_augmentation=False,
         )
+        if freeze_set_encoder:
+            for p in self.set_encoder.parameters():
+                p.requires_grad = False
 
-        # Causal transformer producing p(z_t|history)
-        enc_layer = TransformerEncoderLayer(
-            d_model=latent_dim,
-            nhead=transformer_heads,
-            dim_feedforward=ff_dim,
-            dropout=transformer_dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = TransformerEncoder(enc_layer, num_layers=transformer_layers)
-        self.post_transformer_norm = nn.LayerNorm(latent_dim, eps=1e-6)
+        # GRU-based dynamics producing p(z_t | history)
+        self.gru_cell = nn.GRUCell(latent_dim, latent_dim)
 
         # Predict prior mean/logvar per step from h_{t-1}
         self.prior_head = nn.Sequential(
@@ -112,6 +110,18 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         edges = torch.logspace(math.log10(0.5), math.log10(24 * 60.0), steps=self.num_time_buckets - 1)
         self.register_buffer("time_bucket_edges", edges, persistent=False)
         self.rel_time_bucket_embed = nn.Embedding(self.num_time_buckets, latent_dim)
+
+        # Adaptive observation gate for PoE (scalar per time step)
+        self.use_adaptive_poe = use_adaptive_poe
+        self.poe_beta_min = float(poe_beta_min)
+        self.poe_beta_max = float(poe_beta_max)
+        if self.use_adaptive_poe:
+            # Inputs: [d_mahal, delta_H, log_dt1p] -> beta in (poe_beta_min, poe_beta_max)
+            self.obs_gate = nn.Sequential(
+                nn.Linear(3, latent_dim // 2),
+                nn.GELU(),
+                nn.Linear(latent_dim // 2, 1),
+            )
 
         # Training hparams
         self.lr = lr
@@ -171,13 +181,27 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         mask = (token_probs < mask_ratio).unsqueeze(-1)  # [1,N,1]
         return val.masked_fill(mask, 0.0)
 
-    def _poe(self, mu_qx, logvar_qx, mu_p, logvar_p):
+    def _poe(self, mu_qx, logvar_qx, mu_p, logvar_p, beta_scale: Optional[torch.Tensor] = None):
         var_qx = logvar_qx.exp()
         var_p = logvar_p.exp()
+        if beta_scale is not None:
+            # Scale observation precision by beta: Lambda_qx' = beta * Lambda_qx -> var_qx' = var_qx / beta
+            var_qx = var_qx / beta_scale
         var_post = 1.0 / (1.0 / var_qx + 1.0 / var_p)
         mu_post = var_post * (mu_qx / var_qx + mu_p / var_p)
         logvar_post = torch.log(var_post + 1e-8)
         return mu_post, logvar_post
+
+    @staticmethod
+    def _kl_diag_gauss(mu_q, logvar_q, mu_p, logvar_p):
+        # KL(q||p) for diagonal Gaussians
+        var_q = logvar_q.exp()
+        var_p = logvar_p.exp()
+        term_trace = (var_q / (var_p + 1e-8))
+        term_quad = (mu_p - mu_q) ** 2 / (var_p + 1e-8)
+        kld = 0.5 * (logvar_p - logvar_q + term_trace + term_quad - 1.0)
+        # sum over dim -> [B,S]
+        return kld.sum(dim=-1)
 
     def _beta(self):
         if not self.warmup_beta:
@@ -247,7 +271,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
 
         z_mu_list, z_logvar_list, pos_list = [], [], []
         z_mu_post_list, z_logvar_post_list = [], []
-        kl_total = 0.0
+        h_states: list[torch.Tensor] = []
+        kl_list: list[torch.Tensor] = []
+        beta_gate_list: list[torch.Tensor] = []
         next_change_loss = torch.tensor(0.0, device=device)
         next_change_targets = []
 
@@ -256,9 +282,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             var, val, minute = s["var"], s["val"], s["minute"]
             # Optional Set-MAE masking on input values
             val_inp = self._apply_set_mae(val, self.set_mae_ratio)
-            # normalize and stale-dropout already handled upstream; here encode
-            _, z_list, _ = self.set_encoder(var, val_inp)
-            _, mu_qx, logvar_qx = z_list[-1]
+            # Encode q_x(z|x)
+            z_list_enc, _ = self.set_encoder.encode_from_var_val(var, val_inp)
+            _z, mu_qx, logvar_qx = z_list_enc[-1]
             z_mu_list.append(mu_qx.squeeze(1))
             z_logvar_list.append(logvar_qx.squeeze(1))
             # use a single scalar time per set (e.g., last timestamp)
@@ -270,45 +296,73 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         if minutes.dim() == 1:
             minutes = minutes.unsqueeze(0)
 
-        # history -> prior per step
-        attn_mask = _strict_causal_mask(z_mu.size(1), device=z_mu.device)
-        # add relative time embedding
-        z_mu_with_time = z_mu + self._relative_time_bucket_embedding(minutes)
-        h = self.transformer(z_mu_with_time, mask=attn_mask)
-        h = self.post_transformer_norm(h)
-        prior_params = self.prior_head(h)  # [1,S,2D]
-        mu_p, logvar_p = prior_params.chunk(2, dim=-1)
+        # Step through time with GRUCell; prior uses h_{t-1}, update with posterior mean
+        B = 1
+        h = torch.zeros(B, self.latent_dim, device=device)
+        time_emb = self._relative_time_bucket_embedding(minutes)  # [1,S,D]
+        mu_p_seq: list[torch.Tensor] = []
+        logvar_p_seq: list[torch.Tensor] = []
+        for t in range(S):
+            # Prior from previous hidden
+            prior_params_t = self.prior_head(h)  # [B, 2D]
+            mu_p_t, logvar_p_t = prior_params_t.chunk(2, dim=-1)
+            mu_p_seq.append(mu_p_t)
+            logvar_p_seq.append(logvar_p_t)
+            # Adaptive PoE beta (scalar per step)
+            if self.use_adaptive_poe:
+                mu_qx_t = z_mu[:, t, :]
+                logvar_qx_t = z_logvar[:, t, :]
+                var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
+                d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)  # [B,1]
+                delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)  # [B,1]
+                dt = minutes[:, t : t + 1] - (minutes[:, t - 1 : t] if t > 0 else minutes[:, t : t + 1])
+                log_dt1p = torch.log1p(dt.clamp(min=0.0))  # [B,1]
+                gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
+                gate_raw = self.obs_gate(gate_inp)
+                gate_sig = torch.sigmoid(gate_raw)
+                beta_t = self.poe_beta_min + (self.poe_beta_max - self.poe_beta_min) * gate_sig  # [B,1]
+            else:
+                beta_t = None
+            # PoE merge
+            mu_post_t, logvar_post_t = self._poe(
+                z_mu[:, t, :], z_logvar[:, t, :], mu_p_t, logvar_p_t, beta_t
+            )
+            z_mu_post_list.append(mu_post_t.unsqueeze(1))
+            z_logvar_post_list.append(logvar_post_t.unsqueeze(1))
+            # KL(q_post || p_prior)
+            kl_t = self._kl_diag_gauss(mu_post_t, logvar_post_t, mu_p_t, logvar_p_t)  # [B]
+            # Free bits per step
+            min_kl = self.free_bits * self.latent_dim
+            kl_t = torch.clamp(kl_t, min=min_kl)
+            kl_list.append(kl_t)
+            if beta_t is not None:
+                beta_gate_list.append(beta_t.squeeze(-1))
+            # Update GRU state with posterior mean and time embedding
+            inp_t = mu_post_t + time_emb[:, t, :]
+            h = self.gru_cell(inp_t, h)
+            h_states.append(h.unsqueeze(1))  # [B,1,D]
 
-        # PoE q(z) \u221d q_x(z) * p(z)
-        mu_post, logvar_post = self._poe(z_mu, z_logvar, mu_p, logvar_p)
-        z_mu_post_list.append(mu_post)
-        z_logvar_post_list.append(logvar_post)
-
-        # KL between q_x and q_post as regularizer (encourage using prior)
-        var_qx, var_post = z_logvar.exp(), logvar_post.exp()
-        kl = 0.5 * torch.sum(
-            var_post / var_qx + (mu_post - z_mu) ** 2 / var_qx - 1 + (z_logvar - logvar_post),
-            dim=-1,
-        )  # [1,S]
-        # Apply free-bits threshold per step
-        min_kl = self.free_bits * self.latent_dim
-        kl = torch.clamp(kl, min=min_kl)
-        kl_total = kl.mean()
+        mu_p = torch.cat(mu_p_seq, dim=0).view(B, S, -1) if len(mu_p_seq) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
+        logvar_p = torch.cat(logvar_p_seq, dim=0).view(B, S, -1) if len(logvar_p_seq) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
+        mu_post = torch.cat(z_mu_post_list, dim=1) if len(z_mu_post_list) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
+        logvar_post = torch.cat(z_logvar_post_list, dim=1) if len(z_logvar_post_list) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
+        h_seq = torch.cat(h_states, dim=1) if len(h_states) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
+        kl_total = torch.stack(kl_list, dim=1).mean() if len(kl_list) > 0 else torch.tensor(0.0, device=device)
 
         # Task C: next-step change prediction using h_t
         if self.enable_next_change and S > 1:
             # Build targets from set t+1 has_change for t in [0..S-2]
             for idx in range(1, S):
                 next_change_targets.append(sets[idx]["has_change"])  # shape [1]
-            targets = torch.stack(next_change_targets, dim=1).to(h.dtype)  # [1, S-1]
-            logits = self.next_change_head(h[:, :-1, :]).squeeze(-1)  # [1, S-1]
+            targets = torch.stack(next_change_targets, dim=1).to(h_seq.dtype)  # [1, S-1]
+            logits = self.next_change_head(h_seq[:, :-1, :]).squeeze(-1)  # [1, S-1]
             next_change_loss = self._bce(logits, targets)
 
         # reconstruct from h (use h_t)
         recon_total = 0.0
         for idx, s in enumerate(sets):
             N_t = s["var"].size(1)
-            recon = self.decoder(h[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3))
+            recon = self.decoder(h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3))
             if self.set_encoder.dim_reducer is not None:
                 reduced = self.set_encoder.dim_reducer(s["var"])
             else:
