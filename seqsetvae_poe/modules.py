@@ -180,7 +180,7 @@ class SetVAEModule(nn.Module):
         reduced_normalized = reduced / (norms + 1e-8)
         x = reduced_normalized * val
         if self.training:
-            x = F.dropout(x, p=0.1, training=True)
+            x = F.dropout(x, p=0.05, training=True)
         return self.encode(x)
 
     def decode(self, z_list, target_n, use_mean=False, noise_std=0.5):
@@ -209,7 +209,7 @@ class SetVAEModule(nn.Module):
         
         # Add input dropout
         if self.training:
-            x = F.dropout(x, p=0.1, training=True)
+            x = F.dropout(x, p=0.05, training=True)
             
         z_list, encoded = self.encode(x)
         target_n = x.size(1)
@@ -290,17 +290,38 @@ def recon_loss(
     return total_loss
 
 
-def elbo_loss(recon, target, z_list, free_bits=0.1):
+def elbo_loss(
+    recon,
+    target,
+    z_list,
+    free_bits: float = 0.1,
+    recon_alpha: float = 1.0,
+    recon_beta: float = 1.0,
+    recon_gamma: float = 3.0,
+    beta_var: float = 0.0,
+):
     """
-    ELBO with pure KL (to N(0,I)) and free-bits. No extra regularizers.
+    ELBO with per-dimension free-bits and configurable reconstruction weights.
+    - free_bits is applied per latent dimension before summation.
+    - beta_var encourages higher reconstruction variance (mitigates variance collapse).
     """
-    r_loss = recon_loss(recon, target)
-    latent_dim = z_list[0][1].size(-1)
-    min_kl = free_bits * latent_dim
+    r_loss = recon_loss(
+        recon,
+        target,
+        alpha=recon_alpha,
+        beta=recon_beta,
+        gamma=recon_gamma,
+        beta_var=beta_var,
+    )
     kl_accum = 0.0
     for (_z, mu, logvar) in z_list:
-        kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)
-        kl_div = torch.clamp(kl_div, min=min_kl)
+        # Per-dimension KL for diagonal Gaussians
+        per_dim_kl = 0.5 * (torch.exp(logvar) + mu.pow(2) - 1.0 - logvar)
+        # Apply per-dimension free-bits
+        if free_bits is not None and free_bits > 0.0:
+            per_dim_kl = torch.clamp(per_dim_kl, min=free_bits)
+        # Sum over dimensions, then average over batch
+        kl_div = torch.sum(per_dim_kl, dim=-1)
         kl_accum = kl_accum + kl_div.mean()
     total_kl = kl_accum / max(1, len(z_list))
     return r_loss, total_kl

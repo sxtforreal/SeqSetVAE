@@ -530,22 +530,22 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         warmup_beta: bool = True,
         max_beta: float = 0.2,
         beta_warmup_steps: int = 8000,
-        free_bits: float = 0.05,
+        free_bits: float = 0.01,
         # KL capacity schedule (Burgess et al. 2018)
         use_kl_capacity: bool = True,
         capacity_per_dim_end: float = 0.03,
         capacity_warmup_steps: int = 20000,
         # perturbation params
-        p_stale: float = 0.5,
-        p_live: float = 0.05,
-        set_mae_ratio: float = 0.15,
-        small_set_mask_prob: float = 0.4,
+        p_stale: float = 0.3,
+        p_live: float = 0.03,
+        set_mae_ratio: float = 0.05,
+        small_set_mask_prob: float = 0.2,
         small_set_threshold: int = 5,
         max_masks_per_set: int = 2,
-        val_noise_std: float = 0.07,
+        val_noise_std: float = 0.04,
         dir_noise_std: float = 0.01,
-        train_decoder_noise_std: float = 0.3,
-        eval_decoder_noise_std: float = 0.05,
+        train_decoder_noise_std: float = 0.15,
+        eval_decoder_noise_std: float = 0.03,
     ):
         super().__init__()
         self.set_encoder = SetVAEModule(
@@ -717,7 +717,14 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         recon = self.set_encoder.decode(z_list, target_n=x_target.size(1), noise_std=noise_std)
 
         # losses
-        r_loss = chamfer_recon(recon, x_target)
+        r_loss = chamfer_recon(
+            recon,
+            x_target,
+            alpha=1.0,
+            beta=1.0,
+            gamma=2.0,
+            beta_var=0.01,
+        )
         # KL to standard normal with free-bits
         # Reuse base_elbo to compute KL terms (we discard its recon to avoid double compute)
         _, kl = base_elbo(recon, x_target, z_list, free_bits=self.free_bits)
@@ -746,7 +753,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         recon, kl = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.clamp(kl - cap, min=0.0)
+        kl_objective = torch.abs(kl - cap)
         total = recon + beta * kl_objective
         self.log_dict({"train_loss": total, "train_recon": recon, "train_kl": kl, "train_kl_obj": kl_objective, "train_beta": beta, "train_capacity": cap}, prog_bar=True)
         self._step += 1
@@ -756,7 +763,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         recon, kl = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.clamp(kl - cap, min=0.0)
+        kl_objective = torch.abs(kl - cap)
         total = recon + beta * kl_objective
         self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap}, prog_bar=True, on_epoch=True)
         # Per-dim KL stats on clean inputs (no perturbations)
