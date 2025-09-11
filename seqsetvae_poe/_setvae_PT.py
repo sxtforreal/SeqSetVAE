@@ -33,6 +33,87 @@ from dataset import DataModule
 from model import SetVAEOnlyPretrain
 
 
+def _ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _parse_version_from_path(path: str) -> str:
+    """Try to extract 'version_#' from a path string; return '' if not found."""
+    parts = []
+    p = os.path.abspath(path)
+    while True:
+        p, tail = os.path.split(p)
+        if tail:
+            parts.append(tail)
+        else:
+            if p:
+                parts.append(p)
+            break
+    for part in parts:
+        if part.startswith("version_"):
+            return part
+    return ""
+
+
+def _next_version_index(root: str) -> int:
+    """Return the next integer index for version directories under root (version_0, version_1, ...)."""
+    try:
+        entries = os.listdir(root) if os.path.isdir(root) else []
+    except Exception:
+        entries = []
+    max_idx = -1
+    for name in entries:
+        if name.startswith("version_"):
+            try:
+                idx = int(name.split("version_")[-1])
+                if idx > max_idx:
+                    max_idx = idx
+            except Exception:
+                continue
+    return max_idx + 1
+
+
+def _prepare_version_layout(base_out_dir: str, resume_ckpt: str | None) -> dict:
+    """
+    Create the layout: base_out_dir/setvae-PT/version_X/{checkpoints, eval, logs}
+    If resume_ckpt is given and contains a version_X segment, reuse that version.
+    Returns a dict with keys: version_dir, checkpoints_dir, eval_dir, logs_dir, version_name.
+    """
+    middle = "setvae-PT"
+    project_root = os.path.join(base_out_dir, middle)
+    _ensure_dir(project_root)
+
+    version_name = ""
+    if resume_ckpt:
+        # Prefer to reuse version from provided checkpoint
+        # Expect ckpt path like .../setvae-PT/version_X/checkpoints/*.ckpt
+        maybe_version = _parse_version_from_path(resume_ckpt)
+        if maybe_version:
+            version_name = maybe_version
+
+    if not version_name:
+        idx = _next_version_index(project_root)
+        version_name = f"version_{idx}"
+
+    version_dir = os.path.join(project_root, version_name)
+    checkpoints_dir = os.path.join(version_dir, "checkpoints")
+    eval_dir = os.path.join(version_dir, "eval")
+    logs_dir = os.path.join(version_dir, "logs")
+
+    _ensure_dir(checkpoints_dir)
+    _ensure_dir(eval_dir)
+    _ensure_dir(logs_dir)
+
+    return {
+        "version_dir": version_dir,
+        "checkpoints_dir": checkpoints_dir,
+        "eval_dir": eval_dir,
+        "logs_dir": logs_dir,
+        "version_name": version_name,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SetVAE-only pretraining over LVCF-expanded sets"
@@ -201,18 +282,22 @@ def main():
         except Exception as e:
             print(f"⚠️  Failed to initialize from init_ckpt: {e}")
 
+    # Directory layout: out_dir/setvae-PT/version_X/{checkpoints, eval, logs}
+    base_output_root = args.output_dir if args.output_dir else os.path.join("./outputs")
+    layout = _prepare_version_layout(base_output_root, args.resume_ckpt)
+
     ckpt = ModelCheckpoint(
-        save_top_k=1, monitor="val_loss", mode="min", filename="setvae_PT"
+        dirpath=layout["checkpoints_dir"],
+        save_top_k=1,
+        monitor="val_loss",
+        mode="min",
+        filename="setvae_PT",
     )
     early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
     lrmon = LearningRateMonitor(logging_interval="step")
 
-    # Prepare experiment output directory
-    experiment_output_dir = (
-        args.output_dir if args.output_dir else os.path.join("./outputs", args.run_name)
-    )
-    os.makedirs(experiment_output_dir, exist_ok=True)
-    logger = TensorBoardLogger(save_dir=experiment_output_dir, name="")
+    # TensorBoard under version_X/logs (no nested version folder)
+    logger = TensorBoardLogger(save_dir=layout["version_dir"], name="logs", version="")
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,

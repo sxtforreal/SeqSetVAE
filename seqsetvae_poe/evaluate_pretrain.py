@@ -503,12 +503,32 @@ def main():
     ap.add_argument("--num_workers", type=int, default=getattr(cfg, "num_workers", 0))
     ap.add_argument("--num_eval_batches", type=int, default=50, help="Number of batches to estimate KL stats")
     ap.add_argument("--num_vis_samples", type=int, default=2, help="#samples for detailed recon/heatmaps")
-    ap.add_argument("--output_dir", type=str, default="./outputs/pretrain_eval")
+    ap.add_argument("--output_dir", type=str, default=None)
     ap.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
     ap.add_argument("--active_threshold", type=float, default=0.01, help="KL threshold for active units")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
+    # Derive default output_dir as sibling to checkpoint version: version_X/eval
+    if args.output_dir is None:
+        ckpt_abs = os.path.abspath(args.checkpoint)
+        ckpt_dir = os.path.dirname(ckpt_abs)
+        # Expect structure: .../setvae-PT/version_X/checkpoints/*.ckpt
+        # We will go up to version_X and create/use version_X/eval
+        version_dir = os.path.dirname(ckpt_dir)
+        # If path contains nested 'checkpoints', handle robustly
+        # Search upward for 'version_*'
+        def _find_version_dir(p: str) -> str:
+            q = p
+            while True:
+                parent, tail = os.path.split(q)
+                if tail.startswith("version_"):
+                    return q
+                if parent == q or tail == "":
+                    return p  # fallback to given
+                q = parent
+        version_dir = _find_version_dir(version_dir)
+        args.output_dir = os.path.join(version_dir, "eval")
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Seed (CPU only for deterministic plotting)
