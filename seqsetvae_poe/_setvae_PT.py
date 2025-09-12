@@ -90,6 +90,22 @@ def main():
         help="How often to run validation within an epoch (fraction of train epoch)",
     )
 
+    # InfoVAE / Flows
+    parser.add_argument("--use_flows", action="store_true", default=False, help="Enable planar flows on last-layer latent")
+    parser.add_argument("--num_flows", type=int, default=0, help="Number of planar flow layers")
+    parser.add_argument("--mmd_weight", type=float, default=0.0, help="Weight for InfoVAE MMD regularizer")
+    parser.add_argument("--mmd_scales", type=float, nargs='*', default=[1.0, 2.0, 4.0, 8.0], help="RBF MMD kernel scales")
+
+    # Auto-tune & monitoring
+    parser.add_argument("--auto_tune_kl", action="store_true", default=True, help="Auto-increase capacity/beta if KL_last below target")
+    parser.add_argument("--kl_target_nats", type=float, default=10.0)
+    parser.add_argument("--kl_patience_epochs", type=int, default=2)
+    parser.add_argument("--beta_step", type=float, default=0.2)
+    parser.add_argument("--capacity_per_dim_step", type=float, default=0.02)
+    parser.add_argument("--max_beta_ceiling", type=float, default=2.0)
+    parser.add_argument("--capacity_per_dim_max", type=float, default=0.20)
+    parser.add_argument("--active_ratio_warn_threshold", type=float, default=0.5)
+
     # Optim & regularization
     parser.add_argument("--lr", type=float, default=getattr(config, "lr", 3e-4))
     parser.add_argument(
@@ -195,6 +211,18 @@ def main():
         dir_noise_std=args.dir_noise_std,
         train_decoder_noise_std=args.train_decoder_noise_std,
         eval_decoder_noise_std=args.eval_decoder_noise_std,
+        use_flows=bool(args.use_flows),
+        num_flows=int(args.num_flows),
+        mmd_weight=float(args.mmd_weight),
+        mmd_scales=tuple(args.mmd_scales) if isinstance(args.mmd_scales, list) else (args.mmd_scales,),
+        auto_tune_kl=bool(args.auto_tune_kl),
+        kl_target_nats=float(args.kl_target_nats),
+        kl_patience_epochs=int(args.kl_patience_epochs),
+        beta_step=float(args.beta_step),
+        capacity_per_dim_step=float(args.capacity_per_dim_step),
+        max_beta_ceiling=float(args.max_beta_ceiling),
+        capacity_per_dim_max=float(args.capacity_per_dim_max),
+        active_ratio_warn_threshold=float(args.active_ratio_warn_threshold),
     )
 
     # Optional: initialize weights from checkpoint (weights only)

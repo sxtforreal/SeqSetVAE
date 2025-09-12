@@ -528,24 +528,38 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         beta: float,
         lr: float,
         warmup_beta: bool = True,
-        max_beta: float = 0.2,
-        beta_warmup_steps: int = 8000,
-        free_bits: float = 0.01,
+        max_beta: float = 1.0,
+        beta_warmup_steps: int = 20000,
+        free_bits: float = 0.03,
         # KL capacity schedule (Burgess et al. 2018)
         use_kl_capacity: bool = True,
-        capacity_per_dim_end: float = 0.03,
-        capacity_warmup_steps: int = 20000,
+        capacity_per_dim_end: float = 0.10,
+        capacity_warmup_steps: int = 30000,
         # perturbation params
-        p_stale: float = 0.3,
-        p_live: float = 0.03,
-        set_mae_ratio: float = 0.05,
-        small_set_mask_prob: float = 0.2,
+        p_stale: float = 0.1,
+        p_live: float = 0.02,
+        set_mae_ratio: float = 0.02,
+        small_set_mask_prob: float = 0.1,
         small_set_threshold: int = 5,
         max_masks_per_set: int = 2,
-        val_noise_std: float = 0.04,
+        val_noise_std: float = 0.02,
         dir_noise_std: float = 0.01,
-        train_decoder_noise_std: float = 0.15,
-        eval_decoder_noise_std: float = 0.03,
+        train_decoder_noise_std: float = 0.05,
+        eval_decoder_noise_std: float = 0.02,
+        # InfoVAE / Flow options
+        use_flows: bool = False,
+        num_flows: int = 0,
+        mmd_weight: float = 0.0,
+        mmd_scales: tuple = (1.0, 2.0, 4.0, 8.0),
+        # Auto-tune and monitoring
+        auto_tune_kl: bool = True,
+        kl_target_nats: float = 10.0,
+        kl_patience_epochs: int = 2,
+        beta_step: float = 0.2,
+        capacity_per_dim_step: float = 0.02,
+        max_beta_ceiling: float = 2.0,
+        capacity_per_dim_max: float = 0.20,
+        active_ratio_warn_threshold: float = 0.5,
     ):
         super().__init__()
         self.set_encoder = SetVAEModule(
@@ -555,6 +569,8 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             levels=levels,
             heads=heads,
             m=m,
+            use_flows=use_flows,
+            num_flows=num_flows,
         )
 
         # Training hparams
@@ -582,6 +598,28 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self.dir_noise_std = dir_noise_std
         self.train_decoder_noise_std = train_decoder_noise_std
         self.eval_decoder_noise_std = eval_decoder_noise_std
+        # InfoVAE/MMD
+        self.mmd_weight = float(mmd_weight)
+        try:
+            # ensure tuple of floats
+            self.mmd_scales = tuple(float(s) for s in (mmd_scales if isinstance(mmd_scales, (list, tuple)) else (mmd_scales,)))
+        except Exception:
+            self.mmd_scales = (1.0, 2.0, 4.0, 8.0)
+
+        # Auto-tune & monitors
+        self.auto_tune_kl = bool(auto_tune_kl)
+        self.kl_target_nats = float(kl_target_nats)
+        self.kl_patience_epochs = int(kl_patience_epochs)
+        self.beta_step = float(beta_step)
+        self.capacity_per_dim_step = float(capacity_per_dim_step)
+        self.max_beta_ceiling = float(max_beta_ceiling)
+        self.capacity_per_dim_max = float(capacity_per_dim_max)
+        self.active_ratio_warn_threshold = float(active_ratio_warn_threshold)
+        self._kl_not_met_epochs = 0
+        self._num_adjustments = 0
+        self._val_kl_sum = 0.0
+        self._val_kl_count = 0
+        self._active_warnings = []
 
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
@@ -721,14 +759,24 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             recon,
             x_target,
             alpha=1.0,
-            beta=1.0,
-            gamma=2.0,
+            beta=2.0,
+            gamma=3.0,
             beta_var=0.01,
+            scale_calib_weight=0.5,
         )
-        # KL to standard normal with free-bits
-        # Reuse base_elbo to compute KL terms (we discard its recon to avoid double compute)
-        _, kl = base_elbo(recon, x_target, z_list, free_bits=self.free_bits)
-        return r_loss, kl
+        # Last-layer raw KL to N(0,I) (no extra regularizers)
+        _z_last, mu_last, logvar_last = z_list[-1]
+        per_dim_kl_last = 0.5 * (logvar_last.exp() + mu_last.pow(2) - 1.0 - logvar_last)  # [1,1,D]
+        kl_last = per_dim_kl_last.sum(dim=-1).mean()  # scalar
+        # collect last-layer latent sample (after optional flows) for MMD
+        z_last = z_list[-1][0]  # [1,1,D]
+        try:
+            if hasattr(self.set_encoder, 'apply_flows') and len(getattr(self.set_encoder, 'flows', [])) > 0:
+                z_last, _ = self.set_encoder.apply_flows(z_last)
+        except Exception:
+            pass
+        z_flat = z_last.squeeze(1)  # [1,D]
+        return r_loss, kl_last, z_flat
 
     def forward(self, batch):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
@@ -736,42 +784,98 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         carry_mask = batch.get("carry_mask", None)
         all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
         total_recon, total_kl, count = 0.0, 0.0, 0
+        zs = []
         for sets in all_sets:
             for s in sets:
-                recon, kl = self._forward_single(s)
+                recon, kl, z_flat = self._forward_single(s)
                 total_recon += recon
                 total_kl += kl
+                zs.append(z_flat)
                 count += 1
         if count == 0:
             device = var.device
             zero = torch.tensor(0.0, device=device)
-            return zero, zero
-        return total_recon / count, total_kl / count
+            return zero, zero, torch.zeros(0, self.latent_dim, device=device)
+        z_samples = torch.cat(zs, dim=0) if len(zs) > 0 else torch.zeros(0, self.latent_dim, device=var.device)
+        return total_recon / count, total_kl / count, z_samples
+
+    # --- InfoVAE / MMD ---
+    @staticmethod
+    def _pdists(x: torch.Tensor, y: torch.Tensor):
+        # x: [N,D], y: [M,D] -> [N,M]
+        x2 = (x * x).sum(dim=1, keepdim=True)
+        y2 = (y * y).sum(dim=1, keepdim=True).t()
+        xy = x @ y.t()
+        d2 = (x2 + y2 - 2.0 * xy).clamp_min(0.0)
+        return d2
+
+    def _rbf_mmd(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0 or y.numel() == 0:
+            return torch.tensor(0.0, device=x.device if x.numel() > 0 else y.device)
+        dxx = self._pdists(x, x)
+        dyy = self._pdists(y, y)
+        dxy = self._pdists(x, y)
+        kxx = 0.0
+        kyy = 0.0
+        kxy = 0.0
+        for s in self.mmd_scales:
+            gamma = 1.0 / (2.0 * (float(s) ** 2))
+            kxx = kxx + torch.exp(-gamma * dxx)
+            kyy = kyy + torch.exp(-gamma * dyy)
+            kxy = kxy + torch.exp(-gamma * dxy)
+        n = x.shape[0]
+        m = y.shape[0]
+        # Use biased estimate for stability
+        mmd2 = (kxx.sum() - kxx.diag().sum()) / (n * (n - 1) + 1e-8) \
+             + (kyy.sum() - kyy.diag().sum()) / (m * (m - 1) + 1e-8) \
+             - 2.0 * kxy.mean()
+        return mmd2
 
     # training hooks
     def training_step(self, batch, batch_idx):
-        recon, kl = self.forward(batch)
+        recon, kl, z_samples = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.abs(kl - cap)
-        total = recon + beta * kl_objective
-        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl": kl, "train_kl_obj": kl_objective, "train_beta": beta, "train_capacity": cap}, prog_bar=True)
+        # Lower-bound capacity objective: penalize only when below capacity
+        kl_objective = F.relu(cap - kl)
+        # MMD regularizer (InfoVAE-style): match aggregated q(z) to p(z)
+        mmd = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if self.mmd_weight > 0.0 and z_samples.numel() > 0:
+            prior = torch.randn_like(z_samples)
+            mmd = self._rbf_mmd(z_samples, prior)
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd)
+        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl_last": kl, "train_kl_obj_lb": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd}, prog_bar=True)
         self._step += 1
         return total
 
     def validation_step(self, batch, batch_idx):
-        recon, kl = self.forward(batch)
+        recon, kl, z_samples = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.abs(kl - cap)
-        total = recon + beta * kl_objective
-        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap}, prog_bar=True, on_epoch=True)
+        kl_objective = F.relu(cap - kl)
+        mmd = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if self.mmd_weight > 0.0 and z_samples.numel() > 0:
+            prior = torch.randn_like(z_samples)
+            mmd = self._rbf_mmd(z_samples, prior)
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd)
+        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl_last": kl, "val_kl_obj_lb": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd}, prog_bar=True, on_epoch=True)
+        # accumulate kl for epoch-level auto-tune
+        self._val_kl_sum += float(kl.detach().cpu().item())
+        self._val_kl_count += 1
         # Per-dim KL stats on clean inputs (no perturbations)
         try:
             kl_dim = self._compute_kl_dim_stats(batch)  # [D]
-            if hasattr(self, "logger") and getattr(self.logger, "experiment", None) is not None:
-                tb = self.logger.experiment
-                tb.add_histogram("val/kl_per_dim", kl_dim.detach().cpu().numpy(), global_step=getattr(self, "global_step", 0))
+            # Active ratios
+            for thr in [0.005, 0.01, 0.02]:
+                active = float((kl_dim > thr).float().mean().item())
+                self.log(f"val_active_ratio@{thr}", active, prog_bar=(thr == 0.01), on_epoch=True)
+                if thr == 0.01 and active < self.active_ratio_warn_threshold:
+                    msg = f"Active ratio@0.01 low: {active:.3f} (<{self.active_ratio_warn_threshold})"
+                    self._active_warnings.append({"epoch": int(getattr(self, "current_epoch", -1)), "message": msg})
+                    try:
+                        print(f"⚠️  {msg}")
+                    except Exception:
+                        pass
             # coverage metrics
             kd = kl_dim.detach()
             total_kl = float(kd.sum().item() + 1e-8)
@@ -780,11 +884,58 @@ class SetVAEOnlyPretrain(pl.LightningModule):
                 cumsum = torch.cumsum(sorted_vals, dim=0) / sorted_vals.sum()
                 d90 = int((cumsum < 0.90).sum().item() + 1)
                 d95 = int((cumsum < 0.95).sum().item() + 1)
-                self.log("val_kl_dim90", d90, prog_bar=True, on_epoch=True)
-                self.log("val_kl_dim95", d95, prog_bar=True, on_epoch=True)
+                self.log("val_kl_dim90", d90, prog_bar=False, on_epoch=True)
+                self.log("val_kl_dim95", d95, prog_bar=False, on_epoch=True)
         except Exception:
             pass
         return total
+
+    def on_validation_epoch_start(self):
+        self._val_kl_sum = 0.0
+        self._val_kl_count = 0
+
+    def on_validation_epoch_end(self):
+        if self._val_kl_count <= 0:
+            return
+        kl_epoch = self._val_kl_sum / max(1, self._val_kl_count)
+        self.log("val_kl_last_epoch", kl_epoch, prog_bar=True)
+        # Auto-tune if KL below target
+        if self.auto_tune_kl and kl_epoch < self.kl_target_nats:
+            self._kl_not_met_epochs += 1
+            if self._kl_not_met_epochs >= self.kl_patience_epochs:
+                did_adjust = False
+                # Increase capacity end within limit
+                if self.capacity_per_dim_end < self.capacity_per_dim_max:
+                    new_cap = min(self.capacity_per_dim_end + self.capacity_per_dim_step, self.capacity_per_dim_max)
+                    try:
+                        print(f"🔧 Increasing capacity_per_dim_end: {self.capacity_per_dim_end:.4f} -> {new_cap:.4f}")
+                    except Exception:
+                        pass
+                    self.capacity_per_dim_end = new_cap
+                    did_adjust = True
+                # Increase max_beta within ceiling
+                if self.max_beta < self.max_beta_ceiling:
+                    new_beta = min(self.max_beta + self.beta_step, self.max_beta_ceiling)
+                    try:
+                        print(f"🔧 Increasing max_beta: {self.max_beta:.3f} -> {new_beta:.3f}")
+                    except Exception:
+                        pass
+                    self.max_beta = new_beta
+                    did_adjust = True
+                if did_adjust:
+                    self._num_adjustments += 1
+                self._kl_not_met_epochs = 0
+                # If too many adjustments, trigger early stop
+                if self._num_adjustments >= 5:
+                    try:
+                        print("⛔ KL target not met after multiple adjustments; requesting early stop.")
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self, 'trainer', None) is not None:
+                            self.trainer.should_stop = True
+                    except Exception:
+                        pass
 
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)

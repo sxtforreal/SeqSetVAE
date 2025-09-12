@@ -5,6 +5,50 @@ from torch.distributions import Normal
 import math
 
 
+# --- Normalizing Flows ---
+
+class _PlanarFlow(nn.Module):
+    """
+    Planar flow: z' = z + u_hat * tanh(w^T z + b)
+    Works on inputs shaped [batch, 1, dim]. Returns (z', log|det J|) with logdet per batch.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(dim))
+        self.u = nn.Parameter(torch.randn(dim))
+        self.b = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _m(w_dot_u: torch.Tensor) -> torch.Tensor:
+        # Enforce invertibility via u_hat: u_hat = u + (m - w^T u) * w / ||w||^2, m = -1 + softplus(w^T u)
+        return -1.0 + F.softplus(w_dot_u)
+
+    def forward(self, z: torch.Tensor):
+        # z: [B, 1, D]
+        assert z.dim() == 3 and z.size(1) == 1, "_PlanarFlow expects [B,1,D] input"
+        B, _, D = z.shape
+        w = self.w.view(1, 1, D)
+        u = self.u.view(1, 1, D)
+        b = self.b.view(1, 1, 1)
+        # Compute u_hat
+        w_dot_u = torch.sum(self.w * self.u)
+        m = self._m(w_dot_u)
+        w_norm_sq = torch.sum(self.w * self.w) + 1e-8
+        u_hat = self.u + ((m - w_dot_u) * self.w) / w_norm_sq
+        u_hat = u_hat.view(1, 1, D)
+
+        # a = w^T z + b, h = tanh(a)
+        a = torch.sum(w * z, dim=-1, keepdim=True) + b  # [B,1,1]
+        h = torch.tanh(a)  # [B,1,1]
+        z_new = z + u_hat * h  # broadcast over last dim
+
+        # log|det J| = log|1 + u_hat^T psi|, psi = h'(a) * w
+        h_prime = 1.0 - torch.tanh(a) ** 2  # [B,1,1]
+        psi = h_prime * w  # [B,1,D]
+        inner = torch.sum(u_hat * psi, dim=-1).squeeze(-1)  # [B,1]
+        logdet = torch.log(torch.abs(1.0 + inner) + 1e-8).squeeze(-1)  # [B]
+        return z_new, logdet
+
 # MAB - Multi-head Attention Block
 class MAB(nn.Module):
     def __init__(self, dim, heads):
@@ -78,10 +122,12 @@ class AttentiveBottleneckLayer(nn.Module):
 
 # SetVAE Module
 class SetVAEModule(nn.Module):
-    def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m):
+    def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m, use_flows: bool = False, num_flows: int = 0):
         super().__init__()
         self.reduced_dim = reduced_dim
         self.levels = levels
+        self.use_flows = bool(use_flows)
+        self.num_flows = int(num_flows) if use_flows else 0
         if reduced_dim is not None:
             self.dim_reducer = nn.Linear(input_dim, reduced_dim)
             embed_input = reduced_dim
@@ -113,10 +159,15 @@ class SetVAEModule(nn.Module):
             nn.Linear(latent_dim, latent_dim * 2),
         )
         
-        self.out = nn.Sequential(
-            nn.Linear(latent_dim, out_output),
-            nn.Tanh()  # Add output activation function to limit output range
-        )
+        # Decoder output head (no tanh limit to preserve amplitude capacity)
+        self.out = nn.Linear(latent_dim, out_output)
+
+        # Optional: simple planar flow stack for posterior transform
+        # z_K = f_K \circ ... \circ f_1 (z_0)
+        if self.use_flows and self.num_flows > 0:
+            self.flows = nn.ModuleList([_PlanarFlow(latent_dim) for _ in range(self.num_flows)])
+        else:
+            self.flows = nn.ModuleList()
 
         # Improved initialization
         self._init_weights()
@@ -182,13 +233,38 @@ class SetVAEModule(nn.Module):
     def decode(self, z_list, target_n, use_mean=False, noise_std=0.5):
         idx = 1 if use_mean else 0
         current = z_list[-1][idx]
+        # Apply optional normalizing flows to the last-layer latent sample before decoding
+        if self.use_flows and len(self.flows) > 0 and idx == 0:
+            current, _ = self.apply_flows(current)
         for l in range(self.levels - 1, -1, -1):
             # Add residual connection
             residual = current
-            layer_out = self.decoder_layers[l](current, target_n, noise_std=noise_std)
+            # Inject corresponding encoder layer latent sample to encourage usage across layers
+            inject_x = z_list[l][0] if l < len(z_list) else None
+            layer_out = self.decoder_layers[l](current, target_n, x=inject_x, noise_std=noise_std)
             current = layer_out + residual.expand_as(layer_out)
         recon = self.out(current)
         return recon
+
+    # --- Flow helpers ---
+    def apply_flows(self, z: torch.Tensor):
+        """
+        Apply the planar flow stack to latent sample z.
+        Args:
+            z: [batch, 1, latent_dim]
+        Returns:
+            z_k: flowed latent with same shape
+            sum_logdet: [batch] log-determinant sums (useful if one wants exact flow KL later)
+        """
+        if not self.use_flows or len(self.flows) == 0:
+            batch = z.size(0)
+            return z, torch.zeros(batch, device=z.device, dtype=z.dtype)
+        sum_logdet = 0.0
+        z_k = z
+        for flow in self.flows:
+            z_k, logdet = flow(z_k)
+            sum_logdet = sum_logdet + logdet
+        return z_k, sum_logdet
 
     def forward(self, var, val):
         if self.dim_reducer is not None:
@@ -223,6 +299,7 @@ def recon_loss(
     beta=1.0,
     gamma=3.0,
     beta_var=0.1,
+    scale_calib_weight: float = 0.0,
     epsilon=1e-8,
 ):
     """
@@ -279,9 +356,15 @@ def recon_loss(
         -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
     )  # Mean over dims, tokens, batch
 
+    # Scale calibration to avoid degenerate shrinking or explosion of norms
+    mean_recon_norm = torch.mean(recon_norm + 1e-8)
+    mean_target_norm = torch.mean(target_norm + 1e-8)
+    scale_ratio = mean_recon_norm / (mean_target_norm + 1e-8)
+    scale_penalty = scale_calib_weight * (scale_ratio - 1.0) ** 2
+
     # Total loss
     total_loss = (
-        alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term
+        alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term + scale_penalty
     )
     return total_loss
 
