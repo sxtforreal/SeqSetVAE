@@ -551,6 +551,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         num_flows: int = 0,
         mmd_weight: float = 0.0,
         mmd_scales: tuple = (1.0, 2.0, 4.0, 8.0),
+        # Auto-tune and monitoring
+        auto_tune_kl: bool = True,
+        kl_target_nats: float = 10.0,
+        kl_patience_epochs: int = 2,
+        beta_step: float = 0.2,
+        capacity_per_dim_step: float = 0.02,
+        max_beta_ceiling: float = 2.0,
+        capacity_per_dim_max: float = 0.20,
+        active_ratio_warn_threshold: float = 0.5,
     ):
         super().__init__()
         self.set_encoder = SetVAEModule(
@@ -596,6 +605,21 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             self.mmd_scales = tuple(float(s) for s in (mmd_scales if isinstance(mmd_scales, (list, tuple)) else (mmd_scales,)))
         except Exception:
             self.mmd_scales = (1.0, 2.0, 4.0, 8.0)
+
+        # Auto-tune & monitors
+        self.auto_tune_kl = bool(auto_tune_kl)
+        self.kl_target_nats = float(kl_target_nats)
+        self.kl_patience_epochs = int(kl_patience_epochs)
+        self.beta_step = float(beta_step)
+        self.capacity_per_dim_step = float(capacity_per_dim_step)
+        self.max_beta_ceiling = float(max_beta_ceiling)
+        self.capacity_per_dim_max = float(capacity_per_dim_max)
+        self.active_ratio_warn_threshold = float(active_ratio_warn_threshold)
+        self._kl_not_met_epochs = 0
+        self._num_adjustments = 0
+        self._val_kl_sum = 0.0
+        self._val_kl_count = 0
+        self._active_warnings = []
 
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
@@ -835,12 +859,23 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             mmd = self._rbf_mmd(z_samples, prior)
         total = recon + beta * kl_objective + (self.mmd_weight * mmd)
         self.log_dict({"val_loss": total, "val_recon": recon, "val_kl_last": kl, "val_kl_obj_lb": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd}, prog_bar=True, on_epoch=True)
+        # accumulate kl for epoch-level auto-tune
+        self._val_kl_sum += float(kl.detach().cpu().item())
+        self._val_kl_count += 1
         # Per-dim KL stats on clean inputs (no perturbations)
         try:
             kl_dim = self._compute_kl_dim_stats(batch)  # [D]
-            if hasattr(self, "logger") and getattr(self.logger, "experiment", None) is not None:
-                tb = self.logger.experiment
-                tb.add_histogram("val/kl_per_dim", kl_dim.detach().cpu().numpy(), global_step=getattr(self, "global_step", 0))
+            # Active ratios
+            for thr in [0.005, 0.01, 0.02]:
+                active = float((kl_dim > thr).float().mean().item())
+                self.log(f"val_active_ratio@{thr}", active, prog_bar=(thr == 0.01), on_epoch=True)
+                if thr == 0.01 and active < self.active_ratio_warn_threshold:
+                    msg = f"Active ratio@0.01 low: {active:.3f} (<{self.active_ratio_warn_threshold})"
+                    self._active_warnings.append({"epoch": int(getattr(self, "current_epoch", -1)), "message": msg})
+                    try:
+                        print(f"⚠️  {msg}")
+                    except Exception:
+                        pass
             # coverage metrics
             kd = kl_dim.detach()
             total_kl = float(kd.sum().item() + 1e-8)
@@ -849,11 +884,58 @@ class SetVAEOnlyPretrain(pl.LightningModule):
                 cumsum = torch.cumsum(sorted_vals, dim=0) / sorted_vals.sum()
                 d90 = int((cumsum < 0.90).sum().item() + 1)
                 d95 = int((cumsum < 0.95).sum().item() + 1)
-                self.log("val_kl_dim90", d90, prog_bar=True, on_epoch=True)
-                self.log("val_kl_dim95", d95, prog_bar=True, on_epoch=True)
+                self.log("val_kl_dim90", d90, prog_bar=False, on_epoch=True)
+                self.log("val_kl_dim95", d95, prog_bar=False, on_epoch=True)
         except Exception:
             pass
         return total
+
+    def on_validation_epoch_start(self):
+        self._val_kl_sum = 0.0
+        self._val_kl_count = 0
+
+    def on_validation_epoch_end(self):
+        if self._val_kl_count <= 0:
+            return
+        kl_epoch = self._val_kl_sum / max(1, self._val_kl_count)
+        self.log("val_kl_last_epoch", kl_epoch, prog_bar=True)
+        # Auto-tune if KL below target
+        if self.auto_tune_kl and kl_epoch < self.kl_target_nats:
+            self._kl_not_met_epochs += 1
+            if self._kl_not_met_epochs >= self.kl_patience_epochs:
+                did_adjust = False
+                # Increase capacity end within limit
+                if self.capacity_per_dim_end < self.capacity_per_dim_max:
+                    new_cap = min(self.capacity_per_dim_end + self.capacity_per_dim_step, self.capacity_per_dim_max)
+                    try:
+                        print(f"🔧 Increasing capacity_per_dim_end: {self.capacity_per_dim_end:.4f} -> {new_cap:.4f}")
+                    except Exception:
+                        pass
+                    self.capacity_per_dim_end = new_cap
+                    did_adjust = True
+                # Increase max_beta within ceiling
+                if self.max_beta < self.max_beta_ceiling:
+                    new_beta = min(self.max_beta + self.beta_step, self.max_beta_ceiling)
+                    try:
+                        print(f"🔧 Increasing max_beta: {self.max_beta:.3f} -> {new_beta:.3f}")
+                    except Exception:
+                        pass
+                    self.max_beta = new_beta
+                    did_adjust = True
+                if did_adjust:
+                    self._num_adjustments += 1
+                self._kl_not_met_epochs = 0
+                # If too many adjustments, trigger early stop
+                if self._num_adjustments >= 5:
+                    try:
+                        print("⛔ KL target not met after multiple adjustments; requesting early stop.")
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self, 'trainer', None) is not None:
+                            self.trainer.should_stop = True
+                    except Exception:
+                        pass
 
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)
