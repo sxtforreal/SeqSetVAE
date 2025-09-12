@@ -5,12 +5,58 @@ from torch.distributions import Normal
 import math
 
 
+# --- Normalizing Flows ---
+
+
+class _PlanarFlow(nn.Module):
+    """
+    Planar flow: z' = z + u_hat * tanh(w^T z + b)
+    Works on inputs shaped [batch, 1, dim]. Returns (z', log|det J|) with logdet per batch.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(dim))
+        self.u = nn.Parameter(torch.randn(dim))
+        self.b = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _m(w_dot_u: torch.Tensor) -> torch.Tensor:
+        # Enforce invertibility via u_hat: u_hat = u + (m - w^T u) * w / ||w||^2, m = -1 + softplus(w^T u)
+        return -1.0 + F.softplus(w_dot_u)
+
+    def forward(self, z: torch.Tensor):
+        # z: [B, 1, D]
+        assert z.dim() == 3 and z.size(1) == 1, "_PlanarFlow expects [B,1,D] input"
+        B, _, D = z.shape
+        w = self.w.view(1, 1, D)
+        u = self.u.view(1, 1, D)
+        b = self.b.view(1, 1, 1)
+        # Compute u_hat
+        w_dot_u = torch.sum(self.w * self.u)
+        m = self._m(w_dot_u)
+        w_norm_sq = torch.sum(self.w * self.w) + 1e-8
+        u_hat = self.u + ((m - w_dot_u) * self.w) / w_norm_sq
+        u_hat = u_hat.view(1, 1, D)
+
+        # a = w^T z + b, h = tanh(a)
+        a = torch.sum(w * z, dim=-1, keepdim=True) + b  # [B,1,1]
+        h = torch.tanh(a)  # [B,1,1]
+        z_new = z + u_hat * h  # broadcast over last dim
+
+        # log|det J| = log|1 + u_hat^T psi|, psi = h'(a) * w
+        h_prime = 1.0 - torch.tanh(a) ** 2  # [B,1,1]
+        psi = h_prime * w  # [B,1,D]
+        inner = torch.sum(u_hat * psi, dim=-1).squeeze(-1)  # [B,1]
+        logdet = torch.log(torch.abs(1.0 + inner) + 1e-8).squeeze(-1)  # [B]
+        return z_new, logdet
+
+
 # MAB - Multi-head Attention Block
 class MAB(nn.Module):
-    def __init__(self, dim, heads, dropout: float = 0.1):
+    def __init__(self, dim, heads):
         super().__init__()
-        self.multihead = nn.MultiheadAttention(dim, heads, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
+        self.multihead = nn.MultiheadAttention(dim, heads)
         self.ln1 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
             nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
@@ -22,10 +68,9 @@ class MAB(nn.Module):
         kv_t = kv.transpose(0, 1)
         attn_output, _ = self.multihead(q_t, kv_t, kv_t)
         attn_output = attn_output.transpose(0, 1)
-        # Residual + Pre-LN
-        a = self.ln1(q + self.dropout(attn_output))
+        a = self.ln1(attn_output)
         ff_out = self.ff(a)
-        return self.ln2(a + self.dropout(ff_out))
+        return self.ln2(ff_out)
 
 
 # ISAB - Induced Set Attention Block
@@ -47,18 +92,16 @@ class ISAB(nn.Module):
 class PoolingByMultiheadAttention(nn.Module):
     def __init__(self, dim, heads, dropout=0.1):
         super().__init__()
-        self.mab = MAB(dim, heads, dropout=dropout)
+        self.mab = MAB(dim, heads)
         self.ff = nn.Linear(dim, dim)
         self.ln = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
-        # Learnable base query to make decoding deterministic; tiled to target_n
-        self.base_query = nn.Parameter(torch.zeros(1, 1, dim))
 
     def forward(self, z, target_n, noise_std=0.5):
         batch_size = z.size(0)
-        seed = self.base_query.expand(batch_size, target_n, -1)
-        if self.training and noise_std > 0:
-            seed = seed + torch.randn_like(seed) * noise_std
+        seed = torch.randn(batch_size, target_n, z.size(-1), device=z.device)
+        noise = torch.randn_like(seed) * noise_std
+        seed = seed + noise
         ff_z = F.gelu(self.ff(z))
         ln_ff = self.ln(ff_z)
         mab_out = self.mab(seed, ln_ff)
@@ -82,11 +125,22 @@ class AttentiveBottleneckLayer(nn.Module):
 
 # SetVAE Module
 class SetVAEModule(nn.Module):
-    def __init__(self, input_dim, reduced_dim, latent_dim, levels, heads, m, enable_posterior_std_augmentation: bool = True):
+    def __init__(
+        self,
+        input_dim,
+        reduced_dim,
+        latent_dim,
+        levels,
+        heads,
+        m,
+        use_flows: bool = False,
+        num_flows: int = 0,
+    ):
         super().__init__()
         self.reduced_dim = reduced_dim
         self.levels = levels
-        self.enable_posterior_std_augmentation = enable_posterior_std_augmentation
+        self.use_flows = bool(use_flows)
+        self.num_flows = int(num_flows) if use_flows else 0
         if reduced_dim is not None:
             self.dim_reducer = nn.Linear(input_dim, reduced_dim)
             embed_input = reduced_dim
@@ -95,20 +149,20 @@ class SetVAEModule(nn.Module):
             self.dim_reducer = None
             embed_input = input_dim
             out_output = input_dim
-        
+
         self.embed = nn.Sequential(
             nn.Linear(embed_input, latent_dim),
             nn.LayerNorm(latent_dim),  # Add layer normalization
-            nn.GELU()  # Use GELU activation function
+            nn.GELU(),  # Use GELU activation function
         )
-        
+
         self.encoder_layers = nn.ModuleList(
             [ISAB(latent_dim, heads, m) for _ in range(levels)]
         )
         self.decoder_layers = nn.ModuleList(
             [AttentiveBottleneckLayer(latent_dim, heads, m) for _ in range(levels)]
         )
-        
+
         # Improved mu and logvar networks
         self.mu_logvar = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
@@ -117,10 +171,18 @@ class SetVAEModule(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(latent_dim, latent_dim * 2),
         )
-        
-        self.out = nn.Sequential(
-            nn.Linear(latent_dim, out_output)
-        )
+
+        # Decoder output head (no tanh limit to preserve amplitude capacity)
+        self.out = nn.Linear(latent_dim, out_output)
+
+        # Optional: simple planar flow stack for posterior transform
+        # z_K = f_K \circ ... \circ f_1 (z_0)
+        if self.use_flows and self.num_flows > 0:
+            self.flows = nn.ModuleList(
+                [_PlanarFlow(latent_dim) for _ in range(self.num_flows)]
+            )
+        else:
+            self.flows = nn.ModuleList()
 
         # Improved initialization
         self._init_weights()
@@ -146,21 +208,21 @@ class SetVAEModule(nn.Module):
             residual = current
             current = layer(current)
             current = current + residual  # Residual connection
-            
+
             # Aggregate and generate latent variables
             agg = current.mean(dim=1, keepdim=True)
             mu_logvar = self.mu_logvar(agg)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
-            
+
             # Clamp logvar range to prevent numerical instability
             logvar = torch.clamp(logvar, min=-10, max=10)
             std = torch.exp(0.5 * logvar)
-            
-            # Optional std augmentation (disabled for truthful SetVAE-only)
-            if self.training and self.enable_posterior_std_augmentation:
+
+            # Add noise to prevent overfitting
+            if self.training:
                 eps = torch.randn_like(std) * 0.1
                 std = std + eps.abs()
-                
+
             dist = Normal(mu, std)
             z_sampled = dist.rsample()
             z_list.append((z_sampled, mu, logvar))
@@ -180,37 +242,64 @@ class SetVAEModule(nn.Module):
         reduced_normalized = reduced / (norms + 1e-8)
         x = reduced_normalized * val
         if self.training:
-            x = F.dropout(x, p=0.05, training=True)
+            x = F.dropout(x, p=0.1, training=True)
         return self.encode(x)
 
     def decode(self, z_list, target_n, use_mean=False, noise_std=0.5):
         idx = 1 if use_mean else 0
         current = z_list[-1][idx]
+        # Apply optional normalizing flows to the last-layer latent sample before decoding
+        if self.use_flows and len(self.flows) > 0 and idx == 0:
+            current, _ = self.apply_flows(current)
         for l in range(self.levels - 1, -1, -1):
             # Add residual connection
             residual = current
-            layer_out = self.decoder_layers[l](current, target_n, noise_std=noise_std)
+            # Inject corresponding encoder layer latent sample to encourage usage across layers
+            inject_x = z_list[l][0] if l < len(z_list) else None
+            layer_out = self.decoder_layers[l](
+                current, target_n, x=inject_x, noise_std=noise_std
+            )
             current = layer_out + residual.expand_as(layer_out)
         recon = self.out(current)
         return recon
+
+    # --- Flow helpers ---
+    def apply_flows(self, z: torch.Tensor):
+        """
+        Apply the planar flow stack to latent sample z.
+        Args:
+            z: [batch, 1, latent_dim]
+        Returns:
+            z_k: flowed latent with same shape
+            sum_logdet: [batch] log-determinant sums (useful if one wants exact flow KL later)
+        """
+        if not self.use_flows or len(self.flows) == 0:
+            batch = z.size(0)
+            return z, torch.zeros(batch, device=z.device, dtype=z.dtype)
+        sum_logdet = 0.0
+        z_k = z
+        for flow in self.flows:
+            z_k, logdet = flow(z_k)
+            sum_logdet = sum_logdet + logdet
+        return z_k, sum_logdet
 
     def forward(self, var, val):
         if self.dim_reducer is not None:
             reduced = self.dim_reducer(var)
         else:
             reduced = var
-        
+
         # Improved normalization method
         norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
         # Add small random noise to prevent division by zero
         norms = norms + torch.randn_like(norms) * 1e-8
         reduced_normalized = reduced / (norms + 1e-8)
         x = reduced_normalized * val
-        
+
         # Add input dropout
         if self.training:
-            x = F.dropout(x, p=0.05, training=True)
-            
+            x = F.dropout(x, p=0.1, training=True)
+
         z_list, encoded = self.encode(x)
         target_n = x.size(1)
         recon = self.decode(z_list, target_n)
@@ -226,7 +315,8 @@ def recon_loss(
     alpha=1.0,
     beta=1.0,
     gamma=3.0,
-    beta_var=0.0,
+    beta_var=0.1,
+    scale_calib_weight: float = 0.0,
     epsilon=1e-8,
 ):
     """
@@ -281,48 +371,178 @@ def recon_loss(
     # Variance regularization: Encourage higher variance in recon (negative to minimize)
     var_term = (
         -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
-    )
+    )  # Mean over dims, tokens, batch
+
+    # Scale calibration to avoid degenerate shrinking or explosion of norms
+    mean_recon_norm = torch.mean(recon_norm + 1e-8)
+    mean_target_norm = torch.mean(target_norm + 1e-8)
+    scale_ratio = mean_recon_norm / (mean_target_norm + 1e-8)
+    scale_penalty = scale_calib_weight * (scale_ratio - 1.0) ** 2
 
     # Total loss
     total_loss = (
-        alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term
+        alpha * dir_chamfer
+        + beta * mag_chamfer
+        + gamma * chamfer_loss
+        + var_term
+        + scale_penalty
     )
     return total_loss
 
 
-def elbo_loss(
-    recon,
-    target,
-    z_list,
-    free_bits: float = 0.1,
-    recon_alpha: float = 1.0,
-    recon_beta: float = 1.0,
-    recon_gamma: float = 3.0,
-    beta_var: float = 0.0,
-):
+def elbo_loss(recon, target, z_list, free_bits=0.1):
     """
-    ELBO with per-dimension free-bits and configurable reconstruction weights.
-    - free_bits is applied per latent dimension before summation.
-    - beta_var encourages higher reconstruction variance (mitigates variance collapse).
+    Improved ELBO loss function to prevent posterior collapse
     """
-    r_loss = recon_loss(
-        recon,
-        target,
-        alpha=recon_alpha,
-        beta=recon_beta,
-        gamma=recon_gamma,
-        beta_var=beta_var,
-    )
-    kl_accum = 0.0
-    for (_z, mu, logvar) in z_list:
-        # Per-dimension KL for diagonal Gaussians
-        per_dim_kl = 0.5 * (torch.exp(logvar) + mu.pow(2) - 1.0 - logvar)
-        # Apply per-dimension free-bits
-        if free_bits is not None and free_bits > 0.0:
-            per_dim_kl = torch.clamp(per_dim_kl, min=free_bits)
-        # Sum over dimensions, then average over batch
-        kl_div = torch.sum(per_dim_kl, dim=-1)
-        kl_accum = kl_accum + kl_div.mean()
-    total_kl = kl_accum / max(1, len(z_list))
+    r_loss = recon_loss(recon, target)
+
+    total_kl = 0
+    latent_dim = z_list[0][1].size(-1)
+    min_kl = free_bits * latent_dim
+
+    for layer_idx, (z_sample, mu, logvar) in enumerate(z_list):
+        # Standard KL divergence
+        kl_div = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1 - logvar, dim=-1)
+
+        # Apply free bits
+        kl_div = torch.clamp(kl_div, min=min_kl)
+
+        # Add layer weights, deeper layers have higher KL loss weights
+        layer_weight = (layer_idx + 1) / len(z_list)
+
+        # Regularization term to prevent variance collapse
+        var_reg = -0.1 * torch.mean(logvar)  # Encourage larger variance
+
+        # Regularization term to prevent mean collapse
+        mean_reg = 0.01 * torch.mean(mu.pow(2))  # Slightly penalize large means
+
+        total_kl += layer_weight * (kl_div.mean() + var_reg + mean_reg)
+
     return r_loss, total_kl
 
+
+# --------------------- Test functions for each module ----------------------------
+def test_recon_loss():
+    batch_size, n_x, dim = 1, 3, 3
+    x = torch.randn(batch_size, n_x, dim)
+    y = torch.randn(batch_size, n_x, dim)
+    loss = recon_loss(x, y)
+    print(
+        f"Recon Loss Test - Input x: {x.shape}, y: {y.shape}, Output: {loss.shape}, Value: {loss.item()}"
+    )
+    assert loss.dim() == 0, "Recon loss should return a scalar"
+
+
+def test_multihead_attention_block():
+    batch_size, seq_len, dim, heads = 1, 3, 64, 4
+    q = torch.randn(batch_size, seq_len, dim)
+    kv = torch.randn(batch_size, seq_len, dim)
+    mab = MAB(dim, heads)
+    output = mab(q, kv)
+    print(
+        f"MultiheadAttentionBlock Test - Input q: {q.shape}, kv: {kv.shape}, Output: {output.shape}"
+    )
+    assert output.shape == (batch_size, seq_len, dim), "Output shape mismatch"
+
+
+def test_induced_set_attention_block():
+    batch_size, seq_len, dim, heads, m = 1, 3, 64, 4, 64
+    x = torch.randn(batch_size, seq_len, dim)
+    isab = ISAB(dim, heads, m)
+    output = isab(x)
+    print(f"InducedSetAttentionBlock Test - Input x: {x.shape}, Output: {output.shape}")
+    assert output.shape == (batch_size, seq_len, dim), "Output shape mismatch"
+
+
+def test_pooling_by_multihead_attention():
+    batch_size, seq_len, dim, heads = 1, 3, 64, 4
+    z = torch.randn(batch_size, seq_len, dim)
+    pma = PoolingByMultiheadAttention(dim, heads)
+    target_n = 4
+    output = pma(z, target_n)
+    print(
+        f"PoolingByMultiheadAttention Test - Input z: {z.shape}, target_n: {target_n}, Output: {output.shape}"
+    )
+    assert output.shape == (batch_size, target_n, dim), "Output shape mismatch"
+
+
+def test_attentive_bottleneck_layer():
+    batch_size, seq_len, dim, heads, m = 1, 3, 64, 4, 64
+    z_prev = torch.randn(batch_size, seq_len, dim)
+    abl = AttentiveBottleneckLayer(dim, heads, m)
+    target_n = 4
+    output = abl(z_prev, target_n)
+    print(
+        f"AttentiveBottleneckLayer Test - Input z_prev: {z_prev.shape}, target_n: {target_n}, Output: {output.shape}"
+    )
+    assert output.shape == (batch_size, target_n, dim), "Output shape mismatch"
+
+
+def test_setvae():
+    batch_size, seq_len, input_dim, reduced_dim, latent_dim = 1, 3, 768, 256, 256
+    var = torch.randn(batch_size, seq_len, input_dim)
+    val = torch.randn(batch_size, seq_len, 1)
+    model = SetVAEModule(
+        input_dim=input_dim,
+        reduced_dim=reduced_dim,
+        latent_dim=latent_dim,
+        levels=2,
+        heads=2,
+        m=16,
+    )
+    recon, z_list, _ = model(var, val)
+
+    print(
+        f"SetVAE Test - Input var: {var.shape}, Input val: {val.shape}, Output recon: {recon.shape}, z_list length: {len(z_list)}"
+    )
+    assert recon.shape == (
+        batch_size,
+        seq_len,
+        reduced_dim,
+    ), "Reconstruction shape mismatch"
+    assert all(
+        z[0].shape == (batch_size, 1, latent_dim) for z in z_list
+    ), "Z_list shape mismatch"
+
+
+def test_setvae_variable_n():
+    batch_size = 1
+    input_dim = 768
+    reduced_dim = 256
+    latent_dim = 64
+    levels = 3
+    heads = 4
+    m = 32
+    model = SetVAEModule(
+        input_dim=input_dim,
+        latent_dim=latent_dim,
+        levels=levels,
+        heads=heads,
+        m=m,
+        reduced_dim=reduced_dim,
+    )
+
+    for n in [5, 10, 20, 50]:
+        var = torch.randn(batch_size, n, input_dim)
+        val = torch.randn(batch_size, n, 1)
+        recon, z_list, _ = model(var, val)
+        print(
+            f"Test with n={n} - Input var: {var.shape}, Input val: {val.shape}, Recon: {recon.shape}, z_list length: {len(z_list)}"
+        )
+        assert recon.shape == (batch_size, n, reduced_dim), "Shape mismatch"
+        assert all(
+            z[0].shape == (batch_size, 1, latent_dim) for z in z_list
+        ), "z shape mismatch"
+    print("Variable n test passed!")
+
+
+if __name__ == "__main__":
+    print("Running module tests...")
+    test_recon_loss()
+    test_multihead_attention_block()
+    test_induced_set_attention_block()
+    test_pooling_by_multihead_attention()
+    test_attentive_bottleneck_layer()
+    test_setvae()
+    test_setvae_variable_n()
+    print("All tests completed successfully!")
