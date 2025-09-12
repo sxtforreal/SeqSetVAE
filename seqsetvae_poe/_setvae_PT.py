@@ -90,6 +90,12 @@ def main():
         help="How often to run validation within an epoch (fraction of train epoch)",
     )
 
+    # InfoVAE / Flows
+    parser.add_argument("--use_flows", action="store_true", default=False, help="Enable planar flows on last-layer latent")
+    parser.add_argument("--num_flows", type=int, default=0, help="Number of planar flow layers")
+    parser.add_argument("--mmd_weight", type=float, default=0.0, help="Weight for InfoVAE MMD regularizer")
+    parser.add_argument("--mmd_scales", type=float, nargs='*', default=[1.0, 2.0, 4.0, 8.0], help="RBF MMD kernel scales")
+
     # Optim & regularization
     parser.add_argument("--lr", type=float, default=getattr(config, "lr", 3e-4))
     parser.add_argument(
@@ -195,6 +201,10 @@ def main():
         dir_noise_std=args.dir_noise_std,
         train_decoder_noise_std=args.train_decoder_noise_std,
         eval_decoder_noise_std=args.eval_decoder_noise_std,
+        use_flows=bool(args.use_flows),
+        num_flows=int(args.num_flows),
+        mmd_weight=float(args.mmd_weight),
+        mmd_scales=tuple(args.mmd_scales) if isinstance(args.mmd_scales, list) else (args.mmd_scales,),
     )
 
     # Optional: initialize weights from checkpoint (weights only)

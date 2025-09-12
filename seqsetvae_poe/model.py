@@ -546,6 +546,11 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         dir_noise_std: float = 0.01,
         train_decoder_noise_std: float = 0.15,
         eval_decoder_noise_std: float = 0.03,
+        # InfoVAE / Flow options
+        use_flows: bool = False,
+        num_flows: int = 0,
+        mmd_weight: float = 0.0,
+        mmd_scales: tuple = (1.0, 2.0, 4.0, 8.0),
     ):
         super().__init__()
         self.set_encoder = SetVAEModule(
@@ -555,6 +560,8 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             levels=levels,
             heads=heads,
             m=m,
+            use_flows=use_flows,
+            num_flows=num_flows,
         )
 
         # Training hparams
@@ -582,6 +589,13 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self.dir_noise_std = dir_noise_std
         self.train_decoder_noise_std = train_decoder_noise_std
         self.eval_decoder_noise_std = eval_decoder_noise_std
+        # InfoVAE/MMD
+        self.mmd_weight = float(mmd_weight)
+        try:
+            # ensure tuple of floats
+            self.mmd_scales = tuple(float(s) for s in (mmd_scales if isinstance(mmd_scales, (list, tuple)) else (mmd_scales,)))
+        except Exception:
+            self.mmd_scales = (1.0, 2.0, 4.0, 8.0)
 
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
@@ -728,7 +742,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         # KL to standard normal with free-bits
         # Reuse base_elbo to compute KL terms (we discard its recon to avoid double compute)
         _, kl = base_elbo(recon, x_target, z_list, free_bits=self.free_bits)
-        return r_loss, kl
+        # collect last-layer latent sample (after optional flows) for MMD
+        z_last = z_list[-1][0]  # [1,1,D]
+        try:
+            if hasattr(self.set_encoder, 'apply_flows') and len(getattr(self.set_encoder, 'flows', [])) > 0:
+                z_last, _ = self.set_encoder.apply_flows(z_last)
+        except Exception:
+            pass
+        z_flat = z_last.squeeze(1)  # [1,D]
+        return r_loss, kl, z_flat
 
     def forward(self, batch):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
@@ -736,36 +758,80 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         carry_mask = batch.get("carry_mask", None)
         all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
         total_recon, total_kl, count = 0.0, 0.0, 0
+        zs = []
         for sets in all_sets:
             for s in sets:
-                recon, kl = self._forward_single(s)
+                recon, kl, z_flat = self._forward_single(s)
                 total_recon += recon
                 total_kl += kl
+                zs.append(z_flat)
                 count += 1
         if count == 0:
             device = var.device
             zero = torch.tensor(0.0, device=device)
-            return zero, zero
-        return total_recon / count, total_kl / count
+            return zero, zero, torch.zeros(0, self.latent_dim, device=device)
+        z_samples = torch.cat(zs, dim=0) if len(zs) > 0 else torch.zeros(0, self.latent_dim, device=var.device)
+        return total_recon / count, total_kl / count, z_samples
+
+    # --- InfoVAE / MMD ---
+    @staticmethod
+    def _pdists(x: torch.Tensor, y: torch.Tensor):
+        # x: [N,D], y: [M,D] -> [N,M]
+        x2 = (x * x).sum(dim=1, keepdim=True)
+        y2 = (y * y).sum(dim=1, keepdim=True).t()
+        xy = x @ y.t()
+        d2 = (x2 + y2 - 2.0 * xy).clamp_min(0.0)
+        return d2
+
+    def _rbf_mmd(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0 or y.numel() == 0:
+            return torch.tensor(0.0, device=x.device if x.numel() > 0 else y.device)
+        dxx = self._pdists(x, x)
+        dyy = self._pdists(y, y)
+        dxy = self._pdists(x, y)
+        kxx = 0.0
+        kyy = 0.0
+        kxy = 0.0
+        for s in self.mmd_scales:
+            gamma = 1.0 / (2.0 * (float(s) ** 2))
+            kxx = kxx + torch.exp(-gamma * dxx)
+            kyy = kyy + torch.exp(-gamma * dyy)
+            kxy = kxy + torch.exp(-gamma * dxy)
+        n = x.shape[0]
+        m = y.shape[0]
+        # Use biased estimate for stability
+        mmd2 = (kxx.sum() - kxx.diag().sum()) / (n * (n - 1) + 1e-8) \
+             + (kyy.sum() - kyy.diag().sum()) / (m * (m - 1) + 1e-8) \
+             - 2.0 * kxy.mean()
+        return mmd2
 
     # training hooks
     def training_step(self, batch, batch_idx):
-        recon, kl = self.forward(batch)
+        recon, kl, z_samples = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         kl_objective = torch.abs(kl - cap)
-        total = recon + beta * kl_objective
-        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl": kl, "train_kl_obj": kl_objective, "train_beta": beta, "train_capacity": cap}, prog_bar=True)
+        # MMD regularizer (InfoVAE-style): match aggregated q(z) to p(z)
+        mmd = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if self.mmd_weight > 0.0 and z_samples.numel() > 0:
+            prior = torch.randn_like(z_samples)
+            mmd = self._rbf_mmd(z_samples, prior)
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd)
+        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl": kl, "train_kl_obj": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd}, prog_bar=True)
         self._step += 1
         return total
 
     def validation_step(self, batch, batch_idx):
-        recon, kl = self.forward(batch)
+        recon, kl, z_samples = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         kl_objective = torch.abs(kl - cap)
-        total = recon + beta * kl_objective
-        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap}, prog_bar=True, on_epoch=True)
+        mmd = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if self.mmd_weight > 0.0 and z_samples.numel() > 0:
+            prior = torch.randn_like(z_samples)
+            mmd = self._rbf_mmd(z_samples, prior)
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd)
+        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd}, prog_bar=True, on_epoch=True)
         # Per-dim KL stats on clean inputs (no perturbations)
         try:
             kl_dim = self._compute_kl_dim_stats(batch)  # [D]
