@@ -528,24 +528,24 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         beta: float,
         lr: float,
         warmup_beta: bool = True,
-        max_beta: float = 0.2,
-        beta_warmup_steps: int = 8000,
-        free_bits: float = 0.01,
+        max_beta: float = 1.0,
+        beta_warmup_steps: int = 20000,
+        free_bits: float = 0.03,
         # KL capacity schedule (Burgess et al. 2018)
         use_kl_capacity: bool = True,
-        capacity_per_dim_end: float = 0.03,
-        capacity_warmup_steps: int = 20000,
+        capacity_per_dim_end: float = 0.10,
+        capacity_warmup_steps: int = 30000,
         # perturbation params
-        p_stale: float = 0.3,
-        p_live: float = 0.03,
-        set_mae_ratio: float = 0.05,
-        small_set_mask_prob: float = 0.2,
+        p_stale: float = 0.1,
+        p_live: float = 0.02,
+        set_mae_ratio: float = 0.02,
+        small_set_mask_prob: float = 0.1,
         small_set_threshold: int = 5,
         max_masks_per_set: int = 2,
-        val_noise_std: float = 0.04,
+        val_noise_std: float = 0.02,
         dir_noise_std: float = 0.01,
-        train_decoder_noise_std: float = 0.15,
-        eval_decoder_noise_std: float = 0.03,
+        train_decoder_noise_std: float = 0.05,
+        eval_decoder_noise_std: float = 0.02,
         # InfoVAE / Flow options
         use_flows: bool = False,
         num_flows: int = 0,
@@ -735,13 +735,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             recon,
             x_target,
             alpha=1.0,
-            beta=1.0,
-            gamma=2.0,
+            beta=2.0,
+            gamma=3.0,
             beta_var=0.01,
+            scale_calib_weight=0.5,
         )
-        # KL to standard normal with free-bits
-        # Reuse base_elbo to compute KL terms (we discard its recon to avoid double compute)
-        _, kl = base_elbo(recon, x_target, z_list, free_bits=self.free_bits)
+        # Last-layer raw KL to N(0,I) (no extra regularizers)
+        _z_last, mu_last, logvar_last = z_list[-1]
+        per_dim_kl_last = 0.5 * (logvar_last.exp() + mu_last.pow(2) - 1.0 - logvar_last)  # [1,1,D]
+        kl_last = per_dim_kl_last.sum(dim=-1).mean()  # scalar
         # collect last-layer latent sample (after optional flows) for MMD
         z_last = z_list[-1][0]  # [1,1,D]
         try:
@@ -750,7 +752,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         except Exception:
             pass
         z_flat = z_last.squeeze(1)  # [1,D]
-        return r_loss, kl, z_flat
+        return r_loss, kl_last, z_flat
 
     def forward(self, batch):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
@@ -810,14 +812,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         recon, kl, z_samples = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.abs(kl - cap)
+        # Lower-bound capacity objective: penalize only when below capacity
+        kl_objective = F.relu(cap - kl)
         # MMD regularizer (InfoVAE-style): match aggregated q(z) to p(z)
         mmd = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
         if self.mmd_weight > 0.0 and z_samples.numel() > 0:
             prior = torch.randn_like(z_samples)
             mmd = self._rbf_mmd(z_samples, prior)
         total = recon + beta * kl_objective + (self.mmd_weight * mmd)
-        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl": kl, "train_kl_obj": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd}, prog_bar=True)
+        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl_last": kl, "train_kl_obj_lb": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd}, prog_bar=True)
         self._step += 1
         return total
 
@@ -825,13 +828,13 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         recon, kl, z_samples = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.abs(kl - cap)
+        kl_objective = F.relu(cap - kl)
         mmd = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
         if self.mmd_weight > 0.0 and z_samples.numel() > 0:
             prior = torch.randn_like(z_samples)
             mmd = self._rbf_mmd(z_samples, prior)
         total = recon + beta * kl_objective + (self.mmd_weight * mmd)
-        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd}, prog_bar=True, on_epoch=True)
+        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl_last": kl, "val_kl_obj_lb": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd}, prog_bar=True, on_epoch=True)
         # Per-dim KL stats on clean inputs (no perturbations)
         try:
             kl_dim = self._compute_kl_dim_stats(batch)  # [D]

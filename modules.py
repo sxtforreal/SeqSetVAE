@@ -159,10 +159,8 @@ class SetVAEModule(nn.Module):
             nn.Linear(latent_dim, latent_dim * 2),
         )
         
-        self.out = nn.Sequential(
-            nn.Linear(latent_dim, out_output),
-            nn.Tanh()  # Add output activation function to limit output range
-        )
+        # Decoder output head (no tanh limit to preserve amplitude capacity)
+        self.out = nn.Linear(latent_dim, out_output)
 
         # Optional: simple planar flow stack for posterior transform
         # z_K = f_K \circ ... \circ f_1 (z_0)
@@ -241,7 +239,9 @@ class SetVAEModule(nn.Module):
         for l in range(self.levels - 1, -1, -1):
             # Add residual connection
             residual = current
-            layer_out = self.decoder_layers[l](current, target_n, noise_std=noise_std)
+            # Inject corresponding encoder layer latent sample to encourage usage across layers
+            inject_x = z_list[l][0] if l < len(z_list) else None
+            layer_out = self.decoder_layers[l](current, target_n, x=inject_x, noise_std=noise_std)
             current = layer_out + residual.expand_as(layer_out)
         recon = self.out(current)
         return recon
@@ -299,6 +299,7 @@ def recon_loss(
     beta=1.0,
     gamma=3.0,
     beta_var=0.1,
+    scale_calib_weight: float = 0.0,
     epsilon=1e-8,
 ):
     """
@@ -355,9 +356,15 @@ def recon_loss(
         -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
     )  # Mean over dims, tokens, batch
 
+    # Scale calibration to avoid degenerate shrinking or explosion of norms
+    mean_recon_norm = torch.mean(recon_norm + 1e-8)
+    mean_target_norm = torch.mean(target_norm + 1e-8)
+    scale_ratio = mean_recon_norm / (mean_target_norm + 1e-8)
+    scale_penalty = scale_calib_weight * (scale_ratio - 1.0) ** 2
+
     # Total loss
     total_loss = (
-        alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term
+        alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term + scale_penalty
     )
     return total_loss
 
