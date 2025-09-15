@@ -135,12 +135,21 @@ class SetVAEModule(nn.Module):
         m,
         use_flows: bool = False,
         num_flows: int = 0,
+        posterior_logvar_min: float = -2.5,
+        posterior_logvar_max: float = 2.5,
+        enable_posterior_std_augmentation: bool = False,
+        posterior_std_aug_sigma: float = 0.0,
     ):
         super().__init__()
         self.reduced_dim = reduced_dim
         self.levels = levels
         self.use_flows = bool(use_flows)
         self.num_flows = int(num_flows) if use_flows else 0
+        # Posterior stability controls
+        self.posterior_logvar_min = float(posterior_logvar_min)
+        self.posterior_logvar_max = float(posterior_logvar_max)
+        self.enable_posterior_std_augmentation = bool(enable_posterior_std_augmentation)
+        self.posterior_std_aug_sigma = float(posterior_std_aug_sigma)
         if reduced_dim is not None:
             self.dim_reducer = nn.Linear(input_dim, reduced_dim)
             embed_input = reduced_dim
@@ -214,14 +223,21 @@ class SetVAEModule(nn.Module):
             mu_logvar = self.mu_logvar(agg)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
 
-            # Clamp logvar range to prevent numerical instability
-            logvar = torch.clamp(logvar, min=-10, max=10)
+            # Clamp logvar range to prevent pathological variances
+            logvar = torch.clamp(
+                logvar,
+                min=self.posterior_logvar_min,
+                max=self.posterior_logvar_max,
+            )
             std = torch.exp(0.5 * logvar)
 
-            # Add noise to prevent overfitting
-            if self.training:
-                eps = torch.randn_like(std) * 0.1
-                std = std + eps.abs()
+            # Optional std augmentation for robustness (disabled by default)
+            if (
+                self.training
+                and self.enable_posterior_std_augmentation
+                and self.posterior_std_aug_sigma > 0.0
+            ):
+                std = std + self.posterior_std_aug_sigma * torch.randn_like(std).abs()
 
             dist = Normal(mu, std)
             z_sampled = dist.rsample()

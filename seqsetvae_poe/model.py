@@ -535,6 +535,12 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         use_kl_capacity: bool = True,
         capacity_per_dim_end: float = 0.10,
         capacity_warmup_steps: int = 30000,
+        # New: fairness & stability controls
+        kl_fairness_weight: float = 0.1,
+        kl_spread_tol: float = 1.0,
+        kl_over_weight: float = 1.0,
+        var_stability_weight: float = 0.01,
+        per_dim_free_bits: float = 0.002,
         # perturbation params
         p_stale: float = 0.1,
         p_live: float = 0.02,
@@ -551,6 +557,11 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         num_flows: int = 0,
         mmd_weight: float = 0.0,
         mmd_scales: tuple = (1.0, 2.0, 4.0, 8.0),
+        # Posterior stability in encoder
+        posterior_logvar_min: float = -2.5,
+        posterior_logvar_max: float = 2.5,
+        enable_posterior_std_augmentation: bool = False,
+        posterior_std_aug_sigma: float = 0.0,
         # Auto-tune and monitoring
         auto_tune_kl: bool = True,
         kl_target_nats: float = 10.0,
@@ -571,6 +582,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             m=m,
             use_flows=use_flows,
             num_flows=num_flows,
+            posterior_logvar_min=posterior_logvar_min,
+            posterior_logvar_max=posterior_logvar_max,
+            enable_posterior_std_augmentation=enable_posterior_std_augmentation,
+            posterior_std_aug_sigma=posterior_std_aug_sigma,
         )
 
         # Training hparams
@@ -582,6 +597,12 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self.free_bits = free_bits
         self.latent_dim = latent_dim
         self._step = 0
+        # Fairness & stability
+        self.kl_fairness_weight = float(kl_fairness_weight)
+        self.kl_spread_tol = float(kl_spread_tol)
+        self.kl_over_weight = float(kl_over_weight)
+        self.var_stability_weight = float(var_stability_weight)
+        self.per_dim_free_bits = float(per_dim_free_bits)
         # Capacity schedule
         self.use_kl_capacity = use_kl_capacity
         self.capacity_per_dim_end = capacity_per_dim_end
@@ -767,7 +788,12 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         # Last-layer raw KL to N(0,I) (no extra regularizers)
         _z_last, mu_last, logvar_last = z_list[-1]
         per_dim_kl_last = 0.5 * (logvar_last.exp() + mu_last.pow(2) - 1.0 - logvar_last)  # [1,1,D]
+        # Per-dim free bits clamp to avoid punishing low-use dimensions and preserve capacity per dim
+        if self.per_dim_free_bits is not None and self.per_dim_free_bits > 0.0:
+            per_dim_kl_last = torch.clamp(per_dim_kl_last, min=self.per_dim_free_bits)
         kl_last = per_dim_kl_last.sum(dim=-1).mean()  # scalar
+        # Variance stability: penalize posterior variance deviating from 1
+        var_dev_last = (logvar_last.exp() - 1.0).pow(2).mean()
         # collect last-layer latent sample (after optional flows) for MMD
         z_last = z_list[-1][0]  # [1,1,D]
         try:
@@ -776,7 +802,8 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         except Exception:
             pass
         z_flat = z_last.squeeze(1)  # [1,D]
-        return r_loss, kl_last, z_flat
+        # Return per-dim KL for fairness aggregation and var deviation
+        return r_loss, kl_last, z_flat, per_dim_kl_last.squeeze(0).squeeze(0), var_dev_last
 
     def forward(self, batch):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
@@ -785,19 +812,28 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
         total_recon, total_kl, count = 0.0, 0.0, 0
         zs = []
+        kl_dim_sum = None
+        var_dev_sum = 0.0
         for sets in all_sets:
             for s in sets:
-                recon, kl, z_flat = self._forward_single(s)
+                recon, kl, z_flat, kl_dim_vec, var_dev = self._forward_single(s)
                 total_recon += recon
                 total_kl += kl
                 zs.append(z_flat)
+                if kl_dim_sum is None:
+                    kl_dim_sum = kl_dim_vec
+                else:
+                    kl_dim_sum = kl_dim_sum + kl_dim_vec
+                var_dev_sum = var_dev_sum + var_dev
                 count += 1
         if count == 0:
             device = var.device
             zero = torch.tensor(0.0, device=device)
-            return zero, zero, torch.zeros(0, self.latent_dim, device=device)
+            return zero, zero, torch.zeros(0, self.latent_dim, device=device), torch.zeros(self.latent_dim, device=device), torch.tensor(0.0, device=device)
         z_samples = torch.cat(zs, dim=0) if len(zs) > 0 else torch.zeros(0, self.latent_dim, device=var.device)
-        return total_recon / count, total_kl / count, z_samples
+        kl_dim_mean = kl_dim_sum / float(max(1, count)) if kl_dim_sum is not None else torch.zeros(self.latent_dim, device=var.device)
+        var_dev_mean = var_dev_sum / float(max(1, count))
+        return total_recon / count, total_kl / count, z_samples, kl_dim_mean, var_dev_mean
 
     # --- InfoVAE / MMD ---
     @staticmethod
@@ -833,7 +869,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
 
     # training hooks
     def training_step(self, batch, batch_idx):
-        recon, kl, z_samples = self.forward(batch)
+        recon, kl, z_samples, kl_dim, var_dev = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         # Lower-bound capacity objective: penalize only when below capacity
@@ -843,13 +879,26 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         if self.mmd_weight > 0.0 and z_samples.numel() > 0:
             prior = torch.randn_like(z_samples)
             mmd = self._rbf_mmd(z_samples, prior)
-        total = recon + beta * kl_objective + (self.mmd_weight * mmd)
-        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl_last": kl, "train_kl_obj_lb": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd}, prog_bar=True)
+        # KL fairness: encourage high-entropy per-dimension KL allocation, limit over-concentration
+        fairness = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if kl_dim is not None and kl_dim.numel() > 0:
+            eps = 1e-8
+            D = float(self.latent_dim)
+            p = kl_dim / (kl_dim.sum() + eps)
+            uniform_log = math.log(1.0 / max(1.0, D))
+            kl_to_uniform = (p * (torch.log(p + eps) - uniform_log)).sum()
+            over = F.relu(p - (1.0 / D) * (1.0 + self.kl_spread_tol))
+            l2_over = (over ** 2).sum()
+            fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
+        # Variance stability penalty
+        var_pen = self.var_stability_weight * var_dev
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen
+        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl_last": kl, "train_kl_obj_lb": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd, "train_kl_fair": fairness, "train_var_pen": var_pen}, prog_bar=True)
         self._step += 1
         return total
 
     def validation_step(self, batch, batch_idx):
-        recon, kl, z_samples = self.forward(batch)
+        recon, kl, z_samples, kl_dim, var_dev = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         kl_objective = F.relu(cap - kl)
@@ -857,8 +906,20 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         if self.mmd_weight > 0.0 and z_samples.numel() > 0:
             prior = torch.randn_like(z_samples)
             mmd = self._rbf_mmd(z_samples, prior)
-        total = recon + beta * kl_objective + (self.mmd_weight * mmd)
-        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl_last": kl, "val_kl_obj_lb": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd}, prog_bar=True, on_epoch=True)
+        # KL fairness and variance penalties (eval-time)
+        fairness = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if kl_dim is not None and kl_dim.numel() > 0:
+            eps = 1e-8
+            D = float(self.latent_dim)
+            p = kl_dim / (kl_dim.sum() + eps)
+            uniform_log = math.log(1.0 / max(1.0, D))
+            kl_to_uniform = (p * (torch.log(p + eps) - uniform_log)).sum()
+            over = F.relu(p - (1.0 / D) * (1.0 + self.kl_spread_tol))
+            l2_over = (over ** 2).sum()
+            fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
+        var_pen = self.var_stability_weight * var_dev
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen
+        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl_last": kl, "val_kl_obj_lb": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd, "val_kl_fair": fairness, "val_var_pen": var_pen}, prog_bar=True, on_epoch=True)
         # accumulate kl for epoch-level auto-tune
         self._val_kl_sum += float(kl.detach().cpu().item())
         self._val_kl_count += 1

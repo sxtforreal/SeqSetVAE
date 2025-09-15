@@ -96,6 +96,17 @@ def main():
     parser.add_argument("--mmd_weight", type=float, default=0.0, help="Weight for InfoVAE MMD regularizer")
     parser.add_argument("--mmd_scales", type=float, nargs='*', default=[1.0, 2.0, 4.0, 8.0], help="RBF MMD kernel scales")
 
+    # KL fairness & stability controls
+    parser.add_argument("--kl_fairness_weight", type=float, default=0.1, help="Weight for KL fairness penalty (promote uniform per-dim KL)")
+    parser.add_argument("--kl_spread_tol", type=float, default=1.0, help="Tolerance for over-allocation relative to uniform share")
+    parser.add_argument("--kl_over_weight", type=float, default=1.0, help="Weight for over-allocation L2 term")
+    parser.add_argument("--var_stability_weight", type=float, default=0.01, help="Weight for posterior variance deviation penalty")
+    parser.add_argument("--per_dim_free_bits", type=float, default=0.002, help="Per-dimension free bits (nats)")
+    parser.add_argument("--posterior_logvar_min", type=float, default=-2.5, help="Clamp min for posterior log-variance")
+    parser.add_argument("--posterior_logvar_max", type=float, default=2.5, help="Clamp max for posterior log-variance")
+    parser.add_argument("--enable_posterior_std_augmentation", action="store_true", default=False)
+    parser.add_argument("--posterior_std_aug_sigma", type=float, default=0.0)
+
     # Auto-tune & monitoring
     parser.add_argument("--auto_tune_kl", action="store_true", default=True, help="Auto-increase capacity/beta if KL_last below target")
     parser.add_argument("--kl_target_nats", type=float, default=10.0)
@@ -215,6 +226,16 @@ def main():
         num_flows=int(args.num_flows),
         mmd_weight=float(args.mmd_weight),
         mmd_scales=tuple(args.mmd_scales) if isinstance(args.mmd_scales, list) else (args.mmd_scales,),
+        # Fairness & stability
+        kl_fairness_weight=float(args.kl_fairness_weight),
+        kl_spread_tol=float(args.kl_spread_tol),
+        kl_over_weight=float(args.kl_over_weight),
+        var_stability_weight=float(args.var_stability_weight),
+        per_dim_free_bits=float(args.per_dim_free_bits),
+        posterior_logvar_min=float(args.posterior_logvar_min),
+        posterior_logvar_max=float(args.posterior_logvar_max),
+        enable_posterior_std_augmentation=bool(args.enable_posterior_std_augmentation),
+        posterior_std_aug_sigma=float(args.posterior_std_aug_sigma),
         auto_tune_kl=bool(args.auto_tune_kl),
         kl_target_nats=float(args.kl_target_nats),
         kl_patience_epochs=int(args.kl_patience_epochs),
