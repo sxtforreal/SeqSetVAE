@@ -45,6 +45,8 @@ import json
 import csv
 import math
 import argparse
+import re
+import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
@@ -105,7 +107,33 @@ def _detect_ckpt_type(state: Dict[str, torch.Tensor], prefer: str = "auto") -> s
     return "setvae"
 
 
-def _build_model(ckpt_type: str, lr: float) -> torch.nn.Module:
+def _detect_ckpt_type(state: Dict[str, torch.Tensor], prefer: str = "auto") -> str:
+    if prefer in {"poe", "setvae"}:
+        return prefer
+    keys = list(state.keys())
+    has_transformer = any(k.startswith("transformer.") for k in keys)
+    has_prior_head = any(k.startswith("prior_head.") for k in keys)
+    if has_transformer or has_prior_head:
+        return "poe"
+    return "setvae"
+
+
+def _detect_num_flows_in_state(state: Dict[str, torch.Tensor]) -> int:
+    flow_indices = set()
+    for k in state.keys():
+        if ".flows." in k:
+            m = re.search(r"\.flows\.(\d+)\.", k)
+            if m:
+                try:
+                    flow_indices.add(int(m.group(1)))
+                except Exception:
+                    pass
+    if not flow_indices:
+        return 0
+    return max(flow_indices) + 1
+
+
+def _build_model(ckpt_type: str, lr: float, state: Optional[Dict[str, torch.Tensor]] = None) -> torch.nn.Module:
     if ckpt_type == "poe":
         model = PoESeqSetVAEPretrain(
             input_dim=getattr(cfg, "input_dim", 768),
@@ -130,6 +158,8 @@ def _build_model(ckpt_type: str, lr: float) -> torch.nn.Module:
             next_change_weight=0.3,
         )
     else:
+        num_flows = _detect_num_flows_in_state(state) if state is not None else 0
+        use_flows = num_flows > 0
         model = SetVAEOnlyPretrain(
             input_dim=getattr(cfg, "input_dim", 768),
             reduced_dim=getattr(cfg, "reduced_dim", 256),
@@ -153,6 +183,8 @@ def _build_model(ckpt_type: str, lr: float) -> torch.nn.Module:
             dir_noise_std=0.0,
             train_decoder_noise_std=0.0,
             eval_decoder_noise_std=0.0,
+            use_flows=use_flows,
+            num_flows=num_flows,
         )
     return model
 
@@ -869,7 +901,7 @@ def main():
     # Load checkpoint and instantiate model
     state = _load_state_dict(args.checkpoint)
     ckpt_type = _detect_ckpt_type(state, prefer=args.ckpt_type)
-    model = _build_model(ckpt_type, lr=getattr(cfg, "lr", 3e-4))
+    model = _build_model(ckpt_type, lr=getattr(cfg, "lr", 3e-4), state=state)
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"Loaded weights: missing={len(missing)}, unexpected={len(unexpected)}")
     model.eval()
@@ -1196,7 +1228,33 @@ def _detect_ckpt_type(state: Dict[str, torch.Tensor], prefer: str = "auto") -> s
     return "setvae"
 
 
-def _build_model(ckpt_type: str, lr: float) -> torch.nn.Module:
+def _detect_ckpt_type(state: Dict[str, torch.Tensor], prefer: str = "auto") -> str:
+    if prefer in {"poe", "setvae"}:
+        return prefer
+    keys = list(state.keys())
+    has_transformer = any(k.startswith("transformer.") for k in keys)
+    has_prior_head = any(k.startswith("prior_head.") for k in keys)
+    if has_transformer or has_prior_head:
+        return "poe"
+    return "setvae"
+
+
+def _detect_num_flows_in_state(state: Dict[str, torch.Tensor]) -> int:
+    flow_indices = set()
+    for k in state.keys():
+        if ".flows." in k:
+            m = re.search(r"\.flows\.(\d+)\.", k)
+            if m:
+                try:
+                    flow_indices.add(int(m.group(1)))
+                except Exception:
+                    pass
+    if not flow_indices:
+        return 0
+    return max(flow_indices) + 1
+
+
+def _build_model(ckpt_type: str, lr: float, state: Optional[Dict[str, torch.Tensor]] = None) -> torch.nn.Module:
     if ckpt_type == "poe":
         model = PoESeqSetVAEPretrain(
             input_dim=getattr(cfg, "input_dim", 768),
@@ -1221,6 +1279,8 @@ def _build_model(ckpt_type: str, lr: float) -> torch.nn.Module:
             next_change_weight=0.3,
         )
     else:
+        num_flows = _detect_num_flows_in_state(state) if state is not None else 0
+        use_flows = num_flows > 0
         model = SetVAEOnlyPretrain(
             input_dim=getattr(cfg, "input_dim", 768),
             reduced_dim=getattr(cfg, "reduced_dim", 256),
@@ -1244,6 +1304,8 @@ def _build_model(ckpt_type: str, lr: float) -> torch.nn.Module:
             dir_noise_std=0.0,
             train_decoder_noise_std=0.0,
             eval_decoder_noise_std=0.0,
+            use_flows=use_flows,
+            num_flows=num_flows,
         )
     return model
 
@@ -1645,7 +1707,7 @@ def main():
     # Load checkpoint and instantiate model
     state = _load_state_dict(args.checkpoint)
     ckpt_type = _detect_ckpt_type(state, prefer=args.ckpt_type)
-    model = _build_model(ckpt_type, lr=getattr(cfg, "lr", 3e-4))
+    model = _build_model(ckpt_type, lr=getattr(cfg, "lr", 3e-4), state=state)
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"Loaded weights: missing={len(missing)}, unexpected={len(unexpected)}")
     model.eval()
