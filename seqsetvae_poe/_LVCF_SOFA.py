@@ -99,7 +99,10 @@ def rebuild_strict_lvcf_for_sofa(
 
     # Unique sets, keep original ordering by set_index (stable with time)
     sets = (
-        df[["set_index", "time"]].drop_duplicates().sort_values(["set_index"]).to_numpy()
+        df[["set_index", "time"]]
+        .drop_duplicates()
+        .sort_values(["set_index"])
+        .to_numpy()
     )
 
     # Pre-compute variable -> embedding vector (take first seen row)
@@ -132,7 +135,11 @@ def rebuild_strict_lvcf_for_sofa(
     # Iterate sets chronologically; rebuild per variable
     vars_sorted = sorted(var2vec.keys())
     _total_iters = len(sets) * len(vars_sorted) if len(vars_sorted) > 0 else 0
-    _pb = tqdm(total=_total_iters, desc="rebuild", leave=False) if show_progress and _total_iters > 0 else None
+    _pb = (
+        tqdm(total=_total_iters, desc="rebuild", leave=False)
+        if show_progress and _total_iters > 0
+        else None
+    )
     for set_idx, t in sets:
         set_idx = int(set_idx)
         t = float(t)
@@ -153,23 +160,25 @@ def rebuild_strict_lvcf_for_sofa(
                 _pb.update(1)
     if _pb is not None:
         _pb.close()
-                last_time[v] = t_obs
-                last_val[v] = float(val)
-            elif v in last_time:
-                rows.append(
-                    {
-                        "variable": v,
-                        "value": float(last_val[v]),
-                        "time": t,
-                        "set_index": set_idx,
-                        "is_carry": 1.0,
-                    }
-                )
+        last_time[v] = t_obs
+        last_val[v] = float(val)
+    elif v in last_time:
+        rows.append(
+            {
+                "variable": v,
+                "value": float(last_val[v]),
+                "time": t,
+                "set_index": set_idx,
+                "is_carry": 1.0,
+            }
+        )
 
     out = pd.DataFrame(rows)
     if len(out) == 0:
         # No SOFA variables present for this patient; return empty with columns
-        out = pd.DataFrame(columns=["variable", "value", "time", "set_index", "is_carry"] + vcols)
+        out = pd.DataFrame(
+            columns=["variable", "value", "time", "set_index", "is_carry"] + vcols
+        )
         return out
 
     # Attach embeddings using var2vec (avoid fragmentation by adding all at once)
@@ -200,8 +209,12 @@ def rebuild_strict_lvcf_for_sofa(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input_dir", required=True, help="Directory containing prior LVCF outputs")
-    ap.add_argument("--output_dir", required=True, help="Directory to write post-processed outputs")
+    ap.add_argument(
+        "--input_dir", required=True, help="Directory containing prior LVCF outputs"
+    )
+    ap.add_argument(
+        "--output_dir", required=True, help="Directory to write post-processed outputs"
+    )
     ap.add_argument(
         "--sofa_vars",
         type=str,
@@ -209,8 +222,12 @@ def main():
         help="Optional: file path or comma-separated SOFA variable names; defaults to built-in",
     )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-    ap.add_argument("--smoke", action="store_true", help="Process a single sample from train")
-    ap.add_argument("--progress_inner", action="store_true", help="Show inner tqdm bars per file")
+    ap.add_argument(
+        "--smoke", action="store_true", help="Process a single sample from train"
+    )
+    ap.add_argument(
+        "--progress_inner", action="store_true", help="Show inner tqdm bars per file"
+    )
     args = ap.parse_args()
 
     sofa_vars = set(_parse_var_list(args.sofa_vars) or DEFAULT_SOFA_VARS)
@@ -223,7 +240,9 @@ def main():
 
     def _process(fp: str) -> pd.DataFrame:
         df = pd.read_parquet(fp, engine="pyarrow")
-        return rebuild_strict_lvcf_for_sofa(df, sofa_vars, show_progress=args.progress_inner)
+        return rebuild_strict_lvcf_for_sofa(
+            df, sofa_vars, show_progress=args.progress_inner
+        )
 
     if args.smoke:
         files = sorted(glob.glob(os.path.join(args.input_dir, "train", "*.parquet")))
@@ -258,4 +277,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
