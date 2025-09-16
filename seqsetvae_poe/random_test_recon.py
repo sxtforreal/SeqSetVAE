@@ -16,7 +16,8 @@ Notes:
   - Reconstruction uses the SetVAE encoder/decoder in reduced space if
     a dim reducer exists; mapping back to names is done via cosine NN
     against the set's normalized variable directions, with greedy 1-1 matching.
-  - Events carried from previous time (is_carry==1) are annotated as [mask].
+  - Events carried from previous time (is_carry==1) are annotated as [carry];
+    PT-style random-masked tokens are annotated as [mask].
 """
 
 import os
@@ -409,7 +410,7 @@ def main():
     pct_rand = (num_rand / max(1, len(event_names))) * 100.0
     rand_names = [n for n, m in zip(event_names, rand_mask_np.tolist()) if float(m) > 0.5]
     print((f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}") if num_carry > 0 else "#Carried:   0 (0.0%)")
-    print((f"#RandMask:  {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#RandMask:  0 (0.0%)")
+    print((f"#Mask:      {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#Mask:      0 (0.0%)")
     print("---------------------------------------------------------------")
     print("原始事件（名称 -> 去归一化前的原始数值）:")
     for name, val_norm, is_carry, is_rand in zip(event_names, val_np.tolist(), mask_np.tolist(), rand_mask_np.tolist()):
@@ -418,7 +419,7 @@ def main():
         if float(is_carry) > 0.5:
             tag_parts.append("carry")
         if float(is_rand) > 0.5:
-            tag_parts.append("rand")
+            tag_parts.append("mask")
         tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {val_orig:.6f}{tag}")
     print("---------------------------------------------------------------")
@@ -429,7 +430,7 @@ def main():
         if mask_by_name.get(name, 0.0) > 0.5:
             tag_parts.append("carry")
         if rand_by_name.get(name, 0.0) > 0.5:
-            tag_parts.append("rand")
+            tag_parts.append("mask")
         tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {pred_orig:.6f}{tag}  (cos={cos_sim:.3f})")
     print("===============================================================")
