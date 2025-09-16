@@ -16,13 +16,15 @@ Notes:
   - Reconstruction uses the SetVAE encoder/decoder in reduced space if
     a dim reducer exists; mapping back to names is done via cosine NN
     against the set's normalized variable directions, with greedy 1-1 matching.
-  - Events carried from previous time (is_carry==1) are annotated as [mask].
+  - Events carried from previous time (is_carry==1) are annotated as [carry];
+    PT-style random-masked tokens are annotated as [mask].
 """
 
 import os
 import sys
 import argparse
 import random
+import glob
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -144,6 +146,123 @@ def _encode_decode_set(encoder, var_reduced: torch.Tensor, values: torch.Tensor)
     return recon
 
 
+def _apply_pt_style_random_masks(
+    values: torch.Tensor,
+    carry_mask: torch.Tensor,
+    *,
+    p_stale: float,
+    p_live: float,
+    set_mae_ratio: float,
+    small_set_mask_prob: float,
+    small_set_threshold: int,
+    max_masks_per_set: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply PT-style masking used in SetVAE pretraining to a single set's values.
+    Returns (values_masked, rand_mask) where rand_mask indicates tokens masked by
+    random procedures (value dropout or Set-MAE), excluding carries.
+    - values: [1,N,1] float tensor
+    - carry_mask: [N] or [1,N] or [1,N,1] with 1 for carried tokens
+    """
+    device = values.device
+    val = values.clone()
+    # Normalize carry shape to [1,N,1]
+    if carry_mask.dim() == 1:
+        carry = carry_mask.view(1, -1, 1).to(device)
+    elif carry_mask.dim() == 2:
+        carry = carry_mask.unsqueeze(-1).to(device)
+    else:
+        carry = carry_mask.to(device)
+    # Value dropout
+    stale_mask = (torch.rand_like(val) < p_stale) & (carry > 0.5)
+    live_mask = (torch.rand_like(val) < p_live) & (carry <= 0.5)
+    rand_mask = stale_mask | live_mask
+    val = val.masked_fill(rand_mask, 0.0)
+    # Set-MAE token masking
+    N = val.size(1)
+    if N > 0:
+        if N <= small_set_threshold:
+            if torch.rand((), device=device) < small_set_mask_prob:
+                idx = torch.randint(0, N, (1,), device=device)
+                val[:, idx, :] = 0.0
+                rand_mask[:, idx, :] = True
+        else:
+            k = int(np.ceil(set_mae_ratio * float(N)))
+            k = max(0, min(k, max_masks_per_set))
+            if k > 0:
+                idx = torch.randperm(N, device=device)[:k]
+                val[:, idx, :] = 0.0
+                rand_mask[:, idx, :] = True
+        # Ensure at least one non-carry token remains unmasked if possible
+        non_carry = (carry <= 0.5).squeeze(-1)
+        if non_carry.any():
+            mask_zero = (val.abs() <= 1e-8).squeeze(-1)
+            if torch.all(mask_zero | (~non_carry)):
+                indices = torch.nonzero(non_carry, as_tuple=False).squeeze(-1)
+                pick = indices[torch.randint(0, len(indices), (1,), device=device)]
+                val[:, pick, :] = values[:, pick, :]
+                rand_mask[:, pick, :] = False
+    return val, rand_mask.squeeze(-1).squeeze(0).to(values.dtype)
+
+
+def _detect_key_column(df: pd.DataFrame) -> str:
+    for c in ["Key", "variable", "event", "name", "key"]:
+        if c in df.columns:
+            return c
+    return df.columns[0]
+
+
+def _load_global_vocab_embeddings(
+    data_dir: str,
+    event_emb_csv: Optional[str],
+) -> Tuple[List[str], np.ndarray]:
+    """
+    Build global vocabulary of events and their embedding vectors (v0..vD-1).
+    Priority:
+      1) If event_emb_csv is provided and exists: read from CSV (detect key col; pick numeric columns)
+      2) Else: scan dataset Parquets under data_dir/{train,valid,test}
+    Returns (names, vectors_np) with shape [G, D]
+    """
+    if event_emb_csv and os.path.isfile(event_emb_csv):
+        df = pd.read_csv(event_emb_csv)
+        key_col = _detect_key_column(df)
+        # numeric columns only
+        num_cols = [c for c in df.columns if c != key_col and pd.api.types.is_numeric_dtype(df[c])]
+        if len(num_cols) == 0:
+            raise ValueError("event_emb_csv has no numeric embedding columns")
+        # deterministic order
+        num_cols = sorted(num_cols, key=lambda x: (len(x), x))
+        names = df[key_col].astype(str).tolist()
+        vecs = df[num_cols].to_numpy(dtype=np.float32, copy=False)
+        return names, vecs
+
+    # Fallback: scan dataset
+    parts = ["train", "valid", "test"]
+    files: List[str] = []
+    for p in parts:
+        pattern = os.path.join(data_dir, p, "*.parquet")
+        files.extend(sorted(glob.glob(pattern)))
+    if len(files) == 0:
+        raise FileNotFoundError(f"No parquet files under {data_dir}/(train|valid|test)")
+    # detect vcols from first file
+    sample = pd.read_parquet(files[0], engine="pyarrow")
+    vcols = _detect_vcols(sample)
+    keep_cols = ["variable"] + vcols
+    # accumulate last seen vector per variable
+    last: Dict[str, np.ndarray] = {}
+    for fp in files:
+        dfp = pd.read_parquet(fp, columns=keep_cols, engine="pyarrow")
+        # drop duplicates keep last to reduce memory
+        dfp = dfp.drop_duplicates(subset=["variable"], keep="last")
+        names = dfp["variable"].astype(str).tolist()
+        arr = dfp[vcols].to_numpy(dtype=np.float32, copy=False)
+        for n, v in zip(names, arr):
+            last[n] = v
+    names_all = sorted(last.keys())
+    vecs_all = np.stack([last[n] for n in names_all], axis=0).astype(np.float32, copy=False)
+    return names_all, vecs_all
+
+
 def _greedy_match_recon_to_vars(
     recon: np.ndarray,
     var_dirs: np.ndarray,
@@ -197,6 +316,8 @@ def main():
     ap.add_argument("--patient_index", type=int, default=None)
     ap.add_argument("--set_index", type=int, default=None)
     ap.add_argument("--stats_csv", type=str, default=getattr(cfg, "params_map_path", ""))
+    ap.add_argument("--event_emb_csv", type=str, default="", help="CSV with full vocabulary embeddings; if empty, scan data_dir")
+    ap.add_argument("--match_scope", type=str, choices=["set", "global"], default="global", help="Use only events in the set or global vocabulary for matching")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -296,19 +417,59 @@ def main():
     else:
         var_red = var_t
 
-    # Encode-decode
-    recon_t = _encode_decode_set(encoder, var_red, val_t)               # [1,N,R]
+    # Apply PT-style random masking in addition to carries (for visualization parity)
+    # Pull PT hyperparameters from model where available, with safe defaults
+    p_stale = float(getattr(model, "p_stale", getattr(model, "stale_dropout_p", 0.1)))
+    p_live = float(getattr(model, "p_live", 0.02))
+    set_mae_ratio = float(getattr(model, "set_mae_ratio", 0.02))
+    small_set_mask_prob = float(getattr(model, "small_set_mask_prob", 0.1))
+    small_set_threshold = int(getattr(model, "small_set_threshold", 5))
+    max_masks_per_set = int(getattr(model, "max_masks_per_set", 2))
+
+    val_masked_t, rand_mask_t = _apply_pt_style_random_masks(
+        val_t,
+        torch.from_numpy(mask_np).to(device),
+        p_stale=p_stale,
+        p_live=p_live,
+        set_mae_ratio=set_mae_ratio,
+        small_set_mask_prob=small_set_mask_prob,
+        small_set_threshold=small_set_threshold,
+        max_masks_per_set=max_masks_per_set,
+    )
+
+    # Encode-decode using masked values
+    recon_t = _encode_decode_set(encoder, var_red, val_masked_t)        # [1,N,R]
 
     # Map recon to concrete event names + predicted values
     with torch.no_grad():
         var_dirs = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
-    var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()            # [N,R]
     recon_np = recon_t.squeeze(0).detach().cpu().numpy()                # [N,R]
-    event_names: List[str] = df_set["variable"].astype(str).tolist()
-    # Build name -> mask map (1 for carried, 0 for observed). If duplicates, keep max (mask if any).
+
+    # Build matching candidates per scope
+    if args.match_scope == "global":
+        # Load global vocab embeddings and reduce/normalize
+        vocab_names, vocab_vecs = _load_global_vocab_embeddings(args.data_dir, args.event_emb_csv)
+        vocab_t = torch.from_numpy(vocab_vecs).unsqueeze(0).to(device)  # [1,G,D]
+        if getattr(encoder, "dim_reducer", None) is not None:
+            vocab_red = encoder.dim_reducer(vocab_t)
+        else:
+            vocab_red = vocab_t
+        vocab_dirs = vocab_red / (torch.norm(vocab_red, p=2, dim=-1, keepdim=True) + 1e-8)
+        var_dirs_np = vocab_dirs.squeeze(0).detach().cpu().numpy()      # [G,R]
+        event_names: List[str] = [str(n) for n in vocab_names]
+    else:
+        var_dirs_np = (var_dirs.squeeze(0).detach().cpu().numpy())      # [N,R]
+        event_names: List[str] = df_set["variable"].astype(str).tolist()
+
+    # Carry / random mask maps only for set tokens (used for printing tags). For global scope, tags only apply to those names appearing in the set.
+    set_event_names: List[str] = df_set["variable"].astype(str).tolist()
     mask_by_name: Dict[str, float] = {}
-    for name, m in zip(event_names, mask_np.tolist()):
+    for name, m in zip(set_event_names, mask_np.tolist()):
         mask_by_name[name] = max(mask_by_name.get(name, 0.0), float(m))
+    rand_mask_np = rand_mask_t.detach().cpu().numpy().astype(np.float32)
+    rand_by_name: Dict[str, float] = {}
+    for name, m in zip(set_event_names, rand_mask_np.tolist()):
+        rand_by_name[name] = max(rand_by_name.get(name, 0.0), float(m))
 
     assignments = _greedy_match_recon_to_vars(recon_np, var_dirs_np, event_names)
 
@@ -316,18 +477,37 @@ def main():
     print("================ Random Test Set Reconstruction ================")
     print(f"Patient ID: {patient_id}")
     print(f"Set index:  {chosen_set}")
-    print(f"#Events:    {len(event_names)}")
+    print(f"#Events:    {len(set_event_names)} (match scope: {args.match_scope}, vocab={len(event_names)})")
+    # Carry-over and random-mask summaries
+    num_carry = int((mask_np > 0.5).sum())
+    pct_carry = (num_carry / max(1, len(event_names))) * 100.0
+    carried_names = [n for n, m in zip(set_event_names, mask_np.tolist()) if float(m) > 0.5]
+    num_rand = int((rand_mask_np > 0.5).sum())
+    pct_rand = (num_rand / max(1, len(event_names))) * 100.0
+    rand_names = [n for n, m in zip(set_event_names, rand_mask_np.tolist()) if float(m) > 0.5]
+    print((f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}") if num_carry > 0 else "#Carried:   0 (0.0%)")
+    print((f"#Mask:      {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#Mask:      0 (0.0%)")
     print("---------------------------------------------------------------")
     print("原始事件（名称 -> 去归一化前的原始数值）:")
-    for name, val_norm, is_mask in zip(event_names, val_np.tolist(), mask_np.tolist()):
+    for name, val_norm, is_carry, is_rand in zip(set_event_names, val_np.tolist(), mask_np.tolist(), rand_mask_np.tolist()):
         val_orig = _denorm_value(name, float(val_norm))
-        tag = " [mask]" if float(is_mask) > 0.5 else ""
+        tag_parts = []
+        if float(is_carry) > 0.5:
+            tag_parts.append("carry")
+        if float(is_rand) > 0.5:
+            tag_parts.append("mask")
+        tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {val_orig:.6f}{tag}")
     print("---------------------------------------------------------------")
     print("重构结果（匹配到的事件名 -> 去归一化后的预测数值，余弦相似度）:")
     for (name, pred_val_norm, cos_sim) in assignments:
         pred_orig = _denorm_value(name, float(pred_val_norm))
-        tag = " [mask]" if mask_by_name.get(name, 0.0) > 0.5 else ""
+        tag_parts = []
+        if mask_by_name.get(name, 0.0) > 0.5:
+            tag_parts.append("carry")
+        if rand_by_name.get(name, 0.0) > 0.5:
+            tag_parts.append("mask")
+        tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {pred_orig:.6f}{tag}  (cos={cos_sim:.3f})")
     print("===============================================================")
 
