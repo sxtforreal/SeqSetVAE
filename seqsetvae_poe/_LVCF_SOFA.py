@@ -160,9 +160,12 @@ def rebuild_strict_lvcf_for_sofa(
         out = pd.DataFrame(columns=["variable", "value", "time", "set_index", "is_carry"] + vcols)
         return out
 
-    # Attach embeddings using var2vec
-    for c in vcols:
-        out[c] = 0.0
+    # Attach embeddings using var2vec (avoid fragmentation by adding all at once)
+    zeros_emb = pd.DataFrame(
+        np.zeros((len(out), len(vcols)), dtype=np.float32), columns=vcols
+    )
+    out = pd.concat([out.reset_index(drop=True), zeros_emb], axis=1)
+
     # Fill per variable
     for v, vec in var2vec.items():
         mask = out["variable"] == v
