@@ -7,10 +7,11 @@ Usage:
   python -u seqsetvae_poe/random_test_recon.py \
     --checkpoint /path/to/setvae_PT.ckpt \
     --data_dir /path/to/SeqSetVAE \
-    [--device auto|cpu|cuda] [--seed 42] [--ckpt_type auto|setvae|poe]
+    [--device auto|cpu|cuda] [--seed 42] [--ckpt_type auto|setvae|poe] \
+    [--stats_csv /path/to/stats.csv]
 
 Notes:
-  - Values printed are normalized (as stored in the LVCF parquet `value`).
+  - Values printed are de-normalized to original units using the stats CSV.
   - Event names come from the `variable` column of the chosen set.
   - Reconstruction uses the SetVAE encoder/decoder in reduced space if
     a dim reducer exists; mapping back to names is done via cosine NN
@@ -25,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import pandas as pd
 
 # Ensure local imports work even if launched from project root
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -193,6 +195,7 @@ def main():
     ap.add_argument("--ckpt_type", type=str, choices=["auto", "setvae", "poe"], default="auto")
     ap.add_argument("--patient_index", type=int, default=None)
     ap.add_argument("--set_index", type=int, default=None)
+    ap.add_argument("--stats_csv", type=str, default=getattr(cfg, "params_map_path", ""))
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -219,6 +222,42 @@ def main():
     if encoder is None:
         raise RuntimeError("Model does not expose a SetVAE encoder")
     encoder = encoder  # alias
+
+    # Load stats for de-normalization (variable -> mean/std)
+    stats_map: Dict[str, Tuple[float, float]] = {}
+    if args.stats_csv and os.path.exists(args.stats_csv):
+        try:
+            stats_df = pd.read_csv(args.stats_csv)
+            # Detect key column
+            key_col = None
+            for c in ["Key", "variable", "event", "name", "key"]:
+                if c in stats_df.columns:
+                    key_col = c
+                    break
+            if key_col is None:
+                key_col = stats_df.columns[0]
+            # Normalize mean/std column names
+            rename = {}
+            for c in stats_df.columns:
+                lc = c.lower()
+                if lc == "mean":
+                    rename[c] = "mean"
+                if lc in ("std", "stdev", "stddev"):
+                    rename[c] = "std"
+            stats_df = stats_df.rename(columns=rename)
+            if "mean" in stats_df.columns and "std" in stats_df.columns:
+                for _, r in stats_df.iterrows():
+                    v = str(r[key_col])
+                    m = float(r["mean"]) if pd.notna(r["mean"]) else 0.0
+                    s_raw = float(r["std"]) if pd.notna(r["std"]) else 1.0
+                    s = s_raw if abs(s_raw) > 1e-12 else 1.0
+                    stats_map[v] = (m, s)
+        except Exception as e:
+            print(f"[WARN] Failed to load stats_csv '{args.stats_csv}': {e}")
+
+    def _denorm_value(var_name: str, val_norm: float) -> float:
+        m, s = stats_map.get(var_name, (0.0, 1.0))
+        return val_norm * s + m
 
     # Dataset: pick one patient + one set from test
     ds = PatientDataset("test", saved_dir=args.data_dir)
@@ -273,13 +312,15 @@ def main():
     print(f"Set index:  {chosen_set}")
     print(f"#Events:    {len(event_names)}")
     print("---------------------------------------------------------------")
-    print("Original events (name -> value, normalized):")
-    for name, val in zip(event_names, val_np.tolist()):
-        print(f"  - {name}: {float(val):.6f}")
+    print("原始事件（名称 -> 去归一化前的原始数值）:")
+    for name, val_norm in zip(event_names, val_np.tolist()):
+        val_orig = _denorm_value(name, float(val_norm))
+        print(f"  - {name}: {val_orig:.6f}")
     print("---------------------------------------------------------------")
-    print("Reconstructed (matched name -> predicted value, cos):")
-    for (name, pred_val, cos_sim) in assignments:
-        print(f"  - {name}: {pred_val:.6f}  (cos={cos_sim:.3f})")
+    print("重构结果（匹配到的事件名 -> 去归一化后的预测数值，余弦相似度）:")
+    for (name, pred_val_norm, cos_sim) in assignments:
+        pred_orig = _denorm_value(name, float(pred_val_norm))
+        print(f"  - {name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
     print("===============================================================")
 
 
