@@ -488,7 +488,7 @@ def main():
     print((f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}") if num_carry > 0 else "#Carried:   0 (0.0%)")
     print((f"#Mask:      {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#Mask:      0 (0.0%)")
     print("---------------------------------------------------------------")
-    print("原始事件（名称 -> 去归一化前的原始数值）:")
+    print("Original events (name -> de-normalized original value):")
     for name, val_norm, is_carry, is_rand in zip(set_event_names, val_np.tolist(), mask_np.tolist(), rand_mask_np.tolist()):
         val_orig = _denorm_value(name, float(val_norm))
         tag_parts = []
@@ -499,16 +499,27 @@ def main():
         tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {val_orig:.6f}{tag}")
     print("---------------------------------------------------------------")
-    print("重构结果（匹配到的事件名 -> 去归一化后的预测数值，余弦相似度）:")
-    for (name, pred_val_norm, cos_sim) in assignments:
-        pred_orig = _denorm_value(name, float(pred_val_norm))
-        tag_parts = []
-        if mask_by_name.get(name, 0.0) > 0.5:
-            tag_parts.append("carry")
-        if rand_by_name.get(name, 0.0) > 0.5:
-            tag_parts.append("mask")
-        tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
-        print(f"  - {name}: {pred_orig:.6f}{tag}  (cos={cos_sim:.3f})")
+    print("Reconstruction (source input event -> matched event: de-normalized predicted value, cosine similarity):")
+    for i, (matched_name, pred_val_norm, cos_sim) in enumerate(assignments):
+        # Source input event name (same position as this reconstructed vector)
+        src_name = set_event_names[i]
+        # De-normalize predicted value for readability
+        pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+        # Source event tags (carry/mask from the input event itself)
+        src_tag_parts = []
+        if float(mask_np[i]) > 0.5:
+            src_tag_parts.append("carry")
+        if float(rand_mask_np[i]) > 0.5:
+            src_tag_parts.append("mask")
+        src_tag = (" [" + ",".join(src_tag_parts) + "]") if src_tag_parts else ""
+        # Target event tags (only shown if matched event appears in the input set)
+        dst_tag_parts = []
+        if mask_by_name.get(matched_name, 0.0) > 0.5:
+            dst_tag_parts.append("carry")
+        if rand_by_name.get(matched_name, 0.0) > 0.5:
+            dst_tag_parts.append("mask")
+        dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
+        print(f"  - {src_name}{src_tag} -> {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
     print("===============================================================")
 
 
