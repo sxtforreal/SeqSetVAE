@@ -488,7 +488,7 @@ def main():
     print((f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}") if num_carry > 0 else "#Carried:   0 (0.0%)")
     print((f"#Mask:      {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#Mask:      0 (0.0%)")
     print("---------------------------------------------------------------")
-    print("原始事件（名称 -> 去归一化前的原始数值）:")
+    print("Original events (name -> de-normalized original value):")
     for name, val_norm, is_carry, is_rand in zip(set_event_names, val_np.tolist(), mask_np.tolist(), rand_mask_np.tolist()):
         val_orig = _denorm_value(name, float(val_norm))
         tag_parts = []
@@ -499,20 +499,20 @@ def main():
         tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {val_orig:.6f}{tag}")
     print("---------------------------------------------------------------")
-    print("重构结果（源输入事件 -> 匹配到的事件名: 去归一化后的预测数值，余弦相似度）:")
+    print("Reconstruction (source input event -> matched event: de-normalized predicted value, cosine similarity):")
     for i, (matched_name, pred_val_norm, cos_sim) in enumerate(assignments):
-        # 源输入事件名称（与该重构向量同位置的原始事件）
+        # Source input event name (same position as this reconstructed vector)
         src_name = set_event_names[i]
-        # 去归一化预测值以便可读
+        # De-normalize predicted value for readability
         pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-        # 源事件标签（carry/mask 来自该输入事件本身）
+        # Source event tags (carry/mask from the input event itself)
         src_tag_parts = []
         if float(mask_np[i]) > 0.5:
             src_tag_parts.append("carry")
         if float(rand_mask_np[i]) > 0.5:
             src_tag_parts.append("mask")
         src_tag = (" [" + ",".join(src_tag_parts) + "]") if src_tag_parts else ""
-        # 目标事件标签（当匹配到的事件也在输入集合中时，显示其标签）
+        # Target event tags (only shown if matched event appears in the input set)
         dst_tag_parts = []
         if mask_by_name.get(matched_name, 0.0) > 0.5:
             dst_tag_parts.append("carry")
