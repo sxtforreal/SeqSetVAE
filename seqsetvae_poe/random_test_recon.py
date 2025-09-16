@@ -144,6 +144,65 @@ def _encode_decode_set(encoder, var_reduced: torch.Tensor, values: torch.Tensor)
     return recon
 
 
+def _apply_pt_style_random_masks(
+    values: torch.Tensor,
+    carry_mask: torch.Tensor,
+    *,
+    p_stale: float,
+    p_live: float,
+    set_mae_ratio: float,
+    small_set_mask_prob: float,
+    small_set_threshold: int,
+    max_masks_per_set: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply PT-style masking used in SetVAE pretraining to a single set's values.
+    Returns (values_masked, rand_mask) where rand_mask indicates tokens masked by
+    random procedures (value dropout or Set-MAE), excluding carries.
+    - values: [1,N,1] float tensor
+    - carry_mask: [N] or [1,N] or [1,N,1] with 1 for carried tokens
+    """
+    device = values.device
+    val = values.clone()
+    # Normalize carry shape to [1,N,1]
+    if carry_mask.dim() == 1:
+        carry = carry_mask.view(1, -1, 1).to(device)
+    elif carry_mask.dim() == 2:
+        carry = carry_mask.unsqueeze(-1).to(device)
+    else:
+        carry = carry_mask.to(device)
+    # Value dropout
+    stale_mask = (torch.rand_like(val) < p_stale) & (carry > 0.5)
+    live_mask = (torch.rand_like(val) < p_live) & (carry <= 0.5)
+    rand_mask = stale_mask | live_mask
+    val = val.masked_fill(rand_mask, 0.0)
+    # Set-MAE token masking
+    N = val.size(1)
+    if N > 0:
+        if N <= small_set_threshold:
+            if torch.rand((), device=device) < small_set_mask_prob:
+                idx = torch.randint(0, N, (1,), device=device)
+                val[:, idx, :] = 0.0
+                rand_mask[:, idx, :] = True
+        else:
+            k = int(np.ceil(set_mae_ratio * float(N)))
+            k = max(0, min(k, max_masks_per_set))
+            if k > 0:
+                idx = torch.randperm(N, device=device)[:k]
+                val[:, idx, :] = 0.0
+                rand_mask[:, idx, :] = True
+        # Ensure at least one non-carry token remains unmasked if possible
+        non_carry = (carry <= 0.5).squeeze(-1)
+        if non_carry.any():
+            mask_zero = (val.abs() <= 1e-8).squeeze(-1)
+            if torch.all(mask_zero | (~non_carry)):
+                indices = torch.nonzero(non_carry, as_tuple=False).squeeze(-1)
+                pick = indices[torch.randint(0, len(indices), (1,), device=device)]
+                val[:, pick, :] = values[:, pick, :]
+                rand_mask[:, pick, :] = False
+    return val, rand_mask.squeeze(-1).squeeze(0).to(values.dtype)
+
+
 def _greedy_match_recon_to_vars(
     recon: np.ndarray,
     var_dirs: np.ndarray,
@@ -296,8 +355,28 @@ def main():
     else:
         var_red = var_t
 
-    # Encode-decode
-    recon_t = _encode_decode_set(encoder, var_red, val_t)               # [1,N,R]
+    # Apply PT-style random masking in addition to carries (for visualization parity)
+    # Pull PT hyperparameters from model where available, with safe defaults
+    p_stale = float(getattr(model, "p_stale", getattr(model, "stale_dropout_p", 0.1)))
+    p_live = float(getattr(model, "p_live", 0.02))
+    set_mae_ratio = float(getattr(model, "set_mae_ratio", 0.02))
+    small_set_mask_prob = float(getattr(model, "small_set_mask_prob", 0.1))
+    small_set_threshold = int(getattr(model, "small_set_threshold", 5))
+    max_masks_per_set = int(getattr(model, "max_masks_per_set", 2))
+
+    val_masked_t, rand_mask_t = _apply_pt_style_random_masks(
+        val_t,
+        torch.from_numpy(mask_np).to(device),
+        p_stale=p_stale,
+        p_live=p_live,
+        set_mae_ratio=set_mae_ratio,
+        small_set_mask_prob=small_set_mask_prob,
+        small_set_threshold=small_set_threshold,
+        max_masks_per_set=max_masks_per_set,
+    )
+
+    # Encode-decode using masked values
+    recon_t = _encode_decode_set(encoder, var_red, val_masked_t)        # [1,N,R]
 
     # Map recon to concrete event names + predicted values
     with torch.no_grad():
@@ -309,6 +388,11 @@ def main():
     mask_by_name: Dict[str, float] = {}
     for name, m in zip(event_names, mask_np.tolist()):
         mask_by_name[name] = max(mask_by_name.get(name, 0.0), float(m))
+    # Build name -> random mask map
+    rand_mask_np = rand_mask_t.detach().cpu().numpy().astype(np.float32)
+    rand_by_name: Dict[str, float] = {}
+    for name, m in zip(event_names, rand_mask_np.tolist()):
+        rand_by_name[name] = max(rand_by_name.get(name, 0.0), float(m))
 
     assignments = _greedy_match_recon_to_vars(recon_np, var_dirs_np, event_names)
 
@@ -317,25 +401,36 @@ def main():
     print(f"Patient ID: {patient_id}")
     print(f"Set index:  {chosen_set}")
     print(f"#Events:    {len(event_names)}")
-    # Carry-over (mask) summary
+    # Carry-over and random-mask summaries
     num_carry = int((mask_np > 0.5).sum())
     pct_carry = (num_carry / max(1, len(event_names))) * 100.0
     carried_names = [n for n, m in zip(event_names, mask_np.tolist()) if float(m) > 0.5]
-    if num_carry > 0:
-        print(f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}")
-    else:
-        print("#Carried:   0 (0.0%)")
+    num_rand = int((rand_mask_np > 0.5).sum())
+    pct_rand = (num_rand / max(1, len(event_names))) * 100.0
+    rand_names = [n for n, m in zip(event_names, rand_mask_np.tolist()) if float(m) > 0.5]
+    print((f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}") if num_carry > 0 else "#Carried:   0 (0.0%)")
+    print((f"#RandMask:  {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#RandMask:  0 (0.0%)")
     print("---------------------------------------------------------------")
     print("原始事件（名称 -> 去归一化前的原始数值）:")
-    for name, val_norm, is_mask in zip(event_names, val_np.tolist(), mask_np.tolist()):
+    for name, val_norm, is_carry, is_rand in zip(event_names, val_np.tolist(), mask_np.tolist(), rand_mask_np.tolist()):
         val_orig = _denorm_value(name, float(val_norm))
-        tag = " [mask]" if float(is_mask) > 0.5 else ""
+        tag_parts = []
+        if float(is_carry) > 0.5:
+            tag_parts.append("carry")
+        if float(is_rand) > 0.5:
+            tag_parts.append("rand")
+        tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {val_orig:.6f}{tag}")
     print("---------------------------------------------------------------")
     print("重构结果（匹配到的事件名 -> 去归一化后的预测数值，余弦相似度）:")
     for (name, pred_val_norm, cos_sim) in assignments:
         pred_orig = _denorm_value(name, float(pred_val_norm))
-        tag = " [mask]" if mask_by_name.get(name, 0.0) > 0.5 else ""
+        tag_parts = []
+        if mask_by_name.get(name, 0.0) > 0.5:
+            tag_parts.append("carry")
+        if rand_by_name.get(name, 0.0) > 0.5:
+            tag_parts.append("rand")
+        tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {pred_orig:.6f}{tag}  (cos={cos_sim:.3f})")
     print("===============================================================")
 
