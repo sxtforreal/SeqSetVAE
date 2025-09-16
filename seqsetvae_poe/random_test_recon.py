@@ -8,7 +8,7 @@ Usage:
     --checkpoint /path/to/setvae_PT.ckpt \
     --data_dir /path/to/SeqSetVAE \
     [--device auto|cpu|cuda] [--seed 42] [--ckpt_type auto|setvae|poe] \
-    [--stats_csv /path/to/stats.csv]
+    [--stats_csv /path/to/stats.csv] [--num_samples 10]
 
 Notes:
   - Values printed are de-normalized to original units using the stats CSV.
@@ -318,6 +318,7 @@ def main():
     ap.add_argument("--stats_csv", type=str, default=getattr(cfg, "params_map_path", ""))
     ap.add_argument("--event_emb_csv", type=str, default="", help="CSV with full vocabulary embeddings; if empty, scan data_dir")
     ap.add_argument("--match_scope", type=str, choices=["set", "global"], default="global", help="Use only events in the set or global vocabulary for matching")
+    ap.add_argument("--num_samples", type=int, default=10, help="How many random sets to sample when indices are not fixed")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -381,146 +382,180 @@ def main():
         m, s = stats_map.get(var_name, (0.0, 1.0))
         return val_norm * s + m
 
-    # Dataset: pick one patient + one set from test
-    ds = PatientDataset("test", saved_dir=args.data_dir)
-    if args.patient_index is None:
-        pidx = random.randrange(len(ds))
-    else:
-        if args.patient_index < 0 or args.patient_index >= len(ds):
-            raise IndexError(f"patient_index out of range [0,{len(ds)-1}]")
-        pidx = args.patient_index
-    df, patient_id = ds[pidx]
-
-    vcols = _detect_vcols(df)
-    set_ids = df["set_index"].to_numpy()
-    uniq_sets = sorted(set(int(s) for s in set_ids.tolist()))
-    if not uniq_sets:
-        raise RuntimeError("Selected patient has no sets")
-    if args.set_index is None:
-        chosen_set = random.choice(uniq_sets)
-    else:
-        if int(args.set_index) not in uniq_sets:
-            raise ValueError(f"set_index {args.set_index} not found in patient {patient_id}")
-        chosen_set = int(args.set_index)
-    df_set = df[df["set_index"] == chosen_set].reset_index(drop=True)
-
-    # Build tensors for this set
-    var_np = df_set[vcols].to_numpy(dtype=np.float32, copy=False)
-    val_np = df_set["value"].to_numpy(dtype=np.float32)
-    mask_np = df_set["is_carry"].to_numpy(dtype=np.float32) if "is_carry" in df_set.columns else np.zeros_like(val_np)
-    var_t = torch.from_numpy(var_np).unsqueeze(0).to(device)           # [1,N,D]
-    val_t = torch.from_numpy(val_np).view(1, -1, 1).to(device)         # [1,N,1]
-
-    # Reduce variable vectors if reducer exists
-    if getattr(encoder, "dim_reducer", None) is not None:
-        var_red = encoder.dim_reducer(var_t)
-    else:
-        var_red = var_t
-
-    # Apply PT-style random masking in addition to carries (for visualization parity)
-    # Pull PT hyperparameters from model where available, with safe defaults
-    p_stale = float(getattr(model, "p_stale", getattr(model, "stale_dropout_p", 0.1)))
-    p_live = float(getattr(model, "p_live", 0.02))
-    set_mae_ratio = float(getattr(model, "set_mae_ratio", 0.02))
-    small_set_mask_prob = float(getattr(model, "small_set_mask_prob", 0.1))
-    small_set_threshold = int(getattr(model, "small_set_threshold", 5))
-    max_masks_per_set = int(getattr(model, "max_masks_per_set", 2))
-
-    val_masked_t, rand_mask_t = _apply_pt_style_random_masks(
-        val_t,
-        torch.from_numpy(mask_np).to(device),
-        p_stale=p_stale,
-        p_live=p_live,
-        set_mae_ratio=set_mae_ratio,
-        small_set_mask_prob=small_set_mask_prob,
-        small_set_threshold=small_set_threshold,
-        max_masks_per_set=max_masks_per_set,
-    )
-
-    # Encode-decode using masked values
-    recon_t = _encode_decode_set(encoder, var_red, val_masked_t)        # [1,N,R]
-
-    # Map recon to concrete event names + predicted values
-    with torch.no_grad():
-        var_dirs = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
-    recon_np = recon_t.squeeze(0).detach().cpu().numpy()                # [N,R]
-
-    # Build matching candidates per scope
+    # Pre-load global vocabulary (if needed) so we do it once for many samples
+    vocab_event_names: Optional[List[str]] = None
+    vocab_dirs_np: Optional[np.ndarray] = None
     if args.match_scope == "global":
-        # Load global vocab embeddings and reduce/normalize
         vocab_names, vocab_vecs = _load_global_vocab_embeddings(args.data_dir, args.event_emb_csv)
-        vocab_t = torch.from_numpy(vocab_vecs).unsqueeze(0).to(device)  # [1,G,D]
+        vocab_t = torch.from_numpy(vocab_vecs).unsqueeze(0).to(device)
         if getattr(encoder, "dim_reducer", None) is not None:
             vocab_red = encoder.dim_reducer(vocab_t)
         else:
             vocab_red = vocab_t
         vocab_dirs = vocab_red / (torch.norm(vocab_red, p=2, dim=-1, keepdim=True) + 1e-8)
-        var_dirs_np = vocab_dirs.squeeze(0).detach().cpu().numpy()      # [G,R]
-        event_names: List[str] = [str(n) for n in vocab_names]
+        vocab_dirs_np = vocab_dirs.squeeze(0).detach().cpu().numpy()
+        vocab_event_names = [str(n) for n in vocab_names]
+
+    # Dataset
+    ds = PatientDataset("test", saved_dir=args.data_dir)
+
+    def _process_one_set(df_set: pd.DataFrame, patient_id, chosen_set, sample_idx: Optional[int], total_samples: Optional[int]):
+        vcols_local = _detect_vcols(df_set)
+        # Build tensors for this set
+        var_np = df_set[vcols_local].to_numpy(dtype=np.float32, copy=False)
+        val_np = df_set["value"].to_numpy(dtype=np.float32)
+        mask_np = df_set["is_carry"].to_numpy(dtype=np.float32) if "is_carry" in df_set.columns else np.zeros_like(val_np)
+        var_t = torch.from_numpy(var_np).unsqueeze(0).to(device)
+        val_t = torch.from_numpy(val_np).view(1, -1, 1).to(device)
+
+        # Reduce variable vectors if reducer exists
+        if getattr(encoder, "dim_reducer", None) is not None:
+            var_red = encoder.dim_reducer(var_t)
+        else:
+            var_red = var_t
+
+        # Apply PT-style random masking (visualization parity)
+        p_stale = float(getattr(model, "p_stale", getattr(model, "stale_dropout_p", 0.1)))
+        p_live = float(getattr(model, "p_live", 0.02))
+        set_mae_ratio = float(getattr(model, "set_mae_ratio", 0.02))
+        small_set_mask_prob = float(getattr(model, "small_set_mask_prob", 0.1))
+        small_set_threshold = int(getattr(model, "small_set_threshold", 5))
+        max_masks_per_set = int(getattr(model, "max_masks_per_set", 2))
+
+        val_masked_t, rand_mask_t = _apply_pt_style_random_masks(
+            val_t,
+            torch.from_numpy(mask_np).to(device),
+            p_stale=p_stale,
+            p_live=p_live,
+            set_mae_ratio=set_mae_ratio,
+            small_set_mask_prob=small_set_mask_prob,
+            small_set_threshold=small_set_threshold,
+            max_masks_per_set=max_masks_per_set,
+        )
+
+        # Encode-decode using masked values
+        recon_t = _encode_decode_set(encoder, var_red, val_masked_t)
+
+        with torch.no_grad():
+            var_dirs = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
+        recon_np = recon_t.squeeze(0).detach().cpu().numpy()
+
+        # Build matching candidates per scope
+        if args.match_scope == "global":
+            assert vocab_dirs_np is not None and vocab_event_names is not None
+            var_dirs_np_local = vocab_dirs_np
+            event_names_local: List[str] = vocab_event_names
+        else:
+            var_dirs_np_local = (var_dirs.squeeze(0).detach().cpu().numpy())
+            event_names_local = df_set["variable"].astype(str).tolist()
+
+        # Carry/Random maps for tags
+        set_event_names: List[str] = df_set["variable"].astype(str).tolist()
+        mask_by_name: Dict[str, float] = {}
+        for name, m in zip(set_event_names, mask_np.tolist()):
+            mask_by_name[name] = max(mask_by_name.get(name, 0.0), float(m))
+        rand_mask_np = rand_mask_t.detach().cpu().numpy().astype(np.float32)
+        rand_by_name: Dict[str, float] = {}
+        for name, m in zip(set_event_names, rand_mask_np.tolist()):
+            rand_by_name[name] = max(rand_by_name.get(name, 0.0), float(m))
+
+        assignments = _greedy_match_recon_to_vars(recon_np, var_dirs_np_local, event_names_local)
+
+        # Split into matched vs unmatched w.r.t. original set names
+        matched_items: List[Tuple[str, float, float]] = []
+        unmatched_items: List[Tuple[str, float, float]] = []
+        set_name_set = set(set_event_names)
+        for (matched_name, pred_val_norm, cos_sim) in assignments:
+            if matched_name in set_name_set:
+                matched_items.append((matched_name, pred_val_norm, cos_sim))
+            else:
+                unmatched_items.append((matched_name, pred_val_norm, cos_sim))
+
+        # Print results
+        print("================ Random Test Set Reconstruction ================")
+        if sample_idx is not None and total_samples is not None:
+            print(f"Sample:     {sample_idx+1}/{total_samples}")
+        print(f"Patient ID: {patient_id}")
+        print(f"Set index:  {chosen_set}")
+        vocab_len = len(event_names_local)
+        print(f"#Events:    {len(set_event_names)} (match scope: {args.match_scope}, vocab={vocab_len})")
+        # Carry-over and random-mask summaries
+        num_carry = int((mask_np > 0.5).sum())
+        pct_carry = (num_carry / max(1, vocab_len)) * 100.0
+        carried_names = [n for n, m in zip(set_event_names, mask_np.tolist()) if float(m) > 0.5]
+        num_rand = int((rand_mask_np > 0.5).sum())
+        pct_rand = (num_rand / max(1, vocab_len)) * 100.0
+        rand_names = [n for n, m in zip(set_event_names, rand_mask_np.tolist()) if float(m) > 0.5]
+        print((f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}") if num_carry > 0 else "#Carried:   0 (0.0%)")
+        print((f"#Mask:      {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#Mask:      0 (0.0%)")
+        print("---------------------------------------------------------------")
+        print("Original events (name -> de-normalized original value):")
+        for name, val_norm, is_carry, is_rand in zip(set_event_names, val_np.tolist(), mask_np.tolist(), rand_mask_np.tolist()):
+            val_orig = _denorm_value(name, float(val_norm))
+            tag_parts = []
+            if float(is_carry) > 0.5:
+                tag_parts.append("carry")
+            if float(is_rand) > 0.5:
+                tag_parts.append("mask")
+            tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
+            print(f"  - {name}: {val_orig:.6f}{tag}")
+        print("---------------------------------------------------------------")
+        print("Reconstruction grouped by match to original set:")
+        print(f"  Matched ({len(matched_items)}):")
+        if len(matched_items) == 0:
+            print("    (none)")
+        else:
+            for matched_name, pred_val_norm, cos_sim in matched_items:
+                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+                dst_tag_parts = []
+                if mask_by_name.get(matched_name, 0.0) > 0.5:
+                    dst_tag_parts.append("carry")
+                if rand_by_name.get(matched_name, 0.0) > 0.5:
+                    dst_tag_parts.append("mask")
+                dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
+                print(f"    - {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+        print(f"  Not matched ({len(unmatched_items)}):")
+        if len(unmatched_items) == 0:
+            print("    (none)")
+        else:
+            for matched_name, pred_val_norm, cos_sim in unmatched_items:
+                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+                print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+        print("===============================================================")
+
+    # Sampling strategy
+    if args.patient_index is not None and args.set_index is not None:
+        if args.patient_index < 0 or args.patient_index >= len(ds):
+            raise IndexError(f"patient_index out of range [0,{len(ds)-1}]")
+        df, patient_id = ds[int(args.patient_index)]
+        if int(args.set_index) not in set(int(s) for s in df["set_index"].tolist()):
+            raise ValueError(f"set_index {args.set_index} not found in patient {patient_id}")
+        chosen_set = int(args.set_index)
+        df_set = df[df["set_index"] == chosen_set].reset_index(drop=True)
+        _process_one_set(df_set, patient_id, chosen_set, sample_idx=0, total_samples=1)
+    elif args.patient_index is not None and args.set_index is None:
+        if args.patient_index < 0 or args.patient_index >= len(ds):
+            raise IndexError(f"patient_index out of range [0,{len(ds)-1}]")
+        df, patient_id = ds[int(args.patient_index)]
+        uniq_sets = sorted(set(int(s) for s in df["set_index"].tolist()))
+        if not uniq_sets:
+            raise RuntimeError("Selected patient has no sets")
+        k = min(len(uniq_sets), max(1, int(args.num_samples)))
+        chosen_sets = random.sample(uniq_sets, k=k)
+        for idx, chosen_set in enumerate(chosen_sets):
+            df_set = df[df["set_index"] == chosen_set].reset_index(drop=True)
+            _process_one_set(df_set, patient_id, chosen_set, sample_idx=idx, total_samples=len(chosen_sets))
     else:
-        var_dirs_np = (var_dirs.squeeze(0).detach().cpu().numpy())      # [N,R]
-        event_names: List[str] = df_set["variable"].astype(str).tolist()
-
-    # Carry / random mask maps only for set tokens (used for printing tags). For global scope, tags only apply to those names appearing in the set.
-    set_event_names: List[str] = df_set["variable"].astype(str).tolist()
-    mask_by_name: Dict[str, float] = {}
-    for name, m in zip(set_event_names, mask_np.tolist()):
-        mask_by_name[name] = max(mask_by_name.get(name, 0.0), float(m))
-    rand_mask_np = rand_mask_t.detach().cpu().numpy().astype(np.float32)
-    rand_by_name: Dict[str, float] = {}
-    for name, m in zip(set_event_names, rand_mask_np.tolist()):
-        rand_by_name[name] = max(rand_by_name.get(name, 0.0), float(m))
-
-    assignments = _greedy_match_recon_to_vars(recon_np, var_dirs_np, event_names)
-
-    # Print results
-    print("================ Random Test Set Reconstruction ================")
-    print(f"Patient ID: {patient_id}")
-    print(f"Set index:  {chosen_set}")
-    print(f"#Events:    {len(set_event_names)} (match scope: {args.match_scope}, vocab={len(event_names)})")
-    # Carry-over and random-mask summaries
-    num_carry = int((mask_np > 0.5).sum())
-    pct_carry = (num_carry / max(1, len(event_names))) * 100.0
-    carried_names = [n for n, m in zip(set_event_names, mask_np.tolist()) if float(m) > 0.5]
-    num_rand = int((rand_mask_np > 0.5).sum())
-    pct_rand = (num_rand / max(1, len(event_names))) * 100.0
-    rand_names = [n for n, m in zip(set_event_names, rand_mask_np.tolist()) if float(m) > 0.5]
-    print((f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}") if num_carry > 0 else "#Carried:   0 (0.0%)")
-    print((f"#Mask:      {num_rand} ({pct_rand:.1f}%) -> {', '.join(rand_names)}") if num_rand > 0 else "#Mask:      0 (0.0%)")
-    print("---------------------------------------------------------------")
-    print("Original events (name -> de-normalized original value):")
-    for name, val_norm, is_carry, is_rand in zip(set_event_names, val_np.tolist(), mask_np.tolist(), rand_mask_np.tolist()):
-        val_orig = _denorm_value(name, float(val_norm))
-        tag_parts = []
-        if float(is_carry) > 0.5:
-            tag_parts.append("carry")
-        if float(is_rand) > 0.5:
-            tag_parts.append("mask")
-        tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
-        print(f"  - {name}: {val_orig:.6f}{tag}")
-    print("---------------------------------------------------------------")
-    print("Reconstruction (source input event -> matched event: de-normalized predicted value, cosine similarity):")
-    for i, (matched_name, pred_val_norm, cos_sim) in enumerate(assignments):
-        # Source input event name (same position as this reconstructed vector)
-        src_name = set_event_names[i]
-        # De-normalize predicted value for readability
-        pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-        # Source event tags (carry/mask from the input event itself)
-        src_tag_parts = []
-        if float(mask_np[i]) > 0.5:
-            src_tag_parts.append("carry")
-        if float(rand_mask_np[i]) > 0.5:
-            src_tag_parts.append("mask")
-        src_tag = (" [" + ",".join(src_tag_parts) + "]") if src_tag_parts else ""
-        # Target event tags (only shown if matched event appears in the input set)
-        dst_tag_parts = []
-        if mask_by_name.get(matched_name, 0.0) > 0.5:
-            dst_tag_parts.append("carry")
-        if rand_by_name.get(matched_name, 0.0) > 0.5:
-            dst_tag_parts.append("mask")
-        dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
-        print(f"  - {src_name}{src_tag} -> {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
-    print("===============================================================")
+        total = max(1, int(args.num_samples))
+        for idx in range(total):
+            pidx = random.randrange(len(ds))
+            df, patient_id = ds[pidx]
+            uniq_sets = sorted(set(int(s) for s in df["set_index"].tolist()))
+            if not uniq_sets:
+                continue
+            chosen_set = random.choice(uniq_sets)
+            df_set = df[df["set_index"] == chosen_set].reset_index(drop=True)
+            _process_one_set(df_set, patient_id, chosen_set, sample_idx=idx, total_samples=total)
 
 
 if __name__ == "__main__":
