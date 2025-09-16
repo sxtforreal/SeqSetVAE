@@ -499,16 +499,27 @@ def main():
         tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
         print(f"  - {name}: {val_orig:.6f}{tag}")
     print("---------------------------------------------------------------")
-    print("重构结果（匹配到的事件名 -> 去归一化后的预测数值，余弦相似度）:")
-    for (name, pred_val_norm, cos_sim) in assignments:
-        pred_orig = _denorm_value(name, float(pred_val_norm))
-        tag_parts = []
-        if mask_by_name.get(name, 0.0) > 0.5:
-            tag_parts.append("carry")
-        if rand_by_name.get(name, 0.0) > 0.5:
-            tag_parts.append("mask")
-        tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
-        print(f"  - {name}: {pred_orig:.6f}{tag}  (cos={cos_sim:.3f})")
+    print("重构结果（源输入事件 -> 匹配到的事件名: 去归一化后的预测数值，余弦相似度）:")
+    for i, (matched_name, pred_val_norm, cos_sim) in enumerate(assignments):
+        # 源输入事件名称（与该重构向量同位置的原始事件）
+        src_name = set_event_names[i]
+        # 去归一化预测值以便可读
+        pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+        # 源事件标签（carry/mask 来自该输入事件本身）
+        src_tag_parts = []
+        if float(mask_np[i]) > 0.5:
+            src_tag_parts.append("carry")
+        if float(rand_mask_np[i]) > 0.5:
+            src_tag_parts.append("mask")
+        src_tag = (" [" + ",".join(src_tag_parts) + "]") if src_tag_parts else ""
+        # 目标事件标签（当匹配到的事件也在输入集合中时，显示其标签）
+        dst_tag_parts = []
+        if mask_by_name.get(matched_name, 0.0) > 0.5:
+            dst_tag_parts.append("carry")
+        if rand_by_name.get(matched_name, 0.0) > 0.5:
+            dst_tag_parts.append("mask")
+        dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
+        print(f"  - {src_name}{src_tag} -> {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
     print("===============================================================")
 
 
