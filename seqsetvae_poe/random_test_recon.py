@@ -317,6 +317,14 @@ def main():
     print(f"Patient ID: {patient_id}")
     print(f"Set index:  {chosen_set}")
     print(f"#Events:    {len(event_names)}")
+    # Carry-over (mask) summary
+    num_carry = int((mask_np > 0.5).sum())
+    pct_carry = (num_carry / max(1, len(event_names))) * 100.0
+    carried_names = [n for n, m in zip(event_names, mask_np.tolist()) if float(m) > 0.5]
+    if num_carry > 0:
+        print(f"#Carried:   {num_carry} ({pct_carry:.1f}%) -> {', '.join(carried_names)}")
+    else:
+        print("#Carried:   0 (0.0%)")
     print("---------------------------------------------------------------")
     print("原始事件（名称 -> 去归一化前的原始数值）:")
     for name, val_norm, is_mask in zip(event_names, val_np.tolist(), mask_np.tolist()):
