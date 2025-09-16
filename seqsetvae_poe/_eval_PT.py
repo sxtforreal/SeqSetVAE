@@ -71,6 +71,21 @@ try:
 except Exception:
     umap = None  # type: ignore
 
+# Targeted warning filters to keep logs clean without changing behavior
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r"n_jobs value .* overridden to 1 by setting random_state\. Use no seed for parallelism\.",
+    category=UserWarning,
+    module="umap.umap_",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"Graph is not fully connected, spectral embedding may not work as expected\.",
+    category=UserWarning,
+    module="sklearn.manifold._spectral_embedding",
+)
+
 
 # Ensure local imports work even if launched from project root
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -786,7 +801,7 @@ def _plot_overlay_2d(orig: np.ndarray, recon: np.ndarray, out_file: str):
     try:
         if umap is not None:
             reducer = umap.UMAP(
-                n_components=2, random_state=42, n_neighbors=15, min_dist=0.1
+                n_components=2, random_state=42, n_neighbors=15, min_dist=0.1, init="random"
             )
             orig_emb = reducer.fit_transform(orig_s)
             recon_emb = reducer.transform(recon_s)
@@ -1633,7 +1648,7 @@ def _plot_overlay_2d(orig: np.ndarray, recon: np.ndarray, out_file: str):
     # Reduce
     try:
         if umap is not None:
-            reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+            reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1, init="random")
             orig_emb = reducer.fit_transform(orig_s)
             recon_emb = reducer.transform(recon_s)
         elif PCA is not None:
