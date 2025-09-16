@@ -77,6 +77,7 @@ def _detect_vcols(df: pd.DataFrame) -> List[str]:
 def rebuild_strict_lvcf_for_sofa(
     df_in: pd.DataFrame,
     sofa_vars: Set[str],
+    show_progress: bool = False,
 ) -> pd.DataFrame:
     """Rebuild rows using strict LVCF while preserving set_index/time timeline.
 
@@ -84,6 +85,7 @@ def rebuild_strict_lvcf_for_sofa(
         df_in: Parquet from prior pipeline with columns
                [variable, value, time, set_index, age, is_carry, v0..]
         sofa_vars: Variables to keep and rebuild.
+        show_progress: If True, display tqdm progress for inner processing.
 
     Returns:
         New DataFrame with the same schema but only SOFA variables and strict LVCF.
@@ -102,7 +104,10 @@ def rebuild_strict_lvcf_for_sofa(
 
     # Pre-compute variable -> embedding vector (take first seen row)
     var2vec: Dict[str, np.ndarray] = {}
-    for v in sorted(sofa_vars):
+    _iter_vars = sorted(sofa_vars)
+    if show_progress:
+        _iter_vars = tqdm(_iter_vars, desc="var2vec", leave=False)
+    for v in _iter_vars:
         sub = df[df["variable"] == v]
         if len(sub) == 0:
             continue
@@ -125,10 +130,13 @@ def rebuild_strict_lvcf_for_sofa(
     last_val: Dict[str, float] = {}
 
     # Iterate sets chronologically; rebuild per variable
+    vars_sorted = sorted(var2vec.keys())
+    _total_iters = len(sets) * len(vars_sorted) if len(vars_sorted) > 0 else 0
+    _pb = tqdm(total=_total_iters, desc="rebuild", leave=False) if show_progress and _total_iters > 0 else None
     for set_idx, t in sets:
         set_idx = int(set_idx)
         t = float(t)
-        for v in sorted(var2vec.keys()):
+        for v in vars_sorted:
             key = (set_idx, v)
             if key in raw_map:
                 val, t_obs = raw_map[key]
@@ -141,6 +149,10 @@ def rebuild_strict_lvcf_for_sofa(
                         "is_carry": 0.0,
                     }
                 )
+            if _pb is not None:
+                _pb.update(1)
+    if _pb is not None:
+        _pb.close()
                 last_time[v] = t_obs
                 last_val[v] = float(val)
             elif v in last_time:
@@ -160,11 +172,17 @@ def rebuild_strict_lvcf_for_sofa(
         out = pd.DataFrame(columns=["variable", "value", "time", "set_index", "is_carry"] + vcols)
         return out
 
-    # Attach embeddings using var2vec
-    for c in vcols:
-        out[c] = 0.0
+    # Attach embeddings using var2vec (avoid fragmentation by adding all at once)
+    zeros_emb = pd.DataFrame(
+        np.zeros((len(out), len(vcols)), dtype=np.float32), columns=vcols
+    )
+    out = pd.concat([out.reset_index(drop=True), zeros_emb], axis=1)
+
     # Fill per variable
-    for v, vec in var2vec.items():
+    _iter_fill = var2vec.items()
+    if show_progress and len(var2vec) > 0:
+        _iter_fill = tqdm(_iter_fill, total=len(var2vec), desc="emb", leave=False)
+    for v, vec in _iter_fill:
         mask = out["variable"] == v
         if mask.any():
             out.loc[mask, vcols] = vec
@@ -192,6 +210,7 @@ def main():
     )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     ap.add_argument("--smoke", action="store_true", help="Process a single sample from train")
+    ap.add_argument("--progress_inner", action="store_true", help="Show inner tqdm bars per file")
     args = ap.parse_args()
 
     sofa_vars = set(_parse_var_list(args.sofa_vars) or DEFAULT_SOFA_VARS)
@@ -204,7 +223,7 @@ def main():
 
     def _process(fp: str) -> pd.DataFrame:
         df = pd.read_parquet(fp, engine="pyarrow")
-        return rebuild_strict_lvcf_for_sofa(df, sofa_vars)
+        return rebuild_strict_lvcf_for_sofa(df, sofa_vars, show_progress=args.progress_inner)
 
     if args.smoke:
         files = sorted(glob.glob(os.path.join(args.input_dir, "train", "*.parquet")))
