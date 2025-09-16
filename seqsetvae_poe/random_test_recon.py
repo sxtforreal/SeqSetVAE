@@ -16,6 +16,7 @@ Notes:
   - Reconstruction uses the SetVAE encoder/decoder in reduced space if
     a dim reducer exists; mapping back to names is done via cosine NN
     against the set's normalized variable directions, with greedy 1-1 matching.
+  - Events carried from previous time (is_carry==1) are annotated as [mask].
 """
 
 import os
@@ -285,6 +286,7 @@ def main():
     # Build tensors for this set
     var_np = df_set[vcols].to_numpy(dtype=np.float32, copy=False)
     val_np = df_set["value"].to_numpy(dtype=np.float32)
+    mask_np = df_set["is_carry"].to_numpy(dtype=np.float32) if "is_carry" in df_set.columns else np.zeros_like(val_np)
     var_t = torch.from_numpy(var_np).unsqueeze(0).to(device)           # [1,N,D]
     val_t = torch.from_numpy(val_np).view(1, -1, 1).to(device)         # [1,N,1]
 
@@ -303,6 +305,10 @@ def main():
     var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()            # [N,R]
     recon_np = recon_t.squeeze(0).detach().cpu().numpy()                # [N,R]
     event_names: List[str] = df_set["variable"].astype(str).tolist()
+    # Build name -> mask map (1 for carried, 0 for observed). If duplicates, keep max (mask if any).
+    mask_by_name: Dict[str, float] = {}
+    for name, m in zip(event_names, mask_np.tolist()):
+        mask_by_name[name] = max(mask_by_name.get(name, 0.0), float(m))
 
     assignments = _greedy_match_recon_to_vars(recon_np, var_dirs_np, event_names)
 
@@ -313,14 +319,16 @@ def main():
     print(f"#Events:    {len(event_names)}")
     print("---------------------------------------------------------------")
     print("原始事件（名称 -> 去归一化前的原始数值）:")
-    for name, val_norm in zip(event_names, val_np.tolist()):
+    for name, val_norm, is_mask in zip(event_names, val_np.tolist(), mask_np.tolist()):
         val_orig = _denorm_value(name, float(val_norm))
-        print(f"  - {name}: {val_orig:.6f}")
+        tag = " [mask]" if float(is_mask) > 0.5 else ""
+        print(f"  - {name}: {val_orig:.6f}{tag}")
     print("---------------------------------------------------------------")
     print("重构结果（匹配到的事件名 -> 去归一化后的预测数值，余弦相似度）:")
     for (name, pred_val_norm, cos_sim) in assignments:
         pred_orig = _denorm_value(name, float(pred_val_norm))
-        print(f"  - {name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+        tag = " [mask]" if mask_by_name.get(name, 0.0) > 0.5 else ""
+        print(f"  - {name}: {pred_orig:.6f}{tag}  (cos={cos_sim:.3f})")
     print("===============================================================")
 
 
