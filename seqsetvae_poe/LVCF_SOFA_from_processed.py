@@ -9,9 +9,9 @@ and already contain the following columns:
 Key behavior differences:
 - set_index/time and the per-patient timeline are preserved EXACTLY.
 - Only SOFA variables are retained.
-- Rows are recomputed using strict LVCF (no time window). Ages are recomputed
-  as minutes since last observation for that variable. Values are the already-
-  normalized values taken from raw observations and then carried forward.
+- Rows are recomputed using strict LVCF (no time window). Output does NOT
+  include 'age'. Values are the already-normalized values taken from raw
+  observations and then carried forward.
 - Embedding columns v0.. are copied from the first occurrence of the variable.
 
 Directory layout mirrors input:
@@ -138,21 +138,18 @@ def rebuild_strict_lvcf_for_sofa(
                         "value": float(val),
                         "time": t,
                         "set_index": set_idx,
-                        "age": 0.0,
                         "is_carry": 0.0,
                     }
                 )
                 last_time[v] = t_obs
                 last_val[v] = float(val)
             elif v in last_time:
-                dt = t - last_time[v]
                 rows.append(
                     {
                         "variable": v,
                         "value": float(last_val[v]),
                         "time": t,
                         "set_index": set_idx,
-                        "age": float(dt),
                         "is_carry": 1.0,
                     }
                 )
@@ -160,7 +157,7 @@ def rebuild_strict_lvcf_for_sofa(
     out = pd.DataFrame(rows)
     if len(out) == 0:
         # No SOFA variables present for this patient; return empty with columns
-        out = pd.DataFrame(columns=["variable", "value", "time", "set_index", "age", "is_carry"] + vcols)
+        out = pd.DataFrame(columns=["variable", "value", "time", "set_index", "is_carry"] + vcols)
         return out
 
     # Attach embeddings using var2vec
@@ -176,7 +173,6 @@ def rebuild_strict_lvcf_for_sofa(
     out["value"] = out["value"].astype(np.float32)
     out["time"] = out["time"].astype(float)
     out["set_index"] = out["set_index"].astype(int)
-    out["age"] = out["age"].astype(float)
     out["is_carry"] = out["is_carry"].astype(np.float32)
 
     # Sort to match original convention
