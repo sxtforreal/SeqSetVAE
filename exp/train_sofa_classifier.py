@@ -17,6 +17,8 @@ and then selecting corresponding patients in the SOFA table and labels.
 Model:
 - GRU-based sequence classifier using variable-length packing
 - Features selectable: 'total', 'subscores', or 'all'
+- When feature_set='total', the script selects only 'sofa_total' per patient and
+  automatically drops rows where 'sofa_total' is NaN (no forward-fill or zero-fill).
 
 Usage example:
   python -u exp/train_sofa_classifier.py \
@@ -367,11 +369,17 @@ def build_sequences(
         axis=1,
     )
 
-    # Forward-fill remaining NaNs per patient, then fill leading NaNs with zeros
-    df_feat = (
-        df_feat.sort_values(["patient_id", "event_time"]).groupby("patient_id").apply(lambda g: g.ffill()).reset_index(drop=True)
-    )
-    df_feat[feature_names] = df_feat[feature_names].fillna(0.0)
+    # Handle missing values according to feature selection
+    if feature_set.lower() == "total":
+        # Use only sofa_total; drop rows with NaN (no fill)
+        df_feat = df_feat.sort_values(["patient_id", "event_time"]).copy()
+        df_feat = df_feat[df_feat["sofa_total"].notna()].reset_index(drop=True)
+    else:
+        # For multi-feature cases: forward-fill per patient, then fill leading NaNs with zero
+        df_feat = (
+            df_feat.sort_values(["patient_id", "event_time"]).groupby("patient_id").apply(lambda g: g.ffill()).reset_index(drop=True)
+        )
+        df_feat[feature_names] = df_feat[feature_names].fillna(0.0)
 
     # Load labels
     oc = pd.read_csv(label_csv)
