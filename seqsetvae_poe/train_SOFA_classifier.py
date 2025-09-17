@@ -121,7 +121,7 @@ def _scan_split_ids(split_dir: str) -> Dict[str, List[str]]:
 
 
 def _maybe_map_split_ids_to_patient(
-    splits: Dict[str, List[str]], oc_df: pd.DataFrame
+    splits: Dict[str, List[str]], oc_df: pd.DataFrame, split_id_kind: str = "auto"
 ) -> Dict[str, List[str]]:
     """Map split ids to patient_id if splits appear to contain ts_id.
 
@@ -151,6 +151,21 @@ def _maybe_map_split_ids_to_patient(
         else {}
     )
 
+    # Explicit modes
+    if split_id_kind == "patient_id":
+        return splits
+    if split_id_kind == "ts_id":
+        if not has_tid:
+            raise ValueError(
+                "split_id_kind=ts_id but 'ts_id' column not found in label CSV"
+            )
+        mapped: Dict[str, List[str]] = {}
+        for part, ids in splits.items():
+            mapped_ids = [ts2pid[s] for s in ids if s in ts2pid]
+            mapped[part] = mapped_ids
+        return mapped
+
+    # Auto heuristic
     # Probe the id space of splits
     sampled: List[str] = []
     for part in ("train", "valid", "test"):
@@ -408,6 +423,8 @@ def build_sequences(
     feature_set: str,
     max_len: Optional[int] = None,
     normalize: bool = False,
+    split_id_kind: str = "auto",
+    debug_alignment: bool = False,
 ) -> Tuple[Dict[str, PatientSequence], Dict[str, List[str]], List[str]]:
     """Load data, align splits and build per-patient sequences.
 
@@ -473,11 +490,28 @@ def build_sequences(
     label_map: Dict[str, int] = {
         str(pid): int(v) for pid, v in zip(oc["__pid__"].tolist(), oc[lab_col].tolist())
     }
+    oc_pids = set(oc["__pid__"].tolist())
+    oc_tids = set(
+        oc["ts_id"].apply(_normalize_patient_id_to_str).tolist()
+    ) if "ts_id" in oc.columns else set()
 
     # Build split id lists
     splits = _scan_split_ids(split_dir)
-    # If splits appear to contain ts_id, map them to patient_id using oc
-    splits = _maybe_map_split_ids_to_patient(splits, oc)
+    if debug_alignment:
+        print("[align] Raw split counts:", {k: len(v) for k, v in splits.items()})
+        print(
+            "[align] Raw split IDs present in labels as patient_id:",
+            {k: sum(1 for s in v if s in oc_pids) for k, v in splits.items()},
+        )
+        if len(oc_tids) > 0:
+            print(
+                "[align] Raw split IDs present in labels as ts_id:",
+                {k: sum(1 for s in v if s in oc_tids) for k, v in splits.items()},
+            )
+    # If splits appear to contain ts_id, map them to patient_id using oc (or force per arg)
+    splits = _maybe_map_split_ids_to_patient(splits, oc, split_id_kind=split_id_kind)
+    if debug_alignment:
+        print("[align] Split counts after ts_id->patient_id mapping (if applied):", {k: len(v) for k, v in splits.items()})
 
     # Optionally fit normalization on training set only
     mean_vec = None
@@ -501,6 +535,8 @@ def build_sequences(
 
     # Build per-patient sequences
     seq_map: Dict[str, PatientSequence] = {}
+    # Track which patients have at least one valid row after feature/NaN filtering
+    available_patient_ids = set(df_feat["patient_id"].unique().tolist())
     for pid, g in df_feat.groupby("patient_id", sort=False):
         if pid not in label_map:
             continue
@@ -519,7 +555,15 @@ def build_sequences(
 
     # Filter split ids to those available in seq_map
     for part in ["train", "valid", "test"]:
-        splits[part] = [pid for pid in splits[part] if pid in seq_map]
+        before = list(splits[part])
+        splits[part] = [pid for pid in before if pid in seq_map]
+        if debug_alignment:
+            dropped_missing_label = [pid for pid in before if pid not in label_map]
+            dropped_missing_sofa = [pid for pid in before if pid not in available_patient_ids]
+            dropped_other = [pid for pid in before if pid not in seq_map and pid in label_map and pid in available_patient_ids]
+            print(
+                f"[align] {part}: kept={len(splits[part])}, dropped_missing_label={len(dropped_missing_label)}, dropped_missing_sofa={len(dropped_missing_sofa)}, dropped_other={len(dropped_other)}"
+            )
 
     return seq_map, splits, feature_names
 
@@ -581,6 +625,17 @@ def parse_args() -> argparse.Namespace:
         "--tqdm_refresh", type=int, default=1, help="TQDM refresh rate (steps)"
     )
     ap.add_argument(
+        "--split_id_kind",
+        choices=["auto", "patient_id", "ts_id"],
+        default="auto",
+        help="How to interpret split file basenames: patient_id, ts_id, or auto-detect",
+    )
+    ap.add_argument(
+        "--debug_alignment",
+        action="store_true",
+        help="Print detailed alignment diagnostics for splits/labels/SOFA",
+    )
+    ap.add_argument(
         "--allow_partial_splits",
         action="store_true",
         help="Allow proceeding when some splits (valid/test) are empty; requires non-empty training data",
@@ -609,6 +664,8 @@ def main():
         feature_set=args.feature_set,
         max_len=args.max_len,
         normalize=args.normalize,
+        split_id_kind=args.split_id_kind,
+        debug_alignment=args.debug_alignment,
     )
 
     train_ids = splits["train"]
