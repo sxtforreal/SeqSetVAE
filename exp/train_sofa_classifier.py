@@ -19,6 +19,8 @@ Model:
 - Features selectable: 'total', 'subscores', or 'all'
 - When feature_set='total', the script selects only 'sofa_total' per patient and
   automatically drops rows where 'sofa_total' is NaN (no forward-fill or zero-fill).
+  For 'subscores' or 'all', rows with any NaN among selected features are removed
+  (no forward-fill or zero-fill).
 
 Usage example:
   python -u exp/train_sofa_classifier.py \
@@ -375,11 +377,9 @@ def build_sequences(
         df_feat = df_feat.sort_values(["patient_id", "event_time"]).copy()
         df_feat = df_feat[df_feat["sofa_total"].notna()].reset_index(drop=True)
     else:
-        # For multi-feature cases: forward-fill per patient, then fill leading NaNs with zero
-        df_feat = (
-            df_feat.sort_values(["patient_id", "event_time"]).groupby("patient_id").apply(lambda g: g.ffill()).reset_index(drop=True)
-        )
-        df_feat[feature_names] = df_feat[feature_names].fillna(0.0)
+        # Multi-feature: drop rows that contain any NaN in selected features
+        df_feat = df_feat.sort_values(["patient_id", "event_time"]).copy()
+        df_feat = df_feat.dropna(subset=feature_names).reset_index(drop=True)
 
     # Load labels
     oc = pd.read_csv(label_csv)
@@ -410,6 +410,9 @@ def build_sequences(
             continue
         g_sorted = g.sort_values("event_time")
         feats_np = g_sorted[feature_names].to_numpy(dtype=np.float32, copy=False)
+        if feats_np.shape[0] == 0:
+            # Skip patients whose sequence becomes empty after dropping NaNs
+            continue
         if max_len is not None and len(feats_np) > max_len:
             feats_np = feats_np[:max_len]
         if normalize and mean_vec is not None and std_vec is not None:
