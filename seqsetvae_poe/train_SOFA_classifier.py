@@ -687,6 +687,15 @@ def main():
         else None
     )
 
+    # Diagnostics: batches per epoch and class balance
+    try:
+        num_train_batches = len(train_loader)
+    except TypeError:
+        num_train_batches = None
+    train_labels = [seq_map[pid].label for pid in train_ids]
+    num_train_pos = int(sum(train_labels))
+    num_train_neg = int(len(train_labels) - num_train_pos)
+
     pos_w = compute_pos_weight(train_ids, seq_map)
     model = GRUSequenceClassifier(
         input_dim=len(feature_names),
@@ -730,6 +739,15 @@ def main():
     print(
         f"Training on {len(train_ds)} patients; Valid {valid_count}; Test {test_count}"
     )
+    if num_train_batches is not None:
+        print(
+            f"Train batches per epoch: {num_train_batches} (batch_size={args.batch_size})"
+        )
+        if num_train_batches == 1:
+            print(
+                "[Hint] Only one training batch this epoch. This usually means batch_size >= number of training patients, or very few patients remain after aligning SOFA/labels with split_dir. Try a smaller --batch_size or verify your splits."
+            )
+    print(f"Train label balance -> pos: {num_train_pos}, neg: {num_train_neg}")
     trainer.fit(model, train_loader, val_loader)
 
     print("\nEvaluating best checkpoint on test set...")
