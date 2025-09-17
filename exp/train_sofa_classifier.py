@@ -366,6 +366,10 @@ def build_sequences(
     if df["event_time"].isna().any():
         raise ValueError("Invalid timestamps present in SOFA CSV")
 
+    # Always drop sets where 'sofa_total' is NaN, regardless of feature selection
+    if "sofa_total" in df.columns:
+        df = df[df["sofa_total"].notna()].reset_index(drop=True)
+
     features_df, feature_names = _build_feature_matrix(df, feature_set)
 
     df_feat = pd.concat(
