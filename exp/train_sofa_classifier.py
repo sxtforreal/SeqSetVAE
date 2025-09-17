@@ -20,7 +20,9 @@ Model:
 - When feature_set='total', the script selects only 'sofa_total' per patient and
   automatically drops rows where 'sofa_total' is NaN (no forward-fill or zero-fill).
   For 'subscores' or 'all', rows with any NaN among selected features are removed
-  (no forward-fill or zero-fill).
+  (no forward-fill or zero-fill). Additionally, a time-interval feature `dt_hours`
+  (difference between consecutive `event_time` within each patient; first step = 0)
+  is appended to the input features for all modes.
 
 Usage example:
   python -u exp/train_sofa_classifier.py \
@@ -380,6 +382,15 @@ def build_sequences(
         # Multi-feature: drop rows that contain any NaN in selected features
         df_feat = df_feat.sort_values(["patient_id", "event_time"]).copy()
         df_feat = df_feat.dropna(subset=feature_names).reset_index(drop=True)
+
+    # Append time-interval feature (hours) between consecutive sets per patient
+    if len(df_feat) > 0:
+        df_feat["dt_hours"] = (
+            df_feat.groupby("patient_id")["event_time"].diff().dt.total_seconds().div(3600.0)
+        )
+        # First step has NaN diff; set to 0. Also clamp negatives to 0 (guard malformed time order)
+        df_feat["dt_hours"] = df_feat["dt_hours"].fillna(0.0).clip(lower=0.0)
+        feature_names = feature_names + ["dt_hours"]
 
     # Load labels
     oc = pd.read_csv(label_csv)
