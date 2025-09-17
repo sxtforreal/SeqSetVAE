@@ -463,6 +463,11 @@ def main():
 
         assignments_nomask = _greedy_match_recon_to_vars(recon_nomask_np, var_dirs_np_local, event_names_local)
         assignments_mask = _greedy_match_recon_to_vars(recon_mask_np, var_dirs_np_local, event_names_local)
+        # Third mode: set-only matching (no-mask), regardless of global setting
+        var_dirs_np_set = (var_dirs.squeeze(0).detach().cpu().numpy())
+        assignments_set_only_nomask = _greedy_match_recon_to_vars(
+            recon_nomask_np, var_dirs_np_set, set_event_names
+        )
 
         # Split into matched vs unmatched w.r.t. original set names (both modes)
         def _split(assignments_list: List[Tuple[str, float, float]]):
@@ -477,6 +482,7 @@ def main():
             return matched, unmatched
         matched_nomask, unmatched_nomask = _split(assignments_nomask)
         matched_mask, unmatched_mask = _split(assignments_mask)
+        matched_set_only_nomask, unmatched_set_only_nomask = _split(assignments_set_only_nomask)
 
         # Print results
         print("================ Random Test Set Reconstruction ================")
@@ -549,6 +555,27 @@ def main():
             print("    (none)")
         else:
             for matched_name, pred_val_norm, cos_sim in unmatched_mask:
+                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+                print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+        # Third mode display: set-only matching (no-mask)
+        print("Reconstruction (set-only, no-mask) grouped by match to original set:")
+        print(f"  Matched ({len(matched_set_only_nomask)}):")
+        if len(matched_set_only_nomask) == 0:
+            print("    (none)")
+        else:
+            for matched_name, pred_val_norm, cos_sim in matched_set_only_nomask:
+                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+                dst_tag_parts = []
+                if mask_by_name.get(matched_name, 0.0) > 0.5:
+                    dst_tag_parts.append("carry")
+                # set-only no-mask mode: do not annotate random mask
+                dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
+                print(f"    - {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+        print(f"  Not matched ({len(unmatched_set_only_nomask)}):")
+        if len(unmatched_set_only_nomask) == 0:
+            print("    (none)")
+        else:
+            for matched_name, pred_val_norm, cos_sim in unmatched_set_only_nomask:
                 pred_orig = _denorm_value(matched_name, float(pred_val_norm))
                 print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
         print("===============================================================")
