@@ -518,22 +518,19 @@ def main():
         col_names = ["No-mask", "PT-mask", "Set-only (no-mask)"]
         def _format_cell(var_name: str, pred_val_norm: float, cos_sim: float, *, include_rand_mask: bool) -> str:
             pred_orig = _denorm_value(var_name, float(pred_val_norm))
-            tags: List[str] = []
-            if mask_by_name.get(var_name, 0.0) > 0.5:
-                tags.append("carry")
-            if include_rand_mask and rand_by_name.get(var_name, 0.0) > 0.5:
-                tags.append("mask")
-            tag_str = (" [" + ",".join(tags) + "]") if tags else ""
-            return f"{pred_orig:.6f}{tag_str} (cos={cos_sim:.3f})"
+            return f"{pred_orig:.6f} (cos={cos_sim:.3f})"
 
         map_nomask = {n: _format_cell(n, v, c, include_rand_mask=False) for (n, v, c) in matched_nomask}
         map_mask = {n: _format_cell(n, v, c, include_rand_mask=True) for (n, v, c) in matched_mask}
         map_setonly = {n: _format_cell(n, v, c, include_rand_mask=False) for (n, v, c) in matched_set_only_nomask}
+        # Original de-normalized values mapped by variable name
+        orig_map = {n: f"{_denorm_value(n, float(v)):.6f}" for n, v in zip(set_event_names, val_np.tolist())}
 
         table_rows: List[Dict[str, str]] = []
         for name in set_event_names:
             table_rows.append({
                 "variable": name,
+                "Original value": orig_map.get(name, ""),
                 col_names[0]: map_nomask.get(name, ""),
                 col_names[1]: map_mask.get(name, ""),
                 col_names[2]: map_setonly.get(name, ""),
