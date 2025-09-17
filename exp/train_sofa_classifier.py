@@ -471,6 +471,20 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--save_dir", type=str, default="/workspace/sofa_cls_runs")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tqdm_refresh", type=int, default=1, help="TQDM refresh rate (steps)")
+    ap.add_argument(
+        "--allow_partial_splits",
+        action="store_true",
+        help="Allow proceeding when some splits (valid/test) are empty; requires non-empty training data",
+    )
+    ap.add_argument(
+        "--fallback_train_split",
+        choices=["valid", "test", "auto"],
+        default=None,
+        help=(
+            "If training split is empty and --allow_partial_splits is set, use the specified non-empty split as training data. "
+            "'auto' prefers 'valid' then 'test'. The chosen fallback split will be removed from evaluation to avoid leakage."
+        ),
+    )
     return ap.parse_args()
 
 
@@ -492,8 +506,38 @@ def main():
     val_ids = splits["valid"]
     test_ids = splits["test"]
 
-    if len(train_ids) == 0 or len(val_ids) == 0 or len(test_ids) == 0:
-        raise RuntimeError("Empty split after alignment; ensure SOFA CSV and labels cover the split_dir patients")
+    # Enforce/relax split availability
+    if (len(train_ids) == 0 or len(val_ids) == 0 or len(test_ids) == 0) and (not args.allow_partial_splits):
+        raise RuntimeError(
+            "Empty split after alignment; ensure SOFA CSV and labels cover the split_dir patients"
+        )
+
+    # If training is empty but partial allowed, optionally fall back to a non-empty split for training
+    if len(train_ids) == 0 and args.allow_partial_splits:
+        fallback_choice = None
+        if args.fallback_train_split == "valid" and len(val_ids) > 0:
+            fallback_choice = "valid"
+        elif args.fallback_train_split == "test" and len(test_ids) > 0:
+            fallback_choice = "test"
+        elif args.fallback_train_split == "auto":
+            if len(val_ids) > 0:
+                fallback_choice = "valid"
+            elif len(test_ids) > 0:
+                fallback_choice = "test"
+
+        if fallback_choice is not None:
+            if fallback_choice == "valid":
+                train_ids = val_ids
+                val_ids = []  # avoid leakage
+            elif fallback_choice == "test":
+                train_ids = test_ids
+                test_ids = []  # avoid leakage
+        # If still empty, cannot proceed
+        if len(train_ids) == 0:
+            raise RuntimeError(
+                "Training split is empty after alignment and no usable fallback provided. "
+                "Set --fallback_train_split (valid/test/auto) or fix inputs."
+            )
 
     train_ds = SofaSequenceDataset(train_ids, seq_map)
     val_ds = SofaSequenceDataset(val_ids, seq_map)
@@ -507,21 +551,29 @@ def main():
         pin_memory=True,
         collate_fn=pad_collate,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=pad_collate,
+    val_loader = (
+        DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=pad_collate,
+        )
+        if len(val_ids) > 0
+        else None
     )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=pad_collate,
+    test_loader = (
+        DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=pad_collate,
+        )
+        if len(test_ids) > 0
+        else None
     )
 
     pos_w = compute_pos_weight(train_ids, seq_map)
@@ -536,16 +588,18 @@ def main():
         pos_weight=pos_w,
     )
 
+    monitor_metric = "val_auroc" if val_loader is not None else "train_auroc"
+    ckpt_filename = f"best-epoch{{epoch}}-{monitor_metric.upper()}{{{monitor_metric}:.4f}}"
     ckpt_cb = ModelCheckpoint(
         dirpath=args.save_dir,
-        filename="best-epoch{epoch}-valAUROC{val_auroc:.4f}",
-        monitor="val_auroc",
+        filename=ckpt_filename,
+        monitor=monitor_metric,
         mode="max",
         save_top_k=1,
         save_last=True,
         auto_insert_metric_name=False,
     )
-    es_cb = EarlyStopping(monitor="val_auroc", mode="max", patience=args.patience)
+    es_cb = EarlyStopping(monitor=monitor_metric, mode="max", patience=args.patience)
     prog_cb = TQDMProgressBar(refresh_rate=max(1, int(args.tqdm_refresh)))
     trainer = pl.Trainer(
         max_epochs=args.epochs,
@@ -558,7 +612,9 @@ def main():
         deterministic=False,
     )
 
-    print(f"Training on {len(train_ds)} patients; Valid {len(val_ds)}; Test {len(test_ds)}")
+    valid_count = len(val_ds) if val_loader is not None else 0
+    test_count = len(test_ds) if test_loader is not None else 0
+    print(f"Training on {len(train_ds)} patients; Valid {valid_count}; Test {test_count}")
     trainer.fit(model, train_loader, val_loader)
 
     print("\nEvaluating best checkpoint on test set...")
@@ -567,7 +623,10 @@ def main():
         best_model = GRUSequenceClassifier.load_from_checkpoint(best_path)
     else:
         best_model = model
-    trainer.test(best_model, dataloaders=test_loader)
+    if test_loader is not None:
+        trainer.test(best_model, dataloaders=test_loader)
+    else:
+        print("[WARN] Test split empty or used as training; skipping test evaluation.")
     print(f"Best checkpoint: {best_path}")
 
 
