@@ -120,6 +120,54 @@ def _scan_split_ids(split_dir: str) -> Dict[str, List[str]]:
     return out
 
 
+def _maybe_map_split_ids_to_patient(
+    splits: Dict[str, List[str]], oc_df: pd.DataFrame
+) -> Dict[str, List[str]]:
+    """Map split ids to patient_id if splits appear to contain ts_id.
+
+    Heuristic:
+      - If oc has both 'patient_id' and 'ts_id', sample split ids and count
+        how many exist in oc.patient_id vs oc.ts_id. If more look like ts_id,
+        map via ts_id -> patient_id and return new splits.
+      - Otherwise, return splits unchanged.
+    """
+
+    def _norm(v):
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return str(v)
+
+    has_pid = "patient_id" in oc_df.columns
+    has_tid = "ts_id" in oc_df.columns
+    if not has_pid:
+        return splits
+
+    oc_pids = set(oc_df["patient_id"].map(_norm))
+    oc_tids = set(oc_df["ts_id"].map(_norm)) if has_tid else set()
+    ts2pid = (
+        dict(zip(oc_df["ts_id"].map(_norm), oc_df["patient_id"].map(_norm)))
+        if has_tid
+        else {}
+    )
+
+    # Probe the id space of splits
+    sampled: List[str] = []
+    for part in ("train", "valid", "test"):
+        ids = splits.get(part, [])
+        if ids:
+            sampled.extend(ids[: min(1000, len(ids))])
+    in_pid = sum(1 for s in sampled if s in oc_pids)
+    in_tid = sum(1 for s in sampled if s in oc_tids)
+
+    if has_tid and in_tid > in_pid:
+        mapped: Dict[str, List[str]] = {}
+        for part, ids in splits.items():
+            mapped_ids = [ts2pid[s] for s in ids if s in ts2pid]
+            mapped[part] = mapped_ids
+        return mapped
+    return splits
+
 def _build_feature_matrix(
     df: pd.DataFrame, feature_set: str
 ) -> Tuple[pd.DataFrame, List[str]]:
@@ -398,7 +446,12 @@ def build_sequences(
 
     # Load labels
     oc = pd.read_csv(label_csv)
-    id_col, lab_col = _infer_label_columns(oc)
+    # Prefer patient_id for alignment when available; otherwise fall back
+    if "patient_id" in oc.columns:
+        id_col = "patient_id"
+        lab_col = _infer_label_columns(oc)[1]
+    else:
+        id_col, lab_col = _infer_label_columns(oc)
     oc["__pid__"] = oc[id_col].apply(_normalize_patient_id_to_str)
     label_map: Dict[str, int] = {
         str(pid): int(v) for pid, v in zip(oc["__pid__"].tolist(), oc[lab_col].tolist())
@@ -406,6 +459,8 @@ def build_sequences(
 
     # Build split id lists
     splits = _scan_split_ids(split_dir)
+    # If splits appear to contain ts_id, map them to patient_id using oc
+    splits = _maybe_map_split_ids_to_patient(splits, oc)
 
     # Optionally fit normalization on training set only
     mean_vec = None
