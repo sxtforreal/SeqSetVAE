@@ -624,7 +624,20 @@ def main():
     else:
         best_model = model
     if test_loader is not None:
-        trainer.test(best_model, dataloaders=test_loader)
+        results = trainer.test(best_model, dataloaders=test_loader)
+        # Explicitly print key test metrics (AUROC, AUPRC) after testing
+        if isinstance(results, list) and len(results) > 0 and isinstance(results[0], dict):
+            metrics = results[0]
+            def _fmt(v: Optional[float]) -> str:
+                try:
+                    return f"{float(v):.4f}"
+                except Exception:
+                    return "na"
+            auroc_v = _fmt(metrics.get("test_auroc"))
+            auprc_v = _fmt(metrics.get("test_auprc"))
+            acc_v = _fmt(metrics.get("test_acc"))
+            loss_v = _fmt(metrics.get("test_loss"))
+            print(f"Test metrics -> AUROC: {auroc_v} | AUPRC: {auprc_v} | ACC: {acc_v} | loss: {loss_v}")
     else:
         print("[WARN] Test split empty or used as training; skipping test evaluation.")
     print(f"Best checkpoint: {best_path}")
