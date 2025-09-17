@@ -48,7 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
 from torchmetrics.classification import AUROC, AveragePrecision, Accuracy
 
 
@@ -452,6 +452,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--patience", type=int, default=5, help="Early stopping patience (epochs)")
     ap.add_argument("--save_dir", type=str, default="/workspace/sofa_cls_runs")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--tqdm_refresh", type=int, default=1, help="TQDM refresh rate (steps)")
     return ap.parse_args()
 
 
@@ -527,13 +528,15 @@ def main():
         auto_insert_metric_name=False,
     )
     es_cb = EarlyStopping(monitor="val_auroc", mode="max", patience=args.patience)
+    prog_cb = TQDMProgressBar(refresh_rate=max(1, int(args.tqdm_refresh)))
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",
         devices="auto",
         log_every_n_steps=10,
-        callbacks=[ckpt_cb, es_cb],
+        callbacks=[ckpt_cb, es_cb, prog_cb],
         enable_checkpointing=True,
+        enable_progress_bar=True,
         deterministic=False,
     )
 
