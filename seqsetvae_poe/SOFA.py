@@ -36,6 +36,12 @@ try:
 except Exception:  # pragma: no cover - dependency missing is handled via README
     yaml = None
 
+# Optional progress bar (tqdm is optional dependency)
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover - tqdm optional
+    tqdm = None  # type: ignore
+
 
 # ----------------------------- Data Structures ----------------------------- #
 
@@ -356,8 +362,27 @@ def compute_sofa(df: pd.DataFrame, mapping: ColumnMapping) -> pd.DataFrame:
     df = df.sort_values([mapping.patient_id, "__event_time__"]).reset_index(drop=True)
     df = forward_fill_by_patient(df, mapping.patient_id)
 
-    # Compute subscores
-    subscores = df.apply(lambda row: compute_row_scores(row, mapping), axis=1, result_type="expand")
+    # Compute subscores with optional progress bar
+    if tqdm is not None and hasattr(tqdm, "pandas"):
+        try:
+            tqdm.pandas(desc="Computing SOFA subscores")
+            subscores = df.progress_apply(
+                lambda row: compute_row_scores(row, mapping),
+                axis=1,
+                result_type="expand",
+            )
+        except Exception:
+            subscores = df.apply(
+                lambda row: compute_row_scores(row, mapping),
+                axis=1,
+                result_type="expand",
+            )
+    else:
+        subscores = df.apply(
+            lambda row: compute_row_scores(row, mapping),
+            axis=1,
+            result_type="expand",
+        )
     subscores.columns = [
         "respiratory_score",
         "coagulation_score",
@@ -430,7 +455,10 @@ def _build_wide_from_lvcf_parquets(paths: List[str], *, time_unit: str = "m") ->
         and columns for SOFA variables available.
     """
     wides: List[pd.DataFrame] = []
-    for fp in paths:
+    file_iter = (
+        tqdm(paths, desc="Converting LVCF to wide", unit="file") if tqdm is not None else paths
+    )
+    for fp in file_iter:
         try:
             df = pd.read_parquet(fp, engine="pyarrow")
         except Exception as exc:
