@@ -296,8 +296,8 @@ def _greedy_match_recon_to_vars(
             best_j = int(np.argmax(sim[i]))
             best_s = float(sim[i, best_j])
         taken_vars.add(best_j)
-        # predicted value is projection onto unit direction
-        pred_val = float(np.dot(recon[i], var_dirs[best_j]))
+        # predicted numeric value = length (L2 norm) of reconstruction vector
+        pred_val = float(np.linalg.norm(recon[i]))
         assignments.append((variable_names[best_j], pred_val, best_s))
     # restore original recon order
     out = [None] * N  # type: ignore
@@ -433,12 +433,14 @@ def main():
             max_masks_per_set=max_masks_per_set,
         )
 
-        # Encode-decode using masked values
-        recon_t = _encode_decode_set(encoder, var_red, val_masked_t)
+        # Encode-decode using no-mask (clean) and masked values
+        recon_nomask_t = _encode_decode_set(encoder, var_red, val_t)
+        recon_mask_t = _encode_decode_set(encoder, var_red, val_masked_t)
 
         with torch.no_grad():
             var_dirs = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
-        recon_np = recon_t.squeeze(0).detach().cpu().numpy()
+        recon_nomask_np = recon_nomask_t.squeeze(0).detach().cpu().numpy()
+        recon_mask_np = recon_mask_t.squeeze(0).detach().cpu().numpy()
 
         # Build matching candidates per scope
         if args.match_scope == "global":
@@ -459,17 +461,22 @@ def main():
         for name, m in zip(set_event_names, rand_mask_np.tolist()):
             rand_by_name[name] = max(rand_by_name.get(name, 0.0), float(m))
 
-        assignments = _greedy_match_recon_to_vars(recon_np, var_dirs_np_local, event_names_local)
+        assignments_nomask = _greedy_match_recon_to_vars(recon_nomask_np, var_dirs_np_local, event_names_local)
+        assignments_mask = _greedy_match_recon_to_vars(recon_mask_np, var_dirs_np_local, event_names_local)
 
-        # Split into matched vs unmatched w.r.t. original set names
-        matched_items: List[Tuple[str, float, float]] = []
-        unmatched_items: List[Tuple[str, float, float]] = []
-        set_name_set = set(set_event_names)
-        for (matched_name, pred_val_norm, cos_sim) in assignments:
-            if matched_name in set_name_set:
-                matched_items.append((matched_name, pred_val_norm, cos_sim))
-            else:
-                unmatched_items.append((matched_name, pred_val_norm, cos_sim))
+        # Split into matched vs unmatched w.r.t. original set names (both modes)
+        def _split(assignments_list: List[Tuple[str, float, float]]):
+            matched: List[Tuple[str, float, float]] = []
+            unmatched: List[Tuple[str, float, float]] = []
+            names_set = set(set_event_names)
+            for (nm, valn, cs) in assignments_list:
+                if nm in names_set:
+                    matched.append((nm, valn, cs))
+                else:
+                    unmatched.append((nm, valn, cs))
+            return matched, unmatched
+        matched_nomask, unmatched_nomask = _split(assignments_nomask)
+        matched_mask, unmatched_mask = _split(assignments_mask)
 
         # Print results
         print("================ Random Test Set Reconstruction ================")
@@ -500,12 +507,35 @@ def main():
             tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
             print(f"  - {name}: {val_orig:.6f}{tag}")
         print("---------------------------------------------------------------")
-        print("Reconstruction grouped by match to original set:")
-        print(f"  Matched ({len(matched_items)}):")
-        if len(matched_items) == 0:
+        # No-mask predictions
+        print("Reconstruction (no-mask) grouped by match to original set:")
+        print(f"  Matched ({len(matched_nomask)}):")
+        if len(matched_nomask) == 0:
             print("    (none)")
         else:
-            for matched_name, pred_val_norm, cos_sim in matched_items:
+            for matched_name, pred_val_norm, cos_sim in matched_nomask:
+                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+                dst_tag_parts = []
+                if mask_by_name.get(matched_name, 0.0) > 0.5:
+                    dst_tag_parts.append("carry")
+                # no-mask mode: do not annotate random mask
+                dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
+                print(f"    - {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+        print(f"  Not matched ({len(unmatched_nomask)}):")
+        if len(unmatched_nomask) == 0:
+            print("    (none)")
+        else:
+            for matched_name, pred_val_norm, cos_sim in unmatched_nomask:
+                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
+                print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+
+        # PT-mask predictions
+        print("Reconstruction (PT-mask) grouped by match to original set:")
+        print(f"  Matched ({len(matched_mask)}):")
+        if len(matched_mask) == 0:
+            print("    (none)")
+        else:
+            for matched_name, pred_val_norm, cos_sim in matched_mask:
                 pred_orig = _denorm_value(matched_name, float(pred_val_norm))
                 dst_tag_parts = []
                 if mask_by_name.get(matched_name, 0.0) > 0.5:
@@ -514,11 +544,11 @@ def main():
                     dst_tag_parts.append("mask")
                 dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
                 print(f"    - {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
-        print(f"  Not matched ({len(unmatched_items)}):")
-        if len(unmatched_items) == 0:
+        print(f"  Not matched ({len(unmatched_mask)}):")
+        if len(unmatched_mask) == 0:
             print("    (none)")
         else:
-            for matched_name, pred_val_norm, cos_sim in unmatched_items:
+            for matched_name, pred_val_norm, cos_sim in unmatched_mask:
                 pred_orig = _denorm_value(matched_name, float(pred_val_norm))
                 print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
         print("===============================================================")
