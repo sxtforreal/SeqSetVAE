@@ -513,71 +513,53 @@ def main():
             tag = (" [" + ",".join(tag_parts) + "]") if tag_parts else ""
             print(f"  - {name}: {val_orig:.6f}{tag}")
         print("---------------------------------------------------------------")
-        # No-mask predictions
-        print("Reconstruction (no-mask) grouped by match to original set:")
-        print(f"  Matched ({len(matched_nomask)}):")
-        if len(matched_nomask) == 0:
-            print("    (none)")
-        else:
-            for matched_name, pred_val_norm, cos_sim in matched_nomask:
-                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-                dst_tag_parts = []
-                if mask_by_name.get(matched_name, 0.0) > 0.5:
-                    dst_tag_parts.append("carry")
-                # no-mask mode: do not annotate random mask
-                dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
-                print(f"    - {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
-        print(f"  Not matched ({len(unmatched_nomask)}):")
-        if len(unmatched_nomask) == 0:
-            print("    (none)")
-        else:
-            for matched_name, pred_val_norm, cos_sim in unmatched_nomask:
-                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-                print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+        # Matched results table: rows are variables, columns are modes
+        print("Reconstruction matched results (rows=variable, columns=mode):")
+        col_names = ["No-mask", "PT-mask", "Set-only (no-mask)"]
+        def _format_cell(var_name: str, pred_val_norm: float, cos_sim: float, *, include_rand_mask: bool) -> str:
+            pred_orig = _denorm_value(var_name, float(pred_val_norm))
+            tags: List[str] = []
+            if mask_by_name.get(var_name, 0.0) > 0.5:
+                tags.append("carry")
+            if include_rand_mask and rand_by_name.get(var_name, 0.0) > 0.5:
+                tags.append("mask")
+            tag_str = (" [" + ",".join(tags) + "]") if tags else ""
+            return f"{pred_orig:.6f}{tag_str} (cos={cos_sim:.3f})"
 
-        # PT-mask predictions
-        print("Reconstruction (PT-mask) grouped by match to original set:")
-        print(f"  Matched ({len(matched_mask)}):")
-        if len(matched_mask) == 0:
-            print("    (none)")
+        map_nomask = {n: _format_cell(n, v, c, include_rand_mask=False) for (n, v, c) in matched_nomask}
+        map_mask = {n: _format_cell(n, v, c, include_rand_mask=True) for (n, v, c) in matched_mask}
+        map_setonly = {n: _format_cell(n, v, c, include_rand_mask=False) for (n, v, c) in matched_set_only_nomask}
+
+        table_rows: List[Dict[str, str]] = []
+        for name in set_event_names:
+            table_rows.append({
+                "variable": name,
+                col_names[0]: map_nomask.get(name, ""),
+                col_names[1]: map_mask.get(name, ""),
+                col_names[2]: map_setonly.get(name, ""),
+            })
+        df_matched = pd.DataFrame(table_rows).set_index("variable")
+        if df_matched.shape[0] == 0:
+            print("  (none)")
         else:
-            for matched_name, pred_val_norm, cos_sim in matched_mask:
-                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-                dst_tag_parts = []
-                if mask_by_name.get(matched_name, 0.0) > 0.5:
-                    dst_tag_parts.append("carry")
-                if rand_by_name.get(matched_name, 0.0) > 0.5:
-                    dst_tag_parts.append("mask")
-                dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
-                print(f"    - {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
-        print(f"  Not matched ({len(unmatched_mask)}):")
-        if len(unmatched_mask) == 0:
-            print("    (none)")
+            print(df_matched.to_string())
+
+        # Unmatched results by mode, shown side-by-side (each column is a mode)
+        print("---------------------------------------------------------------")
+        print("Unmatched predictions by mode (each column is a mode):")
+        list_nomask = [f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})" for (n, v, c) in unmatched_nomask]
+        list_mask = [f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})" for (n, v, c) in unmatched_mask]
+        list_setonly = [f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})" for (n, v, c) in unmatched_set_only_nomask]
+        max_len = max(len(list_nomask), len(list_mask), len(list_setonly))
+        if max_len == 0:
+            print("  (none)")
         else:
-            for matched_name, pred_val_norm, cos_sim in unmatched_mask:
-                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-                print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
-        # Third mode display: set-only matching (no-mask)
-        print("Reconstruction (set-only, no-mask) grouped by match to original set:")
-        print(f"  Matched ({len(matched_set_only_nomask)}):")
-        if len(matched_set_only_nomask) == 0:
-            print("    (none)")
-        else:
-            for matched_name, pred_val_norm, cos_sim in matched_set_only_nomask:
-                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-                dst_tag_parts = []
-                if mask_by_name.get(matched_name, 0.0) > 0.5:
-                    dst_tag_parts.append("carry")
-                # set-only no-mask mode: do not annotate random mask
-                dst_tag = (" [" + ",".join(dst_tag_parts) + "]") if dst_tag_parts else ""
-                print(f"    - {matched_name}{dst_tag}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
-        print(f"  Not matched ({len(unmatched_set_only_nomask)}):")
-        if len(unmatched_set_only_nomask) == 0:
-            print("    (none)")
-        else:
-            for matched_name, pred_val_norm, cos_sim in unmatched_set_only_nomask:
-                pred_orig = _denorm_value(matched_name, float(pred_val_norm))
-                print(f"    - {matched_name}: {pred_orig:.6f}  (cos={cos_sim:.3f})")
+            df_unmatched = pd.DataFrame({
+                col_names[0]: list_nomask + [""] * (max_len - len(list_nomask)),
+                col_names[1]: list_mask + [""] * (max_len - len(list_mask)),
+                col_names[2]: list_setonly + [""] * (max_len - len(list_setonly)),
+            })
+            print(df_unmatched.to_string(index=False))
         print("===============================================================")
 
     # Sampling strategy
