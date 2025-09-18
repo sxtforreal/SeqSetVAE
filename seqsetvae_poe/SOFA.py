@@ -536,22 +536,53 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _collect_parquet_files_for_all_splits(input_path: str) -> List[str]:
+    """Collect parquet files ensuring all train/valid/test splits are included.
+
+    If the provided path points to one of the split directories (basename is one
+    of {train, valid, test}), this will also search the sibling split
+    directories under the same parent so that all patient parquet files across
+    splits are included. Otherwise, it searches recursively within the provided
+    directory. If a single parquet file is provided, it is returned as-is.
+    """
+
+    # Single file
+    if os.path.isfile(input_path):
+        return [input_path] if input_path.lower().endswith(".parquet") else []
+
+    inputs: List[str] = []
+    if os.path.isdir(input_path):
+        base = os.path.basename(os.path.normpath(input_path))
+        parent = os.path.dirname(os.path.normpath(input_path))
+        split_names = ["train", "valid", "test"]
+
+        # If pointing at a split dir, include siblings under the same parent
+        if base in split_names and os.path.isdir(parent):
+            for split in split_names:
+                split_dir = os.path.join(parent, split)
+                if os.path.isdir(split_dir):
+                    pattern_recursive = os.path.join(split_dir, "**", "*.parquet")
+                    pattern_flat = os.path.join(split_dir, "*.parquet")
+                    inputs.extend(glob.glob(pattern_recursive, recursive=True))
+                    inputs.extend(glob.glob(pattern_flat))
+        else:
+            # Default: search within the provided directory
+            pattern_recursive = os.path.join(input_path, "**", "*.parquet")
+            pattern_flat = os.path.join(input_path, "*.parquet")
+            inputs.extend(glob.glob(pattern_recursive, recursive=True))
+            inputs.extend(glob.glob(pattern_flat))
+
+    # Deduplicate and sort for stability
+    inputs = sorted(set(inputs))
+    return inputs
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     # Branch: LVCF Parquet long-format vs CSV wide-format
     if args.input_type == "lvcf_parquet":
-        # Collect parquet files from file or directory (recursive)
-        inputs: List[str] = []
-        if os.path.isdir(args.input):
-            # Prefer recursive search under typical split dirs
-            pattern = os.path.join(args.input, "**", "*.parquet")
-            inputs = sorted(glob.glob(pattern, recursive=True))
-            if not inputs:
-                # Also try flat dir
-                inputs = sorted(glob.glob(os.path.join(args.input, "*.parquet")))
-        else:
-            if args.input.lower().endswith(".parquet"):
-                inputs = [args.input]
+        # Collect parquet files ensuring all split directories are covered
+        inputs: List[str] = _collect_parquet_files_for_all_splits(args.input)
         if not inputs:
             print("No parquet files found for LVCF conversion.", file=sys.stderr)
             return 2
