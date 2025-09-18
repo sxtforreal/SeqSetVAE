@@ -71,7 +71,8 @@ def _normalize_patient_id_to_str(value) -> str:
 def _infer_label_columns(df: pd.DataFrame) -> Tuple[str, str]:
     """Infer id and label column names in the oc dataframe.
 
-    Prefers ('ts_id', 'in_hospital_mortality'), falls back to heuristics.
+    Returns a tuple (id_col, label_col). We will only use label_col in the
+    current pipeline but keep the utility intact.
     """
 
     id_candidates = ["ts_id", "patient_id", "subject_id", "id"]
@@ -120,68 +121,7 @@ def _scan_split_ids(split_dir: str) -> Dict[str, List[str]]:
     return out
 
 
-def _maybe_map_split_ids_to_patient(
-    splits: Dict[str, List[str]], oc_df: pd.DataFrame, split_id_kind: str = "auto"
-) -> Dict[str, List[str]]:
-    """Map split ids to patient_id if splits appear to contain ts_id.
-
-    Heuristic:
-      - If oc has both 'patient_id' and 'ts_id', sample split ids and count
-        how many exist in oc.patient_id vs oc.ts_id. If more look like ts_id,
-        map via ts_id -> patient_id and return new splits.
-      - Otherwise, return splits unchanged.
-    """
-
-    def _norm(v):
-        try:
-            return str(int(float(v)))
-        except Exception:
-            return str(v)
-
-    has_pid = "patient_id" in oc_df.columns
-    has_tid = "ts_id" in oc_df.columns
-    if not has_pid:
-        return splits
-
-    oc_pids = set(oc_df["patient_id"].map(_norm))
-    oc_tids = set(oc_df["ts_id"].map(_norm)) if has_tid else set()
-    ts2pid = (
-        dict(zip(oc_df["ts_id"].map(_norm), oc_df["patient_id"].map(_norm)))
-        if has_tid
-        else {}
-    )
-
-    # Explicit modes
-    if split_id_kind == "patient_id":
-        return splits
-    if split_id_kind == "ts_id":
-        if not has_tid:
-            raise ValueError(
-                "split_id_kind=ts_id but 'ts_id' column not found in label CSV"
-            )
-        mapped: Dict[str, List[str]] = {}
-        for part, ids in splits.items():
-            mapped_ids = [ts2pid[s] for s in ids if s in ts2pid]
-            mapped[part] = mapped_ids
-        return mapped
-
-    # Auto heuristic
-    # Probe the id space of splits
-    sampled: List[str] = []
-    for part in ("train", "valid", "test"):
-        ids = splits.get(part, [])
-        if ids:
-            sampled.extend(ids[: min(1000, len(ids))])
-    in_pid = sum(1 for s in sampled if s in oc_pids)
-    in_tid = sum(1 for s in sampled if s in oc_tids)
-
-    if has_tid and in_tid > in_pid:
-        mapped: Dict[str, List[str]] = {}
-        for part, ids in splits.items():
-            mapped_ids = [ts2pid[s] for s in ids if s in ts2pid]
-            mapped[part] = mapped_ids
-        return mapped
-    return splits
+## Heuristic mapping removed in favor of strict ts_id -> patient_id via label CSV
 
 
 def _build_feature_matrix(
@@ -423,7 +363,6 @@ def build_sequences(
     feature_set: str,
     max_len: Optional[int] = None,
     normalize: bool = False,
-    split_id_kind: str = "auto",
     debug_alignment: bool = False,
 ) -> Tuple[Dict[str, PatientSequence], Dict[str, List[str]], List[str]]:
     """Load data, align splits and build per-patient sequences.
@@ -478,40 +417,33 @@ def build_sequences(
         df_feat["dt_hours"] = df_feat["dt_hours"].fillna(0.0).clip(lower=0.0)
         feature_names = feature_names + ["dt_hours"]
 
-    # Load labels
+    # Load labels (must contain both 'ts_id' and 'patient_id')
     oc = pd.read_csv(label_csv)
-    # Prefer patient_id for alignment when available; otherwise fall back
-    if "patient_id" in oc.columns:
-        id_col = "patient_id"
-        lab_col = _infer_label_columns(oc)[1]
-    else:
-        id_col, lab_col = _infer_label_columns(oc)
-    oc["__pid__"] = oc[id_col].apply(_normalize_patient_id_to_str)
+    if "ts_id" not in oc.columns or "patient_id" not in oc.columns:
+        raise ValueError("label_csv must contain columns 'ts_id' and 'patient_id'")
+    # Determine label column
+    _, lab_col = _infer_label_columns(oc)
+    oc["__ts__"] = oc["ts_id"].apply(_normalize_patient_id_to_str)
+    oc["__pid__"] = oc["patient_id"].apply(_normalize_patient_id_to_str)
+    ts_to_pid: Dict[str, str] = dict(zip(oc["__ts__"].tolist(), oc["__pid__"].tolist()))
+    # Labels keyed by patient_id
     label_map: Dict[str, int] = {
-        str(pid): int(v) for pid, v in zip(oc["__pid__"].tolist(), oc[lab_col].tolist())
+        pid: int(lab) for pid, lab in zip(oc["__pid__"].tolist(), oc[lab_col].tolist())
     }
-    oc_pids = set(oc["__pid__"].tolist())
-    oc_tids = set(
-        oc["ts_id"].apply(_normalize_patient_id_to_str).tolist()
-    ) if "ts_id" in oc.columns else set()
 
-    # Build split id lists
-    splits = _scan_split_ids(split_dir)
+    # Build split ts_id lists by scanning parquet basenames, then map to patient_id
+    raw_splits_ts = _scan_split_ids(split_dir)
     if debug_alignment:
-        print("[align] Raw split counts:", {k: len(v) for k, v in splits.items()})
-        print(
-            "[align] Raw split IDs present in labels as patient_id:",
-            {k: sum(1 for s in v if s in oc_pids) for k, v in splits.items()},
-        )
-        if len(oc_tids) > 0:
-            print(
-                "[align] Raw split IDs present in labels as ts_id:",
-                {k: sum(1 for s in v if s in oc_tids) for k, v in splits.items()},
-            )
-    # If splits appear to contain ts_id, map them to patient_id using oc (or force per arg)
-    splits = _maybe_map_split_ids_to_patient(splits, oc, split_id_kind=split_id_kind)
+        print("[align] Raw split counts (ts_id):", {k: len(v) for k, v in raw_splits_ts.items()})
+        present_ts = {k: sum(1 for s in v if s in ts_to_pid) for k, v in raw_splits_ts.items()}
+        print("[align] ts_id present in label_csv:", present_ts)
+    # Map ts_id -> patient_id using label_csv; drop missing
+    splits: Dict[str, List[str]] = {}
+    for part, ts_ids in raw_splits_ts.items():
+        mapped_pids = [ts_to_pid[ts] for ts in ts_ids if ts in ts_to_pid]
+        splits[part] = mapped_pids
     if debug_alignment:
-        print("[align] Split counts after ts_id->patient_id mapping (if applied):", {k: len(v) for k, v in splits.items()})
+        print("[align] Split counts after ts_id->patient_id mapping:", {k: len(v) for k, v in splits.items()})
 
     # Optionally fit normalization on training set only
     mean_vec = None
@@ -625,29 +557,9 @@ def parse_args() -> argparse.Namespace:
         "--tqdm_refresh", type=int, default=1, help="TQDM refresh rate (steps)"
     )
     ap.add_argument(
-        "--split_id_kind",
-        choices=["auto", "patient_id", "ts_id"],
-        default="auto",
-        help="How to interpret split file basenames: patient_id, ts_id, or auto-detect",
-    )
-    ap.add_argument(
         "--debug_alignment",
         action="store_true",
         help="Print detailed alignment diagnostics for splits/labels/SOFA",
-    )
-    ap.add_argument(
-        "--allow_partial_splits",
-        action="store_true",
-        help="Allow proceeding when some splits (valid/test) are empty; requires non-empty training data",
-    )
-    ap.add_argument(
-        "--fallback_train_split",
-        choices=["valid", "test", "auto"],
-        default=None,
-        help=(
-            "If training split is empty and --allow_partial_splits is set, use the specified non-empty split as training data. "
-            "'auto' prefers 'valid' then 'test'. The chosen fallback split will be removed from evaluation to avoid leakage."
-        ),
     )
     return ap.parse_args()
 
@@ -664,7 +576,6 @@ def main():
         feature_set=args.feature_set,
         max_len=args.max_len,
         normalize=args.normalize,
-        split_id_kind=args.split_id_kind,
         debug_alignment=args.debug_alignment,
     )
 
@@ -672,40 +583,11 @@ def main():
     val_ids = splits["valid"]
     test_ids = splits["test"]
 
-    # Enforce/relax split availability
-    if (len(train_ids) == 0 or len(val_ids) == 0 or len(test_ids) == 0) and (
-        not args.allow_partial_splits
-    ):
+    # Enforce split availability strictly (no partial/fallback)
+    if len(train_ids) == 0 or len(val_ids) == 0 or len(test_ids) == 0:
         raise RuntimeError(
             "Empty split after alignment; ensure SOFA CSV and labels cover the split_dir patients"
         )
-
-    # If training is empty but partial allowed, optionally fall back to a non-empty split for training
-    if len(train_ids) == 0 and args.allow_partial_splits:
-        fallback_choice = None
-        if args.fallback_train_split == "valid" and len(val_ids) > 0:
-            fallback_choice = "valid"
-        elif args.fallback_train_split == "test" and len(test_ids) > 0:
-            fallback_choice = "test"
-        elif args.fallback_train_split == "auto":
-            if len(val_ids) > 0:
-                fallback_choice = "valid"
-            elif len(test_ids) > 0:
-                fallback_choice = "test"
-
-        if fallback_choice is not None:
-            if fallback_choice == "valid":
-                train_ids = val_ids
-                val_ids = []  # avoid leakage
-            elif fallback_choice == "test":
-                train_ids = test_ids
-                test_ids = []  # avoid leakage
-        # If still empty, cannot proceed
-        if len(train_ids) == 0:
-            raise RuntimeError(
-                "Training split is empty after alignment and no usable fallback provided. "
-                "Set --fallback_train_split (valid/test/auto) or fix inputs."
-            )
 
     train_ds = SofaSequenceDataset(train_ids, seq_map)
     val_ds = SofaSequenceDataset(val_ids, seq_map)
