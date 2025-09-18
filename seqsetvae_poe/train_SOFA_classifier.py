@@ -3,11 +3,12 @@
 Train a binary classifier on variable-length SOFA score sequences.
 
 Inputs:
-- A CSV produced by `seqsetvae_poe/SOFA.py` with columns including:
-  ['patient_id', 'event_time', 'set_index'(optional), 'respiratory_score',
-   'coagulation_score', 'liver_score', 'cardiovascular_score', 'cns_score',
-   'renal_score', 'sofa_total']
+- A CSV produced by `seqsetvae_poe/SOFA.py` with columns including either
+  an identifier column 'patient_id' or 'ts_id', plus:
+  ['event_time', 'set_index'(optional), 'respiratory_score', 'coagulation_score',
+   'liver_score', 'cardiovascular_score', 'cns_score', 'renal_score', 'sofa_total']
 - An outcome CSV ("oc") with columns like ['ts_id', 'in_hospital_mortality'].
+  If 'patient_id' is absent, it will be inferred from 'ts_id' (identity mapping).
 - A directory with existing train/valid/test splits (per-patient Parquets).
 
 The script derives splits by listing patient file basenames under
@@ -376,6 +377,12 @@ def build_sequences(
     df = pd.read_csv(sofa_csv)
     if "event_time" not in df.columns:
         raise ValueError("SOFA CSV must contain 'event_time' column")
+    # Accept either 'patient_id' or 'ts_id' as the identifier column in SOFA CSV
+    if "patient_id" not in df.columns:
+        if "ts_id" in df.columns:
+            df["patient_id"] = df["ts_id"]
+        else:
+            raise ValueError("SOFA CSV must contain an identifier column 'patient_id' or 'ts_id'")
     df["patient_id"] = df["patient_id"].apply(_normalize_patient_id_to_str)
     df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce")
     if df["event_time"].isna().any():
@@ -417,10 +424,13 @@ def build_sequences(
         df_feat["dt_hours"] = df_feat["dt_hours"].fillna(0.0).clip(lower=0.0)
         feature_names = feature_names + ["dt_hours"]
 
-    # Load labels (must contain both 'ts_id' and 'patient_id')
+    # Load labels (must contain 'ts_id'; 'patient_id' optional and inferred if missing)
     oc = pd.read_csv(label_csv)
-    if "ts_id" not in oc.columns or "patient_id" not in oc.columns:
-        raise ValueError("label_csv must contain columns 'ts_id' and 'patient_id'")
+    if "ts_id" not in oc.columns:
+        raise ValueError("label_csv must contain column 'ts_id'")
+    if "patient_id" not in oc.columns:
+        # Identity mapping: use ts_id as patient_id when not provided
+        oc["patient_id"] = oc["ts_id"]
     # Determine label column
     _, lab_col = _infer_label_columns(oc)
     oc["__ts__"] = oc["ts_id"].apply(_normalize_patient_id_to_str)
