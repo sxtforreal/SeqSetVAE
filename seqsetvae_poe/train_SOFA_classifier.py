@@ -9,11 +9,13 @@ Inputs:
    'liver_score', 'cardiovascular_score', 'cns_score', 'renal_score', 'sofa_total']
 - An outcome CSV ("oc") with columns like ['ts_id', 'in_hospital_mortality'].
   If 'patient_id' is absent, it will be inferred from 'ts_id' (identity mapping).
-- A directory with existing train/valid/test splits (per-patient Parquets).
+- EITHER a JSON file specifying split ts_id lists, e.g. {"train": ["200001", ...],
+  "valid": [...], "test": [...]}, OR a directory containing train/valid/test
+  per-patient Parquets under split_dir/{train,valid,test}/*.parquet.
 
-The script derives splits by listing patient file basenames under
-  split_dir/{train,valid,test}/*.parquet
-and then selecting corresponding patients in the SOFA table and labels.
+When --split_json is provided, splits are taken directly from that file.
+Otherwise, the script derives splits by listing parquet basenames in
+split_dir/{train,valid,test}.
 
 Model:
 - GRU-based sequence classifier using variable-length packing
@@ -43,6 +45,7 @@ from __future__ import annotations
 import argparse
 import os
 import glob
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -123,6 +126,37 @@ def _scan_split_ids(split_dir: str) -> Dict[str, List[str]]:
 
 
 ## Heuristic mapping removed in favor of strict ts_id -> patient_id via label CSV
+
+
+def _load_split_ids_from_json(split_json: str) -> Dict[str, List[str]]:
+    """Load split ts_id arrays from a JSON file.
+
+    Expected structure:
+    {
+      "train": ["200001", "200006", ...],
+      "valid": [ ... ],
+      "test":  [ ... ]
+    }
+
+    Values may be strings or numbers; they will be normalized to canonical strings.
+    Missing keys default to empty lists.
+    """
+
+    with open(split_json, "r") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError("split_json must contain a JSON object with keys train/valid/test")
+    out: Dict[str, List[str]] = {}
+    for part in ["train", "valid", "test"]:
+        raw_list = obj.get(part, [])
+        if raw_list is None:
+            raw_list = []
+        if not isinstance(raw_list, list):
+            raise ValueError(f"split_json[{part}] must be a list")
+        out[part] = [_normalize_patient_id_to_str(v) for v in raw_list]
+    if len(out["train"]) == 0:
+        raise ValueError("split_json must include a non-empty 'train' list")
+    return out
 
 
 def _build_feature_matrix(
@@ -360,11 +394,12 @@ class GRUSequenceClassifier(pl.LightningModule):
 def build_sequences(
     sofa_csv: str,
     label_csv: str,
-    split_dir: str,
+    split_dir: Optional[str],
     feature_set: str,
     max_len: Optional[int] = None,
     normalize: bool = False,
     debug_alignment: bool = False,
+    split_json: Optional[str] = None,
 ) -> Tuple[Dict[str, PatientSequence], Dict[str, List[str]], List[str]]:
     """Load data, align splits and build per-patient sequences.
 
@@ -446,8 +481,13 @@ def build_sequences(
         if ts in ts_overlap
     }
 
-    # Build split ts_id lists by scanning parquet basenames
-    raw_splits_ts = _scan_split_ids(split_dir)
+    # Build split ts_id lists: prefer explicit JSON if provided, else scan directory
+    if split_json is None and split_dir is None:
+        raise ValueError("Provide either --split_json or --split_dir for building splits")
+    if split_json is not None:
+        raw_splits_ts = _load_split_ids_from_json(split_json)
+    else:
+        raw_splits_ts = _scan_split_ids(str(split_dir))
     if debug_alignment:
         print("[align] Raw split counts (ts_id):", {k: len(v) for k, v in raw_splits_ts.items()})
         present_ts = {k: sum(1 for s in v if s in ts_overlap) for k, v in raw_splits_ts.items()}
@@ -478,7 +518,7 @@ def build_sequences(
         train_df = df_feat[df_feat["ts_id"].isin(set(splits["train"]))]
         if len(train_df) == 0:
             raise RuntimeError(
-                "No training rows found in SOFA CSV for the provided split_dir"
+                "No training rows found in SOFA CSV for the provided splits"
             )
         mean_vec = (
             train_df[feature_names]
@@ -545,8 +585,13 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--split_dir",
-        required=True,
+        default=None,
         help="Root directory containing train/valid/test per-patient Parquets",
+    )
+    ap.add_argument(
+        "--split_json",
+        default=None,
+        help="JSON file specifying split ts_id lists: keys train/valid/test",
     )
     ap.add_argument(
         "--feature_set",
@@ -603,16 +648,17 @@ def main():
         max_len=args.max_len,
         normalize=args.normalize,
         debug_alignment=args.debug_alignment,
+        split_json=args.split_json,
     )
 
     train_ids = splits["train"]
     val_ids = splits["valid"]
     test_ids = splits["test"]
 
-    # Enforce split availability strictly (no partial/fallback)
-    if len(train_ids) == 0 or len(val_ids) == 0 or len(test_ids) == 0:
+    # Require only non-empty training set; validation/test optional
+    if len(train_ids) == 0:
         raise RuntimeError(
-            "Empty split after alignment; ensure SOFA CSV and labels cover the split_dir patients"
+            "Empty training split after alignment; ensure SOFA/labels and split mapping overlap"
         )
 
     train_ds = SofaSequenceDataset(train_ids, seq_map)
