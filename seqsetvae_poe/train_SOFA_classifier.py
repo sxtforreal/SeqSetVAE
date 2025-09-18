@@ -377,13 +377,13 @@ def build_sequences(
     df = pd.read_csv(sofa_csv)
     if "event_time" not in df.columns:
         raise ValueError("SOFA CSV must contain 'event_time' column")
-    # Accept either 'patient_id' or 'ts_id' as the identifier column in SOFA CSV
-    if "patient_id" not in df.columns:
-        if "ts_id" in df.columns:
-            df["patient_id"] = df["ts_id"]
+    # Ensure a canonical 'ts_id' column exists for alignment
+    if "ts_id" not in df.columns:
+        if "patient_id" in df.columns:
+            df["ts_id"] = df["patient_id"]
         else:
-            raise ValueError("SOFA CSV must contain an identifier column 'patient_id' or 'ts_id'")
-    df["patient_id"] = df["patient_id"].apply(_normalize_patient_id_to_str)
+            raise ValueError("SOFA CSV must contain an identifier column 'ts_id' or 'patient_id'")
+    df["ts_id"] = df["ts_id"].apply(_normalize_patient_id_to_str)
     df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce")
     if df["event_time"].isna().any():
         raise ValueError("Invalid timestamps present in SOFA CSV")
@@ -396,7 +396,7 @@ def build_sequences(
 
     df_feat = pd.concat(
         [
-            df[["patient_id", "event_time"]].reset_index(drop=True),
+            df[["ts_id", "event_time"]].reset_index(drop=True),
             features_df.reset_index(drop=True),
         ],
         axis=1,
@@ -405,17 +405,17 @@ def build_sequences(
     # Handle missing values according to feature selection
     if feature_set.lower() == "total":
         # Use only sofa_total; drop rows with NaN (no fill)
-        df_feat = df_feat.sort_values(["patient_id", "event_time"]).copy()
+        df_feat = df_feat.sort_values(["ts_id", "event_time"]).copy()
         df_feat = df_feat[df_feat["sofa_total"].notna()].reset_index(drop=True)
     else:
         # Multi-feature: drop rows that contain any NaN in selected features
-        df_feat = df_feat.sort_values(["patient_id", "event_time"]).copy()
+        df_feat = df_feat.sort_values(["ts_id", "event_time"]).copy()
         df_feat = df_feat.dropna(subset=feature_names).reset_index(drop=True)
 
     # Append time-interval feature (hours) between consecutive sets per patient
     if len(df_feat) > 0:
         df_feat["dt_hours"] = (
-            df_feat.groupby("patient_id")["event_time"]
+            df_feat.groupby("ts_id")["event_time"]
             .diff()
             .dt.total_seconds()
             .div(3600.0)
@@ -424,42 +424,58 @@ def build_sequences(
         df_feat["dt_hours"] = df_feat["dt_hours"].fillna(0.0).clip(lower=0.0)
         feature_names = feature_names + ["dt_hours"]
 
-    # Load labels (must contain 'ts_id'; 'patient_id' optional and inferred if missing)
+    # Load labels (must contain 'ts_id'; 'patient_id' optional)
     oc = pd.read_csv(label_csv)
     if "ts_id" not in oc.columns:
-        raise ValueError("label_csv must contain column 'ts_id'")
-    if "patient_id" not in oc.columns:
-        # Identity mapping: use ts_id as patient_id when not provided
-        oc["patient_id"] = oc["ts_id"]
+        if "patient_id" in oc.columns:
+            oc["ts_id"] = oc["patient_id"]
+        else:
+            raise ValueError("label_csv must contain column 'ts_id' or 'patient_id'")
     # Determine label column
     _, lab_col = _infer_label_columns(oc)
     oc["__ts__"] = oc["ts_id"].apply(_normalize_patient_id_to_str)
-    oc["__pid__"] = oc["patient_id"].apply(_normalize_patient_id_to_str)
-    ts_to_pid: Dict[str, str] = dict(zip(oc["__ts__"].tolist(), oc["__pid__"].tolist()))
-    # Labels keyed by patient_id
+
+    # Build overlap on ts_id between OC and SOFA
+    df["__ts__"] = df["ts_id"].apply(_normalize_patient_id_to_str)
+    ts_overlap: set[str] = set(oc["__ts__"].tolist()) & set(df["__ts__"].tolist())
+
+    # Labels keyed by ts_id (restricted to overlap)
     label_map: Dict[str, int] = {
-        pid: int(lab) for pid, lab in zip(oc["__pid__"].tolist(), oc[lab_col].tolist())
+        ts: int(lab)
+        for ts, lab in zip(oc["__ts__"].tolist(), oc[lab_col].tolist())
+        if ts in ts_overlap
     }
 
-    # Build split ts_id lists by scanning parquet basenames, then map to patient_id
+    # Build split ts_id lists by scanning parquet basenames
     raw_splits_ts = _scan_split_ids(split_dir)
     if debug_alignment:
         print("[align] Raw split counts (ts_id):", {k: len(v) for k, v in raw_splits_ts.items()})
-        present_ts = {k: sum(1 for s in v if s in ts_to_pid) for k, v in raw_splits_ts.items()}
-        print("[align] ts_id present in label_csv:", present_ts)
-    # Map ts_id -> patient_id using label_csv; drop missing
-    splits: Dict[str, List[str]] = {}
-    for part, ts_ids in raw_splits_ts.items():
-        mapped_pids = [ts_to_pid[ts] for ts in ts_ids if ts in ts_to_pid]
-        splits[part] = mapped_pids
+        present_ts = {k: sum(1 for s in v if s in ts_overlap) for k, v in raw_splits_ts.items()}
+        print("[align] ts_id present in OC∩SOFA:", present_ts)
+    # Enforce split assumptions: train∩test=∅; valid may contain test -> use valid\test
+    train_ts = list(dict.fromkeys(raw_splits_ts.get("train", [])))
+    valid_ts_raw = list(dict.fromkeys(raw_splits_ts.get("valid", [])))
+    test_ts = list(dict.fromkeys(raw_splits_ts.get("test", [])))
+    # Remove any accidental overlap between train and test
+    test_set = set(test_ts)
+    train_ts = [t for t in train_ts if t not in test_set]
+    # valid := valid \ test
+    valid_ts = [v for v in valid_ts_raw if v not in test_set]
+    # Finally restrict each split to the OC∩SOFA overlap
+    overlap = ts_overlap
+    splits: Dict[str, List[str]] = {
+        "train": [t for t in train_ts if t in overlap],
+        "valid": [v for v in valid_ts if v in overlap],
+        "test": [t for t in test_ts if t in overlap],
+    }
     if debug_alignment:
-        print("[align] Split counts after ts_id->patient_id mapping:", {k: len(v) for k, v in splits.items()})
+        print("[align] Split counts after enforcing overlap & valid\\test:", {k: len(v) for k, v in splits.items()})
 
     # Optionally fit normalization on training set only
     mean_vec = None
     std_vec = None
     if normalize:
-        train_df = df_feat[df_feat["patient_id"].isin(set(splits["train"]))]
+        train_df = df_feat[df_feat["ts_id"].isin(set(splits["train"]))]
         if len(train_df) == 0:
             raise RuntimeError(
                 "No training rows found in SOFA CSV for the provided split_dir"
@@ -478,8 +494,8 @@ def build_sequences(
     # Build per-patient sequences
     seq_map: Dict[str, PatientSequence] = {}
     # Track which patients have at least one valid row after feature/NaN filtering
-    available_patient_ids = set(df_feat["patient_id"].unique().tolist())
-    for pid, g in df_feat.groupby("patient_id", sort=False):
+    available_ts_ids = set(df_feat["ts_id"].unique().tolist())
+    for pid, g in df_feat.groupby("ts_id", sort=False):
         if pid not in label_map:
             continue
         g_sorted = g.sort_values("event_time")
@@ -501,8 +517,8 @@ def build_sequences(
         splits[part] = [pid for pid in before if pid in seq_map]
         if debug_alignment:
             dropped_missing_label = [pid for pid in before if pid not in label_map]
-            dropped_missing_sofa = [pid for pid in before if pid not in available_patient_ids]
-            dropped_other = [pid for pid in before if pid not in seq_map and pid in label_map and pid in available_patient_ids]
+            dropped_missing_sofa = [pid for pid in before if pid not in available_ts_ids]
+            dropped_other = [pid for pid in before if pid not in seq_map and pid in label_map and pid in available_ts_ids]
             print(
                 f"[align] {part}: kept={len(splits[part])}, dropped_missing_label={len(dropped_missing_label)}, dropped_missing_sofa={len(dropped_missing_sofa)}, dropped_other={len(dropped_other)}"
             )
