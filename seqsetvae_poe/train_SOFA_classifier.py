@@ -72,6 +72,35 @@ def _normalize_patient_id_to_str(value) -> str:
         return str(value)
 
 
+def _normalize_patient_id_to_digits_str(value) -> str:
+    """Normalize identifiers by extracting only the digit characters.
+
+    Examples:
+      - "200003.parquet" -> "200003"
+      - " id-00123 " -> "123"
+      - 200003.0 -> "200003"
+
+    Falls back to the generic normalization when no digits are present.
+    """
+
+    try:
+        # Fast path if value looks numeric
+        return str(int(float(value)))
+    except Exception:
+        import re
+
+        s = str(value)
+        matches = re.findall(r"\d+", s)
+        if not matches:
+            # No digits found; fall back to original string
+            return s
+        # Prefer the longest contiguous digit sequence
+        longest = max(matches, key=len)
+        try:
+            return str(int(longest))
+        except Exception:
+            return longest
+
 def _infer_label_columns(df: pd.DataFrame) -> Tuple[str, str]:
     """Infer id and label column names in the oc dataframe.
 
@@ -128,7 +157,7 @@ def _scan_split_ids(split_dir: str) -> Dict[str, List[str]]:
 ## Heuristic mapping removed in favor of strict ts_id -> patient_id via label CSV
 
 
-def _load_split_ids_from_json(split_json: str) -> Dict[str, List[str]]:
+def _load_split_ids_from_json(split_json: str, digits_only: bool = False) -> Dict[str, List[str]]:
     """Load split ts_id arrays from a JSON file.
 
     Expected structure:
@@ -153,7 +182,10 @@ def _load_split_ids_from_json(split_json: str) -> Dict[str, List[str]]:
             raw_list = []
         if not isinstance(raw_list, list):
             raise ValueError(f"split_json[{part}] must be a list")
-        out[part] = [_normalize_patient_id_to_str(v) for v in raw_list]
+        if digits_only:
+            out[part] = [_normalize_patient_id_to_digits_str(v) for v in raw_list]
+        else:
+            out[part] = [_normalize_patient_id_to_str(v) for v in raw_list]
     if len(out["train"]) == 0:
         raise ValueError("split_json must include a non-empty 'train' list")
     return out
@@ -400,6 +432,7 @@ def build_sequences(
     normalize: bool = False,
     debug_alignment: bool = False,
     split_json: Optional[str] = None,
+    split_json_digits_only: bool = False,
 ) -> Tuple[Dict[str, PatientSequence], Dict[str, List[str]], List[str]]:
     """Load data, align splits and build per-patient sequences.
 
@@ -485,13 +518,37 @@ def build_sequences(
     if split_json is None and split_dir is None:
         raise ValueError("Provide either --split_json or --split_dir for building splits")
     if split_json is not None:
-        raw_splits_ts = _load_split_ids_from_json(split_json)
+        raw_splits_ts = _load_split_ids_from_json(split_json, digits_only=split_json_digits_only)
     else:
         raw_splits_ts = _scan_split_ids(str(split_dir))
     if debug_alignment:
         print("[align] Raw split counts (ts_id):", {k: len(v) for k, v in raw_splits_ts.items()})
         present_ts = {k: sum(1 for s in v if s in ts_overlap) for k, v in raw_splits_ts.items()}
         print("[align] ts_id present in OC∩SOFA:", present_ts)
+        # If there are suspiciously low hits, try digits-only normalization as a diagnostic
+        if not split_json_digits_only:
+            diag_digits_only = {
+                k: [_normalize_patient_id_to_digits_str(x) for x in v]
+                for k, v in raw_splits_ts.items()
+            }
+            present_digits = {k: sum(1 for s in v if s in ts_overlap) for k, v in diag_digits_only.items()}
+            print("[align] (diag) ts_id present if digits-only normalization applied:", present_digits)
+            # Show a few mismatch examples for the most problematic split
+            try:
+                worst_key = min(present_ts.keys(), key=lambda kk: (present_ts[kk] / max(1, len(raw_splits_ts.get(kk, [])))))
+            except Exception:
+                worst_key = "train"
+            mismatches = []
+            for s_raw in raw_splits_ts.get(worst_key, [])[:2000]:
+                if s_raw not in ts_overlap:
+                    s_digits = _normalize_patient_id_to_digits_str(s_raw)
+                    mismatches.append((s_raw, s_digits, (s_digits in ts_overlap)))
+                if len(mismatches) >= 5:
+                    break
+            if mismatches:
+                print("[align] Examples of non-overlap IDs and digits-only rescue (raw -> digits -> in_overlap):")
+                for a, b, ok in mismatches:
+                    print(f"  {a!r} -> {b!r} -> {ok}")
     # Enforce split assumptions: train∩test=∅; valid may contain test -> use valid\test
     train_ts = list(dict.fromkeys(raw_splits_ts.get("train", [])))
     valid_ts_raw = list(dict.fromkeys(raw_splits_ts.get("valid", [])))
@@ -594,6 +651,11 @@ def parse_args() -> argparse.Namespace:
         help="JSON file specifying split ts_id lists: keys train/valid/test",
     )
     ap.add_argument(
+        "--split_json_digits_only",
+        action="store_true",
+        help="When reading --split_json, extract digits from IDs (e.g., '123.parquet' -> '123')",
+    )
+    ap.add_argument(
         "--feature_set",
         default="total",
         choices=["total", "subscores", "all"],
@@ -649,6 +711,7 @@ def main():
         normalize=args.normalize,
         debug_alignment=args.debug_alignment,
         split_json=args.split_json,
+        split_json_digits_only=args.split_json_digits_only,
     )
 
     train_ids = splits["train"]
