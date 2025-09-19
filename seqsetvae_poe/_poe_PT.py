@@ -44,7 +44,7 @@ def main():
         "--run_name", type=str, default="PoE-GRU-PT", help="TensorBoard run name subfolder"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="./output", help="Root out_dir for experiments (saves to out_dir/setvae-PT/version_X/{logs,checkpoints,eval})"
+        "--output_dir", type=str, default="./output", help="Root out_dir for experiments (saves to out_dir/POE/version_X/{logs,checkpoints,eval})"
     )
     parser.add_argument(
         "--resume_ckpt",
@@ -183,9 +183,9 @@ def main():
             print(f"⚠️  Failed to initialize from init_ckpt: {e}")
 
     # Loggers & callbacks with standardized directory layout:
-    # out_dir/setvae-PT/version_X/{logs,checkpoints,eval}
+    # out_dir/POE/version_X/{logs,checkpoints,eval}
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "setvae-PT")
+    project_dir = os.path.join(out_root, "POE")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
