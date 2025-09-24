@@ -576,14 +576,6 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--precision", type=str, default="16-mixed")
     ap.add_argument(
-        "--pos_weight",
-        type=float,
-        default=None,
-        help=
-            "Override positive-class weight for BCEWithLogits (>1 emphasizes positives). "
-            "If unset, uses train-set n_neg/n_pos.",
-    )
-    ap.add_argument(
         "--output_dir",
         type=str,
         default="/home/sunx/data/aiiih/projects/sunx/projects/SSV/output",
@@ -621,15 +613,8 @@ def main():
         gru_layers=2,
         dropout=args.dropout,
         lr=args.lr,
-        pos_weight=(
-            args.pos_weight if args.pos_weight is not None else getattr(dm, "pos_weight", None)
-        ),
+        pos_weight=getattr(dm, "pos_weight", None),
     )
-
-    used_pos_weight = (
-        args.pos_weight if args.pos_weight is not None else getattr(dm, "pos_weight", None)
-    )
-    print(f"Classifier pos_weight: {used_pos_weight}")
 
     # Logging/checkpoints under a consistent layout
     out_root = args.output_dir if args.output_dir else "./output"
