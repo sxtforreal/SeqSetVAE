@@ -17,8 +17,8 @@ Usage example:
     --batch_size 4 --max_epochs 10 --num_workers 2 \
     --time_mode delta   # or none
 
-label_csv must contain at least two columns: patient_id,label (0/1)
-where patient_id equals parquet filename stem under {train,valid,test}.
+label_csv must contain at least two columns: ts_id,in_hospital_mortality (0/1)
+where ts_id equals parquet filename stem under {train,valid,test}.
 """
 
 import os
@@ -34,7 +34,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from lightning.pytorch.callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    LearningRateMonitor,
+)
 from lightning.pytorch.loggers import TensorBoardLogger
 
 # Optional metrics (fall back gracefully if unavailable)
@@ -62,7 +66,9 @@ def _load_state_dict(path: str) -> Dict[str, torch.Tensor]:
         raise RuntimeError("Checkpoint does not contain a state_dict")
     # Strip Lightning's 'model.' prefix if present
     if any(k.startswith("model.") for k in state.keys()):
-        state = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
+        state = {
+            k[len("model.") :]: v for k, v in state.items() if k.startswith("model.")
+        }
     return state
 
 
@@ -110,16 +116,32 @@ def _read_label_map(label_csv: str) -> Dict[str, int]:
     mp: Dict[str, int] = {}
     with open(label_csv, "r") as f:
         reader = csv.DictReader(f)
-        assert "patient_id" in reader.fieldnames and "label" in reader.fieldnames, "label_csv must contain patient_id,label columns"
+        assert (
+            "ts_id" in reader.fieldnames
+            and "in_hospital_mortality" in reader.fieldnames
+        ), "label_csv must contain ts_id,in_hospital_mortality columns"
         for row in reader:
-            pid = str(row["patient_id"]).strip()
-            lab = int(row["label"]) if str(row["label"]).strip() != "" else 0
+            pid = str(row["ts_id"]).strip()
+            lab = (
+                int(row["in_hospital_mortality"])
+                if str(row["in_hospital_mortality"]).strip() != ""
+                else 0
+            )
             mp[pid] = 1 if lab == 1 else 0
     return mp
 
 
 class MortalityDataModule(pl.LightningDataModule):
-    def __init__(self, saved_dir: str, label_csv: str, batch_size: int = 4, num_workers: int = 2, pin_memory: bool = True, smoke: bool = False, smoke_batch_size: int = 8):
+    def __init__(
+        self,
+        saved_dir: str,
+        label_csv: str,
+        batch_size: int = 4,
+        num_workers: int = 2,
+        pin_memory: bool = True,
+        smoke: bool = False,
+        smoke_batch_size: int = 8,
+    ):
         super().__init__()
         self.saved_dir = saved_dir
         self.label_csv = label_csv
@@ -155,7 +177,9 @@ class MortalityDataModule(pl.LightningDataModule):
     def _collate_with_label(self, batch: List[Tuple[Any, str]]):
         assert self.vcols is not None
         out = _collate_lvcf(batch, self.vcols)
-        labels = torch.tensor([self.id_to_label.get(pid, 0) for (_, pid) in batch], dtype=torch.float32)
+        labels = torch.tensor(
+            [self.id_to_label.get(pid, 0) for (_, pid) in batch], dtype=torch.float32
+        )
         out["y"] = labels
         return out
 
@@ -223,20 +247,30 @@ class MortalityClassifier(pl.LightningModule):
         pos_weight: Optional[float] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["poe_model"])  # avoid serializing the big backbone
+        self.save_hyperparameters(
+            ignore=["poe_model"]
+        )  # avoid serializing the big backbone
         self.poe = poe_model.eval()
         for p in self.poe.parameters():
             p.requires_grad = False
         self.latent_dim = latent_dim
         self.mu_proj = nn.Sequential(nn.Linear(latent_dim, mu_proj_dim), nn.GELU())
-        self.logvar_proj = nn.Sequential(nn.Linear(latent_dim, logvar_proj_dim), nn.GELU())
+        self.logvar_proj = nn.Sequential(
+            nn.Linear(latent_dim, logvar_proj_dim), nn.GELU()
+        )
         # Divergence/structure/time scalars: [d2, kl, abs_delta_H, beta, log_set_size, has_change, log_dt1p] -> 7
         self.scalar_in_dim = 7
         self.scalar_proj = nn.Sequential(
             nn.Linear(self.scalar_in_dim, 32), nn.GELU(), nn.Linear(32, scalar_proj_dim)
         )
         feat_dim = mu_proj_dim + logvar_proj_dim + scalar_proj_dim
-        self.gru = nn.GRU(input_size=feat_dim, hidden_size=gru_hidden, num_layers=gru_layers, batch_first=True, dropout=dropout if gru_layers > 1 else 0.0)
+        self.gru = nn.GRU(
+            input_size=feat_dim,
+            hidden_size=gru_hidden,
+            num_layers=gru_layers,
+            batch_first=True,
+            dropout=dropout if gru_layers > 1 else 0.0,
+        )
         self.attn = AdditiveAttention(gru_hidden)
         self.head = nn.Sequential(
             nn.Linear(gru_hidden, gru_hidden // 2),
@@ -245,7 +279,11 @@ class MortalityClassifier(pl.LightningModule):
             nn.Linear(gru_hidden // 2, 1),
         )
         self.lr = lr
-        self.pos_weight = None if pos_weight is None else torch.tensor([pos_weight], dtype=torch.float32)
+        self.pos_weight = (
+            None
+            if pos_weight is None
+            else torch.tensor([pos_weight], dtype=torch.float32)
+        )
         # Buffers for epoch metrics
         self._val_logits: List[float] = []
         self._val_labels: List[int] = []
@@ -253,7 +291,9 @@ class MortalityClassifier(pl.LightningModule):
         self._test_labels: List[int] = []
 
     @torch.no_grad()
-    def _extract_features_single(self, sets: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _extract_features_single(
+        self, sets: List[Dict[str, torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         From a list of per-set dicts (as in PoE._split_sets), compute per-step features.
         Returns: (X, mask) where X: [S, F], mask: [S] (all True here; caller pads later)
@@ -261,7 +301,9 @@ class MortalityClassifier(pl.LightningModule):
         device = next(self.parameters()).device
         S = len(sets)
         if S == 0:
-            return torch.zeros(0, 1, device=device), torch.zeros(0, dtype=torch.bool, device=device)
+            return torch.zeros(0, 1, device=device), torch.zeros(
+                0, dtype=torch.bool, device=device
+            )
 
         # Encode q_x(z|x) per set
         mu_qx_list: List[torch.Tensor] = []
@@ -274,20 +316,22 @@ class MortalityClassifier(pl.LightningModule):
             var, val = s["var"], s["val"]  # [1,N,D], [1,N,1]
             z_list_enc, enc_tokens = self.poe.set_encoder.encode_from_var_val(var, val)
             _z, mu_qx, logvar_qx = z_list_enc[-1]
-            mu_qx_list.append(mu_qx.squeeze(1))           # [1,D] → [D]
-            logvar_qx_list.append(logvar_qx.squeeze(1))    # [1,D] → [D]
+            mu_qx_list.append(mu_qx.squeeze(1))  # [1,D] → [D]
+            logvar_qx_list.append(logvar_qx.squeeze(1))  # [1,D] → [D]
             if enc_tokens is not None and enc_tokens.numel() > 0:
-                enc_aggs.append(enc_tokens.mean(dim=1))    # [1,N,D] → [1,D]
+                enc_aggs.append(enc_tokens.mean(dim=1))  # [1,N,D] → [1,D]
             else:
                 enc_aggs.append(mu_qx)
             set_sizes.append(int(var.size(1)))
             has_changes.append(float(s.get("has_change", torch.tensor(0.0)).item()))
-            set_times.append(s["set_time"])               # [1]
+            set_times.append(s["set_time"])  # [1]
 
-        mu_qx = torch.stack(mu_qx_list, dim=1).to(device)        # [1,S,D]
-        logvar_qx = torch.stack(logvar_qx_list, dim=1).to(device) # [1,S,D]
-        set_aggs = torch.stack(enc_aggs, dim=1).to(device)        # [1,S,D]
-        minutes = torch.stack(set_times, dim=1).float().to(device)  # [1,S,1]? set_time is [1]; keep [1,S,1]
+        mu_qx = torch.stack(mu_qx_list, dim=1).to(device)  # [1,S,D]
+        logvar_qx = torch.stack(logvar_qx_list, dim=1).to(device)  # [1,S,D]
+        set_aggs = torch.stack(enc_aggs, dim=1).to(device)  # [1,S,D]
+        minutes = (
+            torch.stack(set_times, dim=1).float().to(device)
+        )  # [1,S,1]? set_time is [1]; keep [1,S,1]
         if minutes.dim() == 2:
             minutes = minutes.unsqueeze(-1)
         minutes = minutes.squeeze(-1)  # [1,S]
@@ -308,11 +352,17 @@ class MortalityClassifier(pl.LightningModule):
             logvar_qx_t = logvar_qx[:, t, :]
             var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
             d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)  # [1,1]
-            delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)      # [1,1]
-            dt = minutes[:, t : t + 1] - (minutes[:, t - 1 : t] if t > 0 else minutes[:, t : t + 1])
+            delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)  # [1,1]
+            dt = minutes[:, t : t + 1] - (
+                minutes[:, t - 1 : t] if t > 0 else minutes[:, t : t + 1]
+            )
             log_dt1p = torch.log1p(dt.clamp(min=0.0))  # [1,1]
             gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
-            beta_t = self.poe.poe_beta_min + (self.poe.poe_beta_max - self.poe.poe_beta_min) * torch.sigmoid(self.poe.obs_gate(gate_inp))  # [1,1]
+            beta_t = self.poe.poe_beta_min + (
+                self.poe.poe_beta_max - self.poe.poe_beta_min
+            ) * torch.sigmoid(
+                self.poe.obs_gate(gate_inp)
+            )  # [1,1]
 
             # Conditional PoE: likelihood natural params from set agg and prior
             set_agg_t = set_aggs[:, t, :]
@@ -331,17 +381,34 @@ class MortalityClassifier(pl.LightningModule):
             # KL(q_post||p_prior) per step (sum over dims)
             var_q = logvar_post_t.exp()
             var_p = logvar_p_t.exp()
-            kld = 0.5 * (logvar_p_t - logvar_post_t + (var_q / (var_p + 1e-8)) + ((mu_p_t - mu_post_t) ** 2) / (var_p + 1e-8) - 1.0)
+            kld = 0.5 * (
+                logvar_p_t
+                - logvar_post_t
+                + (var_q / (var_p + 1e-8))
+                + ((mu_p_t - mu_post_t) ** 2) / (var_p + 1e-8)
+                - 1.0
+            )
             kl_scalar = kld.sum(dim=-1, keepdim=True)  # [1,1]
 
             # Build step feature
             mu_feat = self.mu_proj(mu_post_t)  # [1,Fm]
             logv_feat = self.logvar_proj(logvar_post_t)  # [1,Fv]
-            scalar_feat = torch.cat([
-                d2, torch.abs(delta_H), kl_scalar, beta_t, torch.log1p(torch.tensor([[float(set_sizes[t])]], device=device)), torch.tensor([[has_changes[t]]], device=device), log_dt1p
-            ], dim=-1)  # [1,7]
+            scalar_feat = torch.cat(
+                [
+                    d2,
+                    torch.abs(delta_H),
+                    kl_scalar,
+                    beta_t,
+                    torch.log1p(torch.tensor([[float(set_sizes[t])]], device=device)),
+                    torch.tensor([[has_changes[t]]], device=device),
+                    log_dt1p,
+                ],
+                dim=-1,
+            )  # [1,7]
             scalar_feat = self.scalar_proj(scalar_feat)  # [1,Fs]
-            feat_t = torch.cat([mu_feat, logv_feat, scalar_feat], dim=-1).squeeze(0)  # [F]
+            feat_t = torch.cat([mu_feat, logv_feat, scalar_feat], dim=-1).squeeze(
+                0
+            )  # [F]
             feat_rows.append(feat_t)
 
             # Update GRU hidden with posterior mean + time embedding (as in backbone)
@@ -352,7 +419,9 @@ class MortalityClassifier(pl.LightningModule):
         return X, mask
 
     @torch.no_grad()
-    def _build_batch_features(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_batch_features(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Given a collated batch from MortalityDataModule, produce padded features.
         Returns: (X_pad, mask, y)
@@ -366,7 +435,9 @@ class MortalityClassifier(pl.LightningModule):
         carry_mask = batch.get("carry_mask", None)
         B = var.size(0)
         # Split into per-patient sets using the backbone's utility
-        all_sets = self.poe._split_sets(var, val, minute, set_id, padding_mask, carry_mask)
+        all_sets = self.poe._split_sets(
+            var, val, minute, set_id, padding_mask, carry_mask
+        )
         feats: List[torch.Tensor] = []
         masks: List[torch.Tensor] = []
         for sets in all_sets:
@@ -388,7 +459,9 @@ class MortalityClassifier(pl.LightningModule):
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         X, M, _ = self._build_batch_features(batch)
         lengths = M.sum(dim=1).long().clamp(min=1)
-        packed = pack_padded_sequence(X, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        packed = pack_padded_sequence(
+            X, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
         packed_out, _ = self.gru(packed)
         H, _ = pad_packed_sequence(packed_out, batch_first=True)
         # Recreate mask size [B, S_out]
@@ -402,7 +475,9 @@ class MortalityClassifier(pl.LightningModule):
         logits = self.forward(batch)
         y = batch["y"].to(logits.dtype)
         if self.pos_weight is not None:
-            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=self.pos_weight.to(logits.device))
+            loss = F.binary_cross_entropy_with_logits(
+                logits, y, pos_weight=self.pos_weight.to(logits.device)
+            )
         else:
             loss = F.binary_cross_entropy_with_logits(logits, y)
         self.log("train_loss", loss, prog_bar=True)
@@ -424,8 +499,16 @@ class MortalityClassifier(pl.LightningModule):
         try:
             y_true = np.array(self._val_labels, dtype=np.int32)
             y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
-            auroc = float(roc_auc_score(y_true, y_prob)) if roc_auc_score is not None else float("nan")
-            auprc = float(average_precision_score(y_true, y_prob)) if average_precision_score is not None else float("nan")
+            auroc = (
+                float(roc_auc_score(y_true, y_prob))
+                if roc_auc_score is not None
+                else float("nan")
+            )
+            auprc = (
+                float(average_precision_score(y_true, y_prob))
+                if average_precision_score is not None
+                else float("nan")
+            )
         except Exception:
             auroc, auprc = float("nan"), float("nan")
         self.log("val_auroc", auroc, prog_bar=True)
@@ -448,8 +531,16 @@ class MortalityClassifier(pl.LightningModule):
         try:
             y_true = np.array(self._test_labels, dtype=np.int32)
             y_prob = torch.sigmoid(torch.tensor(self._test_logits)).numpy()
-            auroc = float(roc_auc_score(y_true, y_prob)) if roc_auc_score is not None else float("nan")
-            auprc = float(average_precision_score(y_true, y_prob)) if average_precision_score is not None else float("nan")
+            auroc = (
+                float(roc_auc_score(y_true, y_prob))
+                if roc_auc_score is not None
+                else float("nan")
+            )
+            auprc = (
+                float(average_precision_score(y_true, y_prob))
+                if average_precision_score is not None
+                else float("nan")
+            )
         except Exception:
             auroc, auprc = float("nan"), float("nan")
         self.log("test_auroc", auroc, prog_bar=True)
@@ -458,14 +549,25 @@ class MortalityClassifier(pl.LightningModule):
         self._test_labels.clear()
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
+        opt = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr
+        )
         return opt
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Train mortality classifier on PoE features")
-    ap.add_argument("--checkpoint", required=True, type=str, help="Path to PoE checkpoint (.ckpt)")
-    ap.add_argument("--label_csv", required=True, type=str, help="CSV with columns: patient_id,label (0/1)")
+    ap = argparse.ArgumentParser(
+        description="Train mortality classifier on PoE features"
+    )
+    ap.add_argument(
+        "--checkpoint", required=True, type=str, help="Path to PoE checkpoint (.ckpt)"
+    )
+    ap.add_argument(
+        "--label_csv",
+        required=True,
+        type=str,
+        help="CSV with columns: ts_id,in_hospital_mortality (0/1)",
+    )
     ap.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--num_workers", type=int, default=getattr(cfg, "num_workers", 2))
@@ -473,8 +575,15 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--precision", type=str, default="16-mixed")
-    ap.add_argument("--output_dir", type=str, default="./output", help="Root out_dir (saves under out_dir/mortality/version_X)")
-    ap.add_argument("--smoke", action="store_true", help="Quick smoke run on a few patients")
+    ap.add_argument(
+        "--output_dir",
+        type=str,
+        default="/home/sunx/data/aiiih/projects/sunx/projects/SSV/output",
+        help="Root out_dir (saves under out_dir/mortality/version_X)",
+    )
+    ap.add_argument(
+        "--smoke", action="store_true", help="Quick smoke run on a few patients"
+    )
     args = ap.parse_args()
 
     # Load PoE backbone (frozen)
@@ -509,7 +618,7 @@ def main():
 
     # Logging/checkpoints under a consistent layout
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "mortality")
+    project_dir = os.path.join(out_root, "classifier")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
@@ -524,7 +633,13 @@ def main():
     os.makedirs(ckpt_dir, exist_ok=True)
 
     callbacks = [
-        ModelCheckpoint(dirpath=ckpt_dir, save_top_k=1, monitor="val_auprc", mode="max", filename="mortality_cls"),
+        ModelCheckpoint(
+            dirpath=ckpt_dir,
+            save_top_k=1,
+            monitor="val_auprc",
+            mode="max",
+            filename="mortality_cls",
+        ),
         EarlyStopping(monitor="val_auprc", mode="max", patience=5),
         LearningRateMonitor(logging_interval="step"),
     ]
@@ -536,7 +651,11 @@ def main():
         callbacks=callbacks,
         log_every_n_steps=50,
     )
-    trainer.fit(model, train_dataloaders=dm.train_dataloader(), val_dataloaders=dm.val_dataloader())
+    trainer.fit(
+        model,
+        train_dataloaders=dm.train_dataloader(),
+        val_dataloaders=dm.val_dataloader(),
+    )
 
     print("\nEvaluating best checkpoint on test split...")
     trainer.test(model, dataloaders=dm.test_dataloader())
@@ -544,4 +663,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
