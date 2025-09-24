@@ -14,7 +14,8 @@ Usage example:
     --checkpoint /path/to/output/setvae-PT/version_X/checkpoints/poe_GRU_PT.ckpt \
     --label_csv /path/to/labels.csv \
     --data_dir /path/to/SeqSetVAE \
-    --batch_size 4 --max_epochs 10 --num_workers 2
+    --batch_size 4 --max_epochs 10 --num_workers 2 \
+    --time_mode delta   # or none
 
 label_csv must contain at least two columns: patient_id,label (0/1)
 where patient_id equals parquet filename stem under {train,valid,test}.
