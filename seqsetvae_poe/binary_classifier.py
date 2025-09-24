@@ -10,7 +10,7 @@ Features per time step (built from the PoE fusion pipeline):
 Sequence model: 2-layer GRU + attention pooling + MLP → mortality logit.
 
 Usage example:
-  python -u seqsetvae_poe/train_mortality_classifier.py \
+  python -u seqsetvae_poe/binary_classifier.py \
     --checkpoint /path/to/output/setvae-PT/version_X/checkpoints/poe_GRU_PT.ckpt \
     --label_csv /path/to/labels.csv \
     --data_dir /path/to/SeqSetVAE \
