@@ -697,6 +697,7 @@ def main():
         logger=logger,
         callbacks=callbacks,
         log_every_n_steps=50,
+        val_check_interval=0.5,
     )
     trainer.fit(
         model,
