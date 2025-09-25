@@ -71,6 +71,35 @@ def _load_state_dict(path: str) -> Dict[str, torch.Tensor]:
         }
     return state
 
+def _pid_variants(raw_id: Any) -> List[str]:
+    """
+    Generate robust id variants to match parquet stems and CSV ids.
+    - "200001" <-> "200001.0" and numeric equivalents.
+    """
+    variants: List[str] = []
+    try:
+        s = str(raw_id).strip()
+    except Exception:
+        return variants
+    if s == "":
+        return variants
+    variants.append(s)
+    try:
+        f = float(s)
+        if math.isfinite(f):
+            i = int(f)
+            variants.append(str(i))
+            variants.append(f"{i}.0")
+    except Exception:
+        pass
+    seen = set()
+    out: List[str] = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
 
 def _build_poe_from_state(state: Dict[str, torch.Tensor]) -> PoESeqSetVAEPretrain:
     # Instantiate PoE with config defaults; weights will be loaded next
@@ -121,13 +150,19 @@ def _read_label_map(label_csv: str) -> Dict[str, int]:
             and "in_hospital_mortality" in reader.fieldnames
         ), "label_csv must contain ts_id,in_hospital_mortality columns"
         for row in reader:
-            pid = str(row["ts_id"]).strip()
-            lab = (
-                int(row["in_hospital_mortality"])
-                if str(row["in_hospital_mortality"]).strip() != ""
-                else 0
-            )
-            mp[pid] = 1 if lab == 1 else 0
+            pid_raw = row["ts_id"]
+            y_raw = str(row["in_hospital_mortality"]).strip()
+            if y_raw == "" or y_raw.lower() == "nan":
+                lab = 0
+            else:
+                try:
+                    lab = 1 if int(float(y_raw)) == 1 else 0
+                except Exception:
+                    lab = 0
+            for pid in _pid_variants(pid_raw):
+                if pid == "":
+                    continue
+                mp[pid] = lab
     return mp
 
 
@@ -177,10 +212,22 @@ class MortalityDataModule(pl.LightningDataModule):
     def _collate_with_label(self, batch: List[Tuple[Any, str]]):
         assert self.vcols is not None
         out = _collate_lvcf(batch, self.vcols)
-        labels = torch.tensor(
-            [self.id_to_label.get(pid, 0) for (_, pid) in batch], dtype=torch.float32
-        )
-        out["y"] = labels
+        labels_list: List[float] = []
+        missing: List[str] = []
+        for (_, pid) in batch:
+            lab = self.id_to_label.get(pid, None)
+            if lab is None:
+                for v in _pid_variants(pid):
+                    if v in self.id_to_label:
+                        lab = self.id_to_label[v]
+                        break
+            if lab is None:
+                missing.append(str(pid))
+            else:
+                labels_list.append(float(lab))
+        if len(missing) > 0:
+            raise ValueError(f"Missing labels for IDs (sample): {missing[:10]} (total {len(missing)})")
+        out["y"] = torch.tensor(labels_list, dtype=torch.float32)
         return out
 
     def _loader(self, ds, shuffle):
