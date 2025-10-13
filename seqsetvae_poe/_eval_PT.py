@@ -19,7 +19,7 @@ Usage example:
 """
 
 import os
-import sys#!/usr/bin/env python3
+import sys
 """
 Evaluate SetVAE pretraining results: posterior collapse and reconstruction quality.
 
@@ -848,6 +848,251 @@ def _plot_overlay_2d(orig: np.ndarray, recon: np.ndarray, out_file: str):
     plt.close(fig)
 
 
+def _detect_key_column(df: pd.DataFrame) -> str:
+    for c in ["Key", "variable", "event", "name", "key"]:
+        if c in df.columns:
+            return c
+    return df.columns[0]
+
+
+def _load_global_vocab_embeddings(data_dir: str, event_emb_csv: Optional[str]):
+    if event_emb_csv and os.path.isfile(event_emb_csv):
+        df = pd.read_csv(event_emb_csv)
+        key_col = _detect_key_column(df)
+        num_cols = [c for c in df.columns if c != key_col and pd.api.types.is_numeric_dtype(df[c])]
+        if len(num_cols) == 0:
+            raise ValueError("event_emb_csv has no numeric embedding columns")
+        num_cols = sorted(num_cols, key=lambda x: (len(x), x))
+        names = df[key_col].astype(str).tolist()
+        vecs = df[num_cols].to_numpy(dtype=np.float32, copy=False)
+        return names, vecs
+    parts = ["train", "valid", "test"]
+    files: List[str] = []
+    for p in parts:
+        pattern = os.path.join(data_dir, p, "*.parquet")
+        files.extend(sorted(glob.glob(pattern)))
+    if len(files) == 0:
+        raise FileNotFoundError(f"No parquet files under {data_dir}/(train|valid|test)")
+    sample = pd.read_parquet(files[0], engine="pyarrow")
+    vcols = _detect_vcols(sample)
+    keep_cols = ["variable"] + vcols
+    last: Dict[str, np.ndarray] = {}
+    for fp in files:
+        dfp = pd.read_parquet(fp, columns=keep_cols, engine="pyarrow")
+        dfp = dfp.drop_duplicates(subset=["variable"], keep="last")
+        names = dfp["variable"].astype(str).tolist()
+        arr = dfp[vcols].to_numpy(dtype=np.float32, copy=False)
+        for n, v in zip(names, arr):
+            last[n] = v
+    names_all = sorted(last.keys())
+    vecs_all = np.stack([last[n] for n in names_all], axis=0).astype(np.float32, copy=False)
+    return names_all, vecs_all
+
+
+@torch.no_grad()
+def _encode_decode_set(encoder, var_reduced: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    norms = torch.norm(var_reduced, p=2, dim=-1, keepdim=True)
+    var_dirs = var_reduced / (norms + 1e-8)
+    x_target = var_dirs * values
+    z_list, _ = encoder.encode(x_target)
+    recon = encoder.decode(z_list, target_n=x_target.size(1), use_mean=True, noise_std=0.0)
+    return recon
+
+
+def _greedy_match_recon_to_vars(
+    recon: np.ndarray,
+    var_dirs: np.ndarray,
+    variable_names: List[str],
+):
+    eps = 1e-8
+    recon_norm = np.linalg.norm(recon, axis=1) + eps
+    recon_dir = recon / recon_norm[:, None]
+    sim = np.matmul(recon_dir, var_dirs.T)
+    N, M = sim.shape
+    recon_order = np.argsort(recon_norm)[::-1]
+    taken_vars = set()
+    assignments: List[Tuple[str, float, float]] = []
+    for i in recon_order:
+        best_j, best_s = -1, -1.0
+        for j in range(M):
+            if j in taken_vars:
+                continue
+            s = float(sim[i, j])
+            if s > best_s:
+                best_s = s
+                best_j = j
+        if best_j < 0:
+            best_j = int(np.argmax(sim[i]))
+            best_s = float(sim[i, best_j])
+        taken_vars.add(best_j)
+        pred_val = float(np.linalg.norm(recon[i]))
+        assignments.append((variable_names[best_j], pred_val, best_s))
+    out = [None] * N  # type: ignore
+    for rank, i in enumerate(recon_order):
+        out[i] = assignments[rank]
+    return out  # type: ignore
+
+
+def _run_named_recon_print(model: torch.nn.Module, args):
+    print("Running named reconstruction printing ...")
+    # Prepare encoder
+    encoder = model.set_encoder if hasattr(model, "set_encoder") else getattr(model, "setvae", None)
+    if encoder is None:
+        print("[WARN] Model does not expose a SetVAE encoder; skip named recon")
+        return
+
+    # Stats map for de-normalization
+    stats_map: Dict[str, Tuple[float, float]] = {}
+    if args.stats_csv and os.path.exists(args.stats_csv):
+        try:
+            stats_df = pd.read_csv(args.stats_csv)
+            key_col = _detect_key_column(stats_df)
+            rename = {}
+            for c in stats_df.columns:
+                lc = c.lower()
+                if lc == "mean":
+                    rename[c] = "mean"
+                if lc in ("std", "stdev", "stddev"):
+                    rename[c] = "std"
+            stats_df = stats_df.rename(columns=rename)
+            if "mean" in stats_df.columns and "std" in stats_df.columns:
+                for _, r in stats_df.iterrows():
+                    v = str(r[key_col])
+                    m = float(r["mean"]) if pd.notna(r["mean"]) else 0.0
+                    s_raw = float(r["std"]) if pd.notna(r["std"]) else 1.0
+                    s = s_raw if abs(s_raw) > 1e-12 else 1.0
+                    stats_map[v] = (m, s)
+        except Exception as e:
+            print(f"[WARN] Failed to load stats_csv '{args.stats_csv}': {e}")
+
+    def _denorm_value(var_name: str, val_norm: float) -> float:
+        m, s = stats_map.get(var_name, (0.0, 1.0))
+        return val_norm * s + m
+
+    # Pre-load global vocabulary if needed
+    vocab_event_names: Optional[List[str]] = None
+    vocab_dirs_np: Optional[np.ndarray] = None
+    device = next(model.parameters()).device
+    if args.named_recon == "global":
+        vocab_names, vocab_vecs = _load_global_vocab_embeddings(args.data_dir, args.event_emb_csv)
+        vocab_t = torch.from_numpy(vocab_vecs).unsqueeze(0).to(device)
+        if getattr(encoder, "dim_reducer", None) is not None:
+            vocab_red = encoder.dim_reducer(vocab_t)
+        else:
+            vocab_red = vocab_t
+        vocab_dirs = vocab_red / (torch.norm(vocab_red, p=2, dim=-1, keepdim=True) + 1e-8)
+        vocab_dirs_np = vocab_dirs.squeeze(0).detach().cpu().numpy()
+        vocab_event_names = [str(n) for n in vocab_names]
+
+    # Build dataset for sampling raw rows
+    ds = PatientDataset("test" if args.split == "test" else "valid", saved_dir=args.data_dir)
+
+    rng = random.Random(args.seed)
+
+    def _process_one_set(df_set: pd.DataFrame, patient_id, chosen_set, sample_idx: Optional[int], total_samples: Optional[int]):
+        vcols_local = _detect_vcols(df_set)
+        var_np = df_set[vcols_local].to_numpy(dtype=np.float32, copy=False)
+        val_np = df_set["value"].to_numpy(dtype=np.float32)
+        mask_np = df_set["is_carry"].to_numpy(dtype=np.float32) if "is_carry" in df_set.columns else np.zeros_like(val_np)
+        var_t = torch.from_numpy(var_np).unsqueeze(0).to(device)
+        val_t = torch.from_numpy(val_np).view(1, -1, 1).to(device)
+        # Reduce variable vectors if reducer exists
+        if getattr(encoder, "dim_reducer", None) is not None:
+            var_red = encoder.dim_reducer(var_t)
+        else:
+            var_red = var_t
+        # Encode-decode using original values (no PT masking here)
+        recon_nomask_t = _encode_decode_set(encoder, var_red, val_t)
+        with torch.no_grad():
+            var_dirs = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
+        recon_nomask_np = recon_nomask_t.squeeze(0).detach().cpu().numpy()
+
+        if args.named_recon == "global":
+            assert vocab_dirs_np is not None and vocab_event_names is not None
+            var_dirs_np_local = vocab_dirs_np
+            event_names_local: List[str] = vocab_event_names
+        else:
+            var_dirs_np_local = (var_dirs.squeeze(0).detach().cpu().numpy())
+            event_names_local = df_set["variable"].astype(str).tolist()
+
+        assignments_nomask = _greedy_match_recon_to_vars(recon_nomask_np, var_dirs_np_local, event_names_local)
+
+        set_event_names: List[str] = df_set["variable"].astype(str).tolist()
+        # Matched vs unmatched relative to set names
+        def _split(assignments_list: List[Tuple[str, float, float]]):
+            matched: List[Tuple[str, float, float]] = []
+            unmatched: List[Tuple[str, float, float]] = []
+            names_set = set(set_event_names)
+            for (nm, valn, cs) in assignments_list:
+                if nm in names_set:
+                    matched.append((nm, valn, cs))
+                else:
+                    unmatched.append((nm, valn, cs))
+            return matched, unmatched
+        matched_nomask, unmatched_nomask = _split(assignments_nomask)
+
+        print("================ Named Reconstruction ================")
+        if sample_idx is not None and total_samples is not None:
+            print(f"Sample:     {sample_idx+1}/{total_samples}")
+        print(f"Patient ID: {patient_id}")
+        print(f"Set index:  {chosen_set}")
+        vocab_len = len(event_names_local)
+        print(f"#Events:    {len(set_event_names)} (match scope: {args.named_recon}, vocab={vocab_len})")
+        print("---------------------------------------------------------------")
+        print("Original events (name -> de-normalized original value):")
+        for name, val_norm in zip(set_event_names, val_np.tolist()):
+            val_orig = _denorm_value(name, float(val_norm))
+            print(f"  - {name}: {val_orig:.6f}")
+        print("---------------------------------------------------------------")
+        print("Reconstruction matched results (No-mask):")
+        col_header = ["variable", "Pred value (denorm)", "cosine"]
+        print(" | ".join(col_header))
+        for (n, v, c) in matched_nomask:
+            print(f"{n} | {_denorm_value(n, float(v)):.6f} | {c:.3f}")
+        print("---------------------------------------------------------------")
+        print("Unmatched predictions (No-mask):")
+        for (n, v, c) in unmatched_nomask:
+            print(f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})")
+        print("===============================================================")
+
+    # Sampling strategy
+    if args.patient_index is not None and args.set_index is not None:
+        if args.patient_index < 0 or args.patient_index >= len(ds):
+            print(f"[WARN] patient_index out of range [0,{len(ds)-1}]")
+            return
+        df, patient_id = ds[int(args.patient_index)]
+        if int(args.set_index) not in set(int(s) for s in df["set_index"].tolist()):
+            print(f"[WARN] set_index {args.set_index} not found in patient {patient_id}")
+            return
+        chosen_set = int(args.set_index)
+        df_set = df[df["set_index"] == chosen_set].reset_index(drop=True)
+        _process_one_set(df_set, patient_id, chosen_set, sample_idx=0, total_samples=1)
+    elif args.patient_index is not None and args.set_index is None:
+        if args.patient_index < 0 or args.patient_index >= len(ds):
+            print(f"[WARN] patient_index out of range [0,{len(ds)-1}]")
+            return
+        df, patient_id = ds[int(args.patient_index)]
+        uniq_sets = sorted(set(int(s) for s in df["set_index"].tolist()))
+        if not uniq_sets:
+            print("[WARN] Selected patient has no sets")
+            return
+        k = min(len(uniq_sets), max(1, int(args.num_named_samples)))
+        chosen_sets = rng.sample(uniq_sets, k=k)
+        for idx, chosen_set in enumerate(chosen_sets):
+            df_set = df[df["set_index"] == chosen_set].reset_index(drop=True)
+            _process_one_set(df_set, patient_id, chosen_set, sample_idx=idx, total_samples=len(chosen_sets))
+    else:
+        total = max(1, int(args.num_named_samples))
+        for idx in range(total):
+            pidx = rng.randrange(len(ds))
+            df, patient_id = ds[pidx]
+            uniq_sets = sorted(set(int(s) for s in df["set_index"].tolist()))
+            if not uniq_sets:
+                continue
+            chosen_set = rng.choice(uniq_sets)
+            df_set = df[df["set_index"] == chosen_set].reset_index(drop=True)
+            _process_one_set(df_set, patient_id, chosen_set, sample_idx=idx, total_samples=total)
+
 def main():
     ap = argparse.ArgumentParser(
         description="Evaluate SetVAE pretraining: collapse + reconstruction"
@@ -1190,6 +1435,9 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
+import random
+import glob
+import pandas as pd
 
 # Optional visualization deps
 try:
@@ -1216,7 +1464,7 @@ if THIS_DIR not in sys.path:
     sys.path.append(THIS_DIR)
 
 import config as cfg  # type: ignore
-from dataset import DataModule  # type: ignore
+from dataset import DataModule, PatientDataset, _detect_vcols  # type: ignore
 from model import SetVAEOnlyPretrain, PoESeqSetVAEPretrain  # type: ignore
 
 
@@ -1699,6 +1947,19 @@ def main():
     ap.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
     ap.add_argument("--active_threshold", type=float, default=0.01, help="KL threshold for active units")
     ap.add_argument("--seed", type=int, default=42)
+    # Named reconstruction printing options (integrated from test_recon.py)
+    ap.add_argument(
+        "--named_recon",
+        type=str,
+        choices=["off", "set", "global"],
+        default="off",
+        help="Print event-name recon table: 'set' uses set-only vars; 'global' uses full vocab",
+    )
+    ap.add_argument("--num_named_samples", type=int, default=10, help="#random sets to sample when not fixing indices")
+    ap.add_argument("--patient_index", type=int, default=None, help="Specific patient index for named recon")
+    ap.add_argument("--set_index", type=int, default=None, help="Specific set index for named recon")
+    ap.add_argument("--stats_csv", type=str, default=getattr(cfg, "params_map_path", ""), help="CSV with variable mean/std for de-normalization")
+    ap.add_argument("--event_emb_csv", type=str, default="", help="CSV for global vocabulary embeddings; if empty, scan data_dir")
     args = ap.parse_args()
 
     # Resolve output directory: default to <ckpt_version_dir>/eval
@@ -1846,6 +2107,10 @@ def main():
     with open(out_json, "w") as f:
         json.dump(report, f, indent=2)
     print(f"Saved evaluation report to: {out_json}")
+
+    # 3) Optional: Named reconstruction printing (event names with de-normalized values)
+    if args.named_recon != "off":
+        _run_named_recon_print(model, args)
 
 
 if __name__ == "__main__":
