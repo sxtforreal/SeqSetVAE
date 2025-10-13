@@ -556,10 +556,37 @@ class MortalityClassifier(pl.LightningModule):
                 if average_precision_score is not None
                 else float("nan")
             )
+            # Threshold optimization for ACC (and report sensitivity/specificity)
+            best_thr = 0.5
+            best_acc = 0.0
+            sens = float("nan")
+            spec = float("nan")
+            try:
+                # grid over quantiles of predicted probabilities for stability
+                qs = np.linspace(0.05, 0.95, 19)
+                cand = np.unique(np.quantile(y_prob, qs))
+                for t in cand:
+                    y_hat = (y_prob >= t).astype(int)
+                    tp = int(((y_hat == 1) & (y_true == 1)).sum())
+                    tn = int(((y_hat == 0) & (y_true == 0)).sum())
+                    fp = int(((y_hat == 1) & (y_true == 0)).sum())
+                    fn = int(((y_hat == 0) & (y_true == 1)).sum())
+                    acc = (tp + tn) / max(1, len(y_true))
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_thr = float(t)
+                        sens = tp / max(1, tp + fn)
+                        spec = tn / max(1, tn + fp)
+            except Exception:
+                pass
         except Exception:
-            auroc, auprc = float("nan"), float("nan")
+            auroc, auprc, best_thr, best_acc, sens, spec = float("nan"), float("nan"), 0.5, float("nan"), float("nan"), float("nan")
         self.log("val_auroc", auroc, prog_bar=True)
         self.log("val_auprc", auprc, prog_bar=True)
+        self.log("val_best_thr", best_thr, prog_bar=True)
+        self.log("val_best_acc", best_acc, prog_bar=False)
+        self.log("val_sensitivity", sens, prog_bar=False)
+        self.log("val_specificity", spec, prog_bar=False)
         self._val_logits.clear()
         self._val_labels.clear()
 
