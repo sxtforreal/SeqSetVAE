@@ -79,6 +79,15 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         freeze_set_encoder: bool = True,
         # PoE mode: 'conditional' uses a learned likelihood expert; 'naive' uses set encoder posterior
         poe_mode: str = "conditional",
+        # Reconstruction weighting (perm-invariant Chamfer components)
+        recon_alpha: float = 1.0,
+        recon_beta: float = 1.0,
+        recon_gamma: float = 3.0,
+        recon_scale_calib: float = 0.0,
+        recon_beta_var: float = 0.1,
+        # Partial unfreezing options (when freeze_set_encoder=True)
+        partial_unfreeze: bool = False,
+        unfreeze_dim_reducer: bool = False,
     ):
         super().__init__()
 
@@ -95,6 +104,26 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         if freeze_set_encoder:
             for p in self.set_encoder.parameters():
                 p.requires_grad = False
+            if partial_unfreeze:
+                # Unfreeze posterior head (mu_logvar)
+                try:
+                    for p in self.set_encoder.mu_logvar.parameters():
+                        p.requires_grad = True
+                except Exception:
+                    pass
+                # Unfreeze last encoder layer to adapt features slightly
+                try:
+                    for p in self.set_encoder.encoder_layers[-1].parameters():
+                        p.requires_grad = True
+                except Exception:
+                    pass
+                # Optionally unfreeze dimension reducer to calibrate scale
+                if unfreeze_dim_reducer and getattr(self.set_encoder, "dim_reducer", None) is not None:
+                    try:
+                        for p in self.set_encoder.dim_reducer.parameters():
+                            p.requires_grad = True
+                    except Exception:
+                        pass
 
         # PoE mode
         assert poe_mode in {"conditional", "naive"}
@@ -156,6 +185,12 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self._step = 0
         self.enable_next_change = enable_next_change
         self.next_change_weight = next_change_weight
+        # Recon weights
+        self.recon_alpha = float(recon_alpha)
+        self.recon_beta = float(recon_beta)
+        self.recon_gamma = float(recon_gamma)
+        self.recon_scale_calib = float(recon_scale_calib)
+        self.recon_beta_var = float(recon_beta_var)
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
 
@@ -414,7 +449,15 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
             reduced_normalized = reduced / (norms + 1e-8)
             target_x = reduced_normalized * s["val"]
-            recon_total += chamfer_recon(recon, target_x)
+            recon_total += chamfer_recon(
+                recon,
+                target_x,
+                alpha=self.recon_alpha,
+                beta=self.recon_beta,
+                gamma=self.recon_gamma,
+                beta_var=self.recon_beta_var,
+                scale_calib_weight=self.recon_scale_calib,
+            )
         recon_total = recon_total / max(1, S)
         return recon_total, kl_total, next_change_loss
 
@@ -541,6 +584,12 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         kl_over_weight: float = 1.0,
         var_stability_weight: float = 0.01,
         per_dim_free_bits: float = 0.002,
+        # Reconstruction weighting (perm-invariant Chamfer components)
+        recon_alpha: float = 1.0,
+        recon_beta: float = 2.0,
+        recon_gamma: float = 3.0,
+        recon_scale_calib: float = 0.5,
+        recon_beta_var: float = 0.01,
         # perturbation params
         p_stale: float = 0.1,
         p_live: float = 0.02,
@@ -603,6 +652,12 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self.kl_over_weight = float(kl_over_weight)
         self.var_stability_weight = float(var_stability_weight)
         self.per_dim_free_bits = float(per_dim_free_bits)
+        # Recon weights
+        self.recon_alpha = float(recon_alpha)
+        self.recon_beta = float(recon_beta)
+        self.recon_gamma = float(recon_gamma)
+        self.recon_scale_calib = float(recon_scale_calib)
+        self.recon_beta_var = float(recon_beta_var)
         # Capacity schedule
         self.use_kl_capacity = use_kl_capacity
         self.capacity_per_dim_end = capacity_per_dim_end
@@ -779,11 +834,11 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         r_loss = chamfer_recon(
             recon,
             x_target,
-            alpha=1.0,
-            beta=2.0,
-            gamma=3.0,
-            beta_var=0.01,
-            scale_calib_weight=0.5,
+            alpha=self.recon_alpha,
+            beta=self.recon_beta,
+            gamma=self.recon_gamma,
+            beta_var=self.recon_beta_var,
+            scale_calib_weight=self.recon_scale_calib,
         )
         # Last-layer raw KL to N(0,I) (no extra regularizers)
         _z_last, mu_last, logvar_last = z_list[-1]

@@ -97,6 +97,12 @@ def main():
     parser.add_argument("--mmd_scales", type=float, nargs='*', default=[1.0, 2.0, 4.0, 8.0], help="RBF MMD kernel scales")
 
     # KL fairness & stability controls
+    # Reconstruction weighting
+    parser.add_argument("--recon_alpha", type=float, default=1.0)
+    parser.add_argument("--recon_beta", type=float, default=4.0)
+    parser.add_argument("--recon_gamma", type=float, default=3.0)
+    parser.add_argument("--recon_scale_calib", type=float, default=1.0)
+    parser.add_argument("--recon_beta_var", type=float, default=0.0)
     parser.add_argument("--kl_fairness_weight", type=float, default=0.1, help="Weight for KL fairness penalty (promote uniform per-dim KL)")
     parser.add_argument("--kl_spread_tol", type=float, default=1.0, help="Tolerance for over-allocation relative to uniform share")
     parser.add_argument("--kl_over_weight", type=float, default=1.0, help="Weight for over-allocation L2 term")
@@ -226,6 +232,12 @@ def main():
         num_flows=int(args.num_flows),
         mmd_weight=float(args.mmd_weight),
         mmd_scales=tuple(args.mmd_scales) if isinstance(args.mmd_scales, list) else (args.mmd_scales,),
+        # recon weighting
+        recon_alpha=args.recon_alpha,
+        recon_beta=args.recon_beta,
+        recon_gamma=args.recon_gamma,
+        recon_scale_calib=args.recon_scale_calib,
+        recon_beta_var=args.recon_beta_var,
         # Fairness & stability
         kl_fairness_weight=float(args.kl_fairness_weight),
         kl_spread_tol=float(args.kl_spread_tol),

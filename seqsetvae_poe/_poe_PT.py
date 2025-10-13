@@ -126,6 +126,14 @@ def main():
 
     # PoE mode
     parser.add_argument("--poe_mode", type=str, choices=["conditional", "naive"], default="conditional")
+    # Recon weighting and partial unfreeze controls
+    parser.add_argument("--recon_alpha", type=float, default=1.0)
+    parser.add_argument("--recon_beta", type=float, default=6.0)
+    parser.add_argument("--recon_gamma", type=float, default=2.5)
+    parser.add_argument("--recon_scale_calib", type=float, default=1.0)
+    parser.add_argument("--recon_beta_var", type=float, default=0.0)
+    parser.add_argument("--partial_unfreeze", action="store_true", default=False)
+    parser.add_argument("--unfreeze_dim_reducer", action="store_true", default=False)
 
     args = parser.parse_args()
 
@@ -169,6 +177,13 @@ def main():
         poe_beta_max=args.poe_beta_max,
         freeze_set_encoder=args.freeze_set_encoder,
         poe_mode=args.poe_mode,
+        recon_alpha=args.recon_alpha,
+        recon_beta=args.recon_beta,
+        recon_gamma=args.recon_gamma,
+        recon_scale_calib=args.recon_scale_calib,
+        recon_beta_var=args.recon_beta_var,
+        partial_unfreeze=bool(args.partial_unfreeze),
+        unfreeze_dim_reducer=bool(args.unfreeze_dim_reducer),
     )
 
     # Optional: initialize weights from checkpoint (weights only)
