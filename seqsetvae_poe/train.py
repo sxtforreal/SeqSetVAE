@@ -168,7 +168,7 @@ def _run_stage_a():
             print(f"Failed to initialize from init_ckpt: {e}")
 
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "setvae-PT")
+    project_dir = os.path.join(out_root, "Stage_A")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
@@ -315,7 +315,8 @@ def _run_stage_b():
             print(f"Failed to initialize from init_ckpt: {e}")
 
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "setvae-PT")
+    stage_name = "Stage_B2" if bool(args.partial_unfreeze) else "Stage_B1"
+    project_dir = os.path.join(out_root, stage_name)
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
@@ -387,7 +388,7 @@ def _run_stage_c():
     )
 
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "classifier")
+    project_dir = os.path.join(out_root, "Stage_C")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")

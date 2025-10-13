@@ -86,7 +86,7 @@ def _run_stage_c():
         pos_weight=getattr(dm, "pos_weight", None),
     )
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "classifier_eval")
+    project_dir = os.path.join(out_root, "Stage_C_eval")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
