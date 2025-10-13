@@ -27,8 +27,7 @@ import pandas as pd
 
 import config as cfg  # type: ignore
 from dataset import MortalityDataModule, DataModule, PatientDataset, _detect_vcols  # type: ignore
-from classifier import MortalityClassifier, _load_state_dict, _build_poe_from_state  # type: ignore
-from model import SetVAEOnlyPretrain, PoESeqSetVAEPretrain  # type: ignore
+from model import MortalityClassifier, _load_state_dict, _build_poe_from_state, SetVAEOnlyPretrain, PoESeqSetVAEPretrain  # type: ignore
 
 # Optional visualization deps for A/B
 try:
@@ -1315,7 +1314,8 @@ def _inject_ckpt_type_from_stage():
 def _run_stage_c():
     import argparse as _ap
     ap = _ap.ArgumentParser(description="Stage C evaluation (classifier on PoE features)")
-    ap.add_argument("--checkpoint", required=True, type=str, help="Path to PoE checkpoint (.ckpt)")
+    ap.add_argument("--classifier_ckpt", required=True, type=str, help="Path to trained MortalityClassifier checkpoint (.ckpt)")
+    ap.add_argument("--checkpoint", required=False, default=None, type=str, help="Optional: PoE checkpoint (.ckpt) to initialize backbone if classifier ckpt lacks PoE weights")
     ap.add_argument("--label_csv", required=True, type=str)
     ap.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
     ap.add_argument("--batch_size", type=int, default=64)
@@ -1325,8 +1325,9 @@ def _run_stage_c():
     ap.add_argument("--output_dir", type=str, default="./output")
     args, _ = ap.parse_known_args()
 
-    state = _load_state_dict(args.checkpoint)
-    poe = _build_poe_from_state(state)
+    # Build PoE backbone from provided ckpt (if any); weights from classifier ckpt will override if present
+    poe_state = _load_state_dict(args.checkpoint) if args.checkpoint else {}
+    poe = _build_poe_from_state(poe_state)
     dm = MortalityDataModule(
         saved_dir=args.data_dir,
         label_csv=args.label_csv,
@@ -1337,17 +1338,11 @@ def _run_stage_c():
         smoke_batch_size=max(2, args.batch_size),
     )
     dm.setup()
-    model = MortalityClassifier(
+    # Load trained classifier weights (and PoE if present) from checkpoint
+    model = MortalityClassifier.load_from_checkpoint(
+        args.classifier_ckpt,
         poe_model=poe,
-        latent_dim=getattr(cfg, "latent_dim", 128),
-        mu_proj_dim=64,
-        logvar_proj_dim=32,
-        scalar_proj_dim=16,
-        gru_hidden=128,
-        gru_layers=2,
-        dropout=args.dropout,
-        lr=args.lr,
-        pos_weight=getattr(dm, "pos_weight", None),
+        map_location="cpu",
     )
     out_root = args.output_dir if args.output_dir else "./output"
     project_dir = os.path.join(out_root, "Stage_C_eval")

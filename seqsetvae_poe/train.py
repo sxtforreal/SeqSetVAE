@@ -22,8 +22,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 
 import config as cfg  # type: ignore
 from dataset import DataModule, MortalityDataModule  # type: ignore
-from model import SetVAEOnlyPretrain, PoESeqSetVAEPretrain  # type: ignore
-from classifier import MortalityClassifier, _load_state_dict, _build_poe_from_state  # type: ignore
+from model import SetVAEOnlyPretrain, PoESeqSetVAEPretrain, MortalityClassifier, _load_state_dict, _build_poe_from_state  # type: ignore
 
 
 def _strip_stage_from_argv():

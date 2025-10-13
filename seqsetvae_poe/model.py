@@ -5,7 +5,10 @@ import torch.nn.functional as F
 import lightning.pytorch as pl
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
-from typing import Optional
+from typing import Optional, List, Dict, Tuple
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import numpy as np
+import config as cfg  # type: ignore
 
 from modules import SetVAEModule, AttentiveBottleneckLayer, elbo_loss as base_elbo, recon_loss as chamfer_recon
 
@@ -1106,3 +1109,356 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         if kl_dim_sum is None or count == 0:
             return torch.zeros(self.latent_dim, device=var.device)
         return kl_dim_sum / float(count)
+
+
+# ---------------------
+# Classifier components
+# ---------------------
+
+def _load_state_dict(path: str) -> Dict[str, torch.Tensor]:
+    state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        raise RuntimeError("Checkpoint does not contain a state_dict")
+    if any(k.startswith("model.") for k in state.keys()):
+        state = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
+    return state
+
+
+def _build_poe_from_state(state: Dict[str, torch.Tensor]) -> 'PoESeqSetVAEPretrain':
+    model = PoESeqSetVAEPretrain(
+        input_dim=getattr(cfg, "input_dim", 768),
+        reduced_dim=getattr(cfg, "reduced_dim", 256),
+        latent_dim=getattr(cfg, "latent_dim", 128),
+        levels=getattr(cfg, "levels", 2),
+        heads=getattr(cfg, "heads", 2),
+        m=getattr(cfg, "m", 16),
+        beta=getattr(cfg, "beta", 0.1),
+        lr=getattr(cfg, "lr", 2e-4),
+        ff_dim=getattr(cfg, "ff_dim", 512),
+        transformer_heads=getattr(cfg, "transformer_heads", 8),
+        transformer_layers=getattr(cfg, "transformer_layers", 4),
+        transformer_dropout=getattr(cfg, "transformer_dropout", 0.15),
+        warmup_beta=getattr(cfg, "warmup_beta", True),
+        max_beta=getattr(cfg, "max_beta", 0.05),
+        beta_warmup_steps=getattr(cfg, "beta_warmup_steps", 8000),
+        free_bits=getattr(cfg, "free_bits", 0.03),
+        use_kl_capacity=getattr(cfg, "use_kl_capacity", True),
+        capacity_per_dim_end=getattr(cfg, "capacity_per_dim_end", 0.03),
+        capacity_warmup_steps=getattr(cfg, "capacity_warmup_steps", 20000),
+        stale_dropout_p=getattr(cfg, "stale_dropout_p", 0.2),
+        set_mae_ratio=getattr(cfg, "set_mae_ratio", 0.0),
+        enable_next_change=True,
+        next_change_weight=0.3,
+        use_adaptive_poe=True,
+        poe_beta_min=0.1,
+        poe_beta_max=3.0,
+        freeze_set_encoder=True,
+        poe_mode="conditional",
+    )
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    try:
+        print(f"Loaded PoE weights: missing={len(missing)}, unexpected={len(unexpected)}")
+    except Exception:
+        pass
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
+class AdditiveAttention(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1),
+        )
+
+    def forward(self, h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        score = self.fc(h).squeeze(-1)
+        score = score.masked_fill(~mask, float("-inf"))
+        att = torch.softmax(score, dim=-1)
+        att = att.unsqueeze(-1)
+        z = torch.sum(att * h, dim=1)
+        return z
+
+
+class MortalityClassifier(pl.LightningModule):
+    def __init__(
+        self,
+        poe_model: 'PoESeqSetVAEPretrain',
+        latent_dim: int,
+        mu_proj_dim: int = 64,
+        logvar_proj_dim: int = 32,
+        scalar_proj_dim: int = 16,
+        gru_hidden: int = 128,
+        gru_layers: int = 2,
+        dropout: float = 0.2,
+        lr: float = 1e-3,
+        pos_weight: Optional[float] = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["poe_model"])  # do not serialize big backbone in hparams
+        self.poe = poe_model.eval()
+        for p in self.poe.parameters():
+            p.requires_grad = False
+        self.latent_dim = latent_dim
+        self.mu_proj = nn.Sequential(nn.Linear(latent_dim, mu_proj_dim), nn.GELU())
+        self.logvar_proj = nn.Sequential(nn.Linear(latent_dim, logvar_proj_dim), nn.GELU())
+        self.scalar_in_dim = 7
+        self.scalar_proj = nn.Sequential(
+            nn.Linear(self.scalar_in_dim, 32), nn.GELU(), nn.Linear(32, scalar_proj_dim)
+        )
+        feat_dim = mu_proj_dim + logvar_proj_dim + scalar_proj_dim
+        self.gru = nn.GRU(
+            input_size=feat_dim,
+            hidden_size=gru_hidden,
+            num_layers=gru_layers,
+            batch_first=True,
+            dropout=dropout if gru_layers > 1 else 0.0,
+        )
+        self.attn = AdditiveAttention(gru_hidden)
+        self.head = nn.Sequential(
+            nn.Linear(gru_hidden, gru_hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(gru_hidden // 2, 1),
+        )
+        self.lr = lr
+        self.pos_weight = (
+            None if pos_weight is None else torch.tensor([pos_weight], dtype=torch.float32)
+        )
+        self._val_logits: List[float] = []
+        self._val_labels: List[int] = []
+        self._test_logits: List[float] = []
+        self._test_labels: List[int] = []
+
+        # Optional metrics
+        try:
+            from sklearn.metrics import roc_auc_score as _auc, average_precision_score as _ap
+            self._roc_auc_score = _auc
+            self._average_precision_score = _ap
+        except Exception:
+            self._roc_auc_score = None
+            self._average_precision_score = None
+
+    @torch.no_grad()
+    def _extract_features_single(self, sets: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = next(self.parameters()).device
+        S = len(sets)
+        if S == 0:
+            return torch.zeros(0, 1, device=device), torch.zeros(0, dtype=torch.bool, device=device)
+
+        mu_qx_list: List[torch.Tensor] = []
+        logvar_qx_list: List[torch.Tensor] = []
+        enc_aggs: List[torch.Tensor] = []
+        set_sizes: List[int] = []
+        has_changes: List[float] = []
+        set_times: List[torch.Tensor] = []
+        for s in sets:
+            var, val = s["var"], s["val"]
+            z_list_enc, enc_tokens = self.poe.set_encoder.encode_from_var_val(var, val)
+            _z, mu_qx, logvar_qx = z_list_enc[-1]
+            mu_qx_list.append(mu_qx.squeeze(1))
+            logvar_qx_list.append(logvar_qx.squeeze(1))
+            if enc_tokens is not None and enc_tokens.numel() > 0:
+                enc_aggs.append(enc_tokens.mean(dim=1))
+            else:
+                enc_aggs.append(mu_qx)
+            set_sizes.append(int(var.size(1)))
+            has_changes.append(float(s.get("has_change", torch.tensor(0.0)).item()))
+            set_times.append(s["set_time"])  # [1]
+
+        mu_qx = torch.stack(mu_qx_list, dim=1).to(device)
+        logvar_qx = torch.stack(logvar_qx_list, dim=1).to(device)
+        set_aggs = torch.stack(enc_aggs, dim=1).to(device)
+        minutes = torch.stack(set_times, dim=1).float().to(device)
+        if minutes.dim() == 2:
+            minutes = minutes.unsqueeze(-1)
+        minutes = minutes.squeeze(-1)
+
+        time_emb = self.poe._relative_time_bucket_embedding(minutes)
+        B = 1
+        h = torch.zeros(B, self.latent_dim, device=device)
+
+        feat_rows: List[torch.Tensor] = []
+        for t in range(S):
+            prior_params = self.poe.prior_head(h)
+            mu_p_t, logvar_p_t = prior_params.chunk(2, dim=-1)
+
+            mu_qx_t = mu_qx[:, t, :]
+            logvar_qx_t = logvar_qx[:, t, :]
+            var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
+            d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)
+            delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)
+            dt = minutes[:, t : t + 1] - (minutes[:, t - 1 : t] if t > 0 else minutes[:, t : t + 1])
+            log_dt1p = torch.log1p(dt.clamp(min=0.0))
+            gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
+            beta_t = self.poe.poe_beta_min + (self.poe.poe_beta_max - self.poe.poe_beta_min) * torch.sigmoid(self.poe.obs_gate(gate_inp))
+
+            set_agg_t = set_aggs[:, t, :]
+            like_inp = torch.cat([set_agg_t, mu_p_t, logvar_p_t], dim=-1)
+            like_out = self.poe.like_head(like_inp)
+            log_prec_like_t, h_like_t = like_out.chunk(2, dim=-1)
+            prec_like_t = F.softplus(log_prec_like_t) + 1e-4
+            Lambda_p_t = torch.exp(-logvar_p_t)
+            prec_like_t = prec_like_t * beta_t
+            h_like_t = h_like_t * beta_t
+            Lambda_post_t = Lambda_p_t + prec_like_t
+            h_post_t = Lambda_p_t * mu_p_t + h_like_t
+            mu_post_t = h_post_t / (Lambda_post_t + 1e-8)
+            logvar_post_t = -torch.log(Lambda_post_t + 1e-8)
+
+            var_q = logvar_post_t.exp()
+            var_p = logvar_p_t.exp()
+            kld = 0.5 * (logvar_p_t - logvar_post_t + (var_q / (var_p + 1e-8)) + ((mu_p_t - mu_post_t) ** 2) / (var_p + 1e-8) - 1.0)
+            kl_scalar = kld.sum(dim=-1, keepdim=True)
+
+            mu_feat = self.mu_proj(mu_post_t)
+            logv_feat = self.logvar_proj(logvar_post_t)
+            scalar_feat = torch.cat([
+                d2,
+                torch.abs(delta_H),
+                kl_scalar,
+                beta_t,
+                torch.log1p(torch.tensor([[float(set_sizes[t])]], device=device)),
+                torch.tensor([[has_changes[t]]], device=device),
+                log_dt1p,
+            ], dim=-1)
+            scalar_feat = self.scalar_proj(scalar_feat)
+            feat_t = torch.cat([mu_feat, logv_feat, scalar_feat], dim=-1).squeeze(0)
+            feat_rows.append(feat_t)
+
+            h = self.poe.gru_cell(mu_post_t + time_emb[:, t, :], h)
+
+        X = torch.stack(feat_rows, dim=0)
+        mask = torch.ones(S, dtype=torch.bool, device=device)
+        return X, mask
+
+    @torch.no_grad()
+    def _build_batch_features(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        var, val = batch["var"], batch["val"]
+        minute, set_id = batch["minute"], batch["set_id"]
+        padding_mask = batch.get("padding_mask", None)
+        carry_mask = batch.get("carry_mask", None)
+        B = var.size(0)
+        all_sets = self.poe._split_sets(var, val, minute, set_id, padding_mask, carry_mask)
+        feats: List[torch.Tensor] = []
+        masks: List[torch.Tensor] = []
+        for sets in all_sets:
+            X_i, m_i = self._extract_features_single(sets)
+            feats.append(X_i)
+            masks.append(m_i)
+        maxS = max((x.shape[0] for x in feats), default=0)
+        feat_dim = feats[0].shape[1] if len(feats) > 0 and feats[0].ndim == 2 and feats[0].shape[0] > 0 else (self.mu_proj[0].out_features + self.logvar_proj[0].out_features + self.scalar_proj[-1].out_features)
+        X_pad = torch.zeros(B, maxS, feat_dim, device=var.device)
+        M = torch.zeros(B, maxS, dtype=torch.bool, device=var.device)
+        for b in range(B):
+            s_len = feats[b].shape[0]
+            if s_len > 0:
+                X_pad[b, :s_len, :] = feats[b]
+                M[b, :s_len] = masks[b]
+        y = batch["y"].to(var.device) if "y" in batch else torch.zeros(B, device=var.device)
+        return X_pad, M, y
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        X, M, _ = self._build_batch_features(batch)
+        lengths = M.sum(dim=1).long().clamp(min=1)
+        packed = pack_padded_sequence(X, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        packed_out, _ = self.gru(packed)
+        H, _ = pad_packed_sequence(packed_out, batch_first=True)
+        S_out = H.size(1)
+        M_out = torch.arange(S_out, device=H.device).unsqueeze(0) < lengths.unsqueeze(1)
+        z = self.attn(H, M_out)
+        logit = self.head(z).squeeze(-1)
+        return logit
+
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        logits = self.forward(batch)
+        y = batch["y"].to(logits.dtype)
+        if self.pos_weight is not None:
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=self.pos_weight.to(logits.device))
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, y)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        logits = self.forward(batch)
+        y = batch["y"].to(logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
+        self._val_logits.extend(logits.detach().cpu().tolist())
+        self._val_labels.extend(y.detach().cpu().tolist())
+        return loss
+
+    def on_validation_epoch_end(self) -> None:
+        if len(self._val_labels) == 0:
+            return
+        try:
+            y_true = np.array(self._val_labels, dtype=np.int32)
+            y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
+            auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
+            auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
+            best_thr = 0.5
+            best_acc = 0.0
+            sens = float("nan")
+            spec = float("nan")
+            try:
+                qs = np.linspace(0.05, 0.95, 19)
+                cand = np.unique(np.quantile(y_prob, qs))
+                for t in cand:
+                    y_hat = (y_prob >= t).astype(int)
+                    tp = int(((y_hat == 1) & (y_true == 1)).sum())
+                    tn = int(((y_hat == 0) & (y_true == 0)).sum())
+                    fp = int(((y_hat == 1) & (y_true == 0)).sum())
+                    fn = int(((y_hat == 0) & (y_true == 1)).sum())
+                    acc = (tp + tn) / max(1, len(y_true))
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_thr = float(t)
+                        sens = tp / max(1, tp + fn)
+                        spec = tn / max(1, tn + fp)
+            except Exception:
+                pass
+        except Exception:
+            auroc, auprc, best_thr, best_acc, sens, spec = float("nan"), float("nan"), 0.5, float("nan"), float("nan"), float("nan")
+        self.log("val_auroc", auroc, prog_bar=True)
+        self.log("val_auprc", auprc, prog_bar=True)
+        self.log("val_best_thr", best_thr, prog_bar=True)
+        self.log("val_best_acc", best_acc, prog_bar=False)
+        self.log("val_sensitivity", sens, prog_bar=False)
+        self.log("val_specificity", spec, prog_bar=False)
+        self._val_logits.clear()
+        self._val_labels.clear()
+
+    def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        logits = self.forward(batch)
+        y = batch.get("y", torch.zeros_like(logits)).to(logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        self.log("test_loss", loss, prog_bar=True)
+        self._test_logits.extend(logits.detach().cpu().tolist())
+        self._test_labels.extend(y.detach().cpu().tolist())
+        return loss
+
+    def on_test_epoch_end(self) -> None:
+        if len(self._test_labels) == 0:
+            return
+        try:
+            y_true = np.array(self._test_labels, dtype=np.int32)
+            y_prob = torch.sigmoid(torch.tensor(self._test_logits)).numpy()
+            auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
+            auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
+        except Exception:
+            auroc, auprc = float("nan"), float("nan")
+        self.log("test_auroc", auroc, prog_bar=True)
+        self.log("test_auprc", auprc, prog_bar=True)
+        self._test_logits.clear()
+        self._test_labels.clear()
+
+    def configure_optimizers(self):
+        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
+        return opt
