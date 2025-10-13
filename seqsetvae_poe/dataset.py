@@ -271,3 +271,145 @@ class DataModule(pl.LightningDataModule):
         batch_items: List[Tuple[pd.DataFrame, str]] = [self.train[i] for i in idxs]
         return _collate_lvcf(batch_items, self.vcols)
 
+
+# ---------------- Mortality label data module (Stage C) ---------------- #
+
+def _pid_variants(raw_id: Any) -> List[str]:
+    variants: List[str] = []
+    try:
+        s = str(raw_id).strip()
+    except Exception:
+        return variants
+    if s == "":
+        return variants
+    variants.append(s)
+    try:
+        f = float(s)
+        i = int(f)
+        variants.append(str(i))
+        variants.append(f"{i}.0")
+    except Exception:
+        pass
+    seen = set()
+    out: List[str] = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _read_label_map(label_csv: str) -> Dict[str, int]:
+    import csv
+    mp: Dict[str, int] = {}
+    with open(label_csv, "r") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "ts_id" not in reader.fieldnames or "in_hospital_mortality" not in reader.fieldnames:
+            raise ValueError("label_csv must contain columns ts_id,in_hospital_mortality")
+        for row in reader:
+            pid_raw = row["ts_id"]
+            y_raw = str(row["in_hospital_mortality"]).strip()
+            if y_raw == "" or y_raw.lower() == "nan":
+                lab = 0
+            else:
+                try:
+                    lab = 1 if int(float(y_raw)) == 1 else 0
+                except Exception:
+                    lab = 0
+            for pid in _pid_variants(pid_raw):
+                if pid == "":
+                    continue
+                mp[pid] = lab
+    return mp
+
+
+class MortalityDataModule(pl.LightningDataModule):
+    def __init__(
+        self,
+        saved_dir: str,
+        label_csv: str,
+        batch_size: int = 4,
+        num_workers: int = 2,
+        pin_memory: bool = True,
+        smoke: bool = False,
+        smoke_batch_size: int = 8,
+    ):
+        super().__init__()
+        self.saved_dir = saved_dir
+        self.label_csv = label_csv
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.smoke = smoke
+        self.smoke_batch_size = smoke_batch_size
+        self.id_to_label: Dict[str, int] = {}
+        self.vcols: Optional[List[str]] = None
+
+    def setup(self, stage=None):
+        self.id_to_label = _read_label_map(self.label_csv)
+        self.train = PatientDataset("train", self.saved_dir)
+        self.valid = PatientDataset("valid", self.saved_dir)
+        self.test = PatientDataset("test", self.saved_dir)
+        sample_df, _ = self.train[0]
+        self.vcols = _detect_vcols(sample_df)
+        tr_labels = [self.id_to_label.get(pid, 0) for pid in self.train.ids]
+        n_pos = max(1, sum(tr_labels))
+        n_neg = max(1, len(tr_labels) - n_pos)
+        self.pos_weight = float(n_neg) / float(n_pos)
+        if self.smoke:
+            n = len(self.train)
+            k = min(self.smoke_batch_size, n)
+            self._smoke_idx = list(range(k))
+        else:
+            self._smoke_idx = None
+
+    def _collate_with_label(self, batch: List[Tuple[Any, str]]):
+        assert self.vcols is not None
+        out = _collate_lvcf(batch, self.vcols)
+        labels_list: List[float] = []
+        missing: List[str] = []
+        for (_, pid) in batch:
+            lab = self.id_to_label.get(pid, None)
+            if lab is None:
+                for v in _pid_variants(pid):
+                    if v in self.id_to_label:
+                        lab = self.id_to_label[v]
+                        break
+            if lab is None:
+                missing.append(str(pid))
+            else:
+                labels_list.append(float(lab))
+        if len(missing) > 0:
+            raise ValueError(f"Missing labels for IDs (sample): {missing[:10]} (total {len(missing)})")
+        out["y"] = torch.tensor(labels_list, dtype=torch.float32)
+        return out
+
+    def _loader(self, ds, shuffle):
+        return DataLoader(
+            ds,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            collate_fn=self._collate_with_label,
+        )
+
+    def train_dataloader(self):
+        if getattr(self, "_smoke_idx", None) is not None:
+            subset = Subset(self.train, self._smoke_idx)
+            return DataLoader(
+                subset,
+                batch_size=len(subset),
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                collate_fn=self._collate_with_label,
+            )
+        return self._loader(self.train, True)
+
+    def val_dataloader(self):
+        return self._loader(self.valid, False)
+
+    def test_dataloader(self):
+        return self._loader(self.test, False)
+

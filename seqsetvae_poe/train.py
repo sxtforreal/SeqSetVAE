@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Unified train entrypoint with --stage {A,B,CA,B,C}.
+Unified train entrypoint with --stage {A,B,C}.
 
-- Stage A: SetVAE-only pretraining (_setvae_PT)
-- Stage B: Dynamics + conditional PoE pretraining (_poe_PT)
-- Stage C: Downstream classifier (classifier)
+- Stage A: SetVAE-only pretraining (internals from _setvae_PT)
+- Stage B: Dynamics + conditional PoE pretraining (internals from _poe_PT)
+- Stage C: Downstream classifier (internals from classifier)
 
-All other arguments are forwarded to the underlying stage script.
+All other arguments are forwarded to the underlying stage logic.
 """
 from __future__ import annotations
 import argparse
