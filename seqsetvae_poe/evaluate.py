@@ -1005,6 +1005,137 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             _process_one_set(df_set, patient_id, chosen_set, sample_idx=idx, total_samples=total)
 
 
+def _run_var_scale_audit(model: torch.nn.Module, args):
+    print("Running per-variable scale audit ...")
+    encoder = model.set_encoder if hasattr(model, "set_encoder") else getattr(model, "setvae", None)
+    if encoder is None:
+        print("[WARN] Model does not expose a SetVAE encoder; skip audit")
+        return
+    device = next(model.parameters()).device
+
+    part = getattr(args, "audit_partition", "train")
+    small_thr = float(getattr(args, "audit_small_thr", 0.2))
+    max_patients = int(getattr(args, "audit_max_patients", 200))
+    min_count = int(getattr(args, "audit_min_count", 10))
+    seed = int(getattr(args, "seed", 42))
+
+    ds = PatientDataset(part, saved_dir=args.data_dir)
+    idxs = list(range(len(ds)))
+    rng = random.Random(seed)
+    rng.shuffle(idxs)
+    if max_patients is not None and max_patients > 0:
+        idxs = idxs[:max_patients]
+
+    var_to_vals: Dict[str, List[float]] = {}
+    var_to_ratios: Dict[str, List[float]] = {}
+    var_to_cos: Dict[str, List[float]] = {}
+    keep_first_n = int(getattr(args, "audit_keep_first_n_vars", 0))
+    seen_vars: set[str] = set()
+
+    for i in idxs:
+        df, _pid = ds[i]
+        try:
+            vcols = _detect_vcols(df)
+        except Exception:
+            continue
+        uniq_sets = sorted(set(int(s) for s in df["set_index"].tolist()))
+        for sid in uniq_sets:
+            df_set = df[df["set_index"] == sid]
+            if len(df_set) == 0:
+                continue
+            names = df_set["variable"].astype(str).tolist()
+            val_np = df_set["value"].to_numpy(dtype=np.float32)
+            if val_np.size == 0:
+                continue
+            var_np = df_set[vcols].to_numpy(dtype=np.float32, copy=False)
+
+            var_t = torch.from_numpy(var_np).unsqueeze(0).to(device)
+            val_t = torch.from_numpy(val_np).reshape(1, -1, 1).to(device)
+
+            if getattr(encoder, "dim_reducer", None) is not None:
+                var_red = encoder.dim_reducer(var_t)
+            else:
+                var_red = var_t
+            with torch.no_grad():
+                recon_t = _encode_decode_set(encoder, var_red, val_t)
+                var_dirs_t = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
+            recon_np = recon_t.squeeze(0).detach().cpu().numpy()
+            var_dirs_np = var_dirs_t.squeeze(0).detach().cpu().numpy()
+
+            assigns = _greedy_match_recon_to_vars(recon_np, var_dirs_np, names)
+            pred_map: Dict[str, Tuple[float, float]] = {n: (pv, cs) for (n, pv, cs) in assigns}
+
+            for name, v in zip(names, val_np.tolist()):
+                if keep_first_n > 0 and name not in seen_vars and len(seen_vars) >= keep_first_n:
+                    # skip new variables if we already have N distinct vars collected
+                    continue
+                abs_v = float(abs(v))
+                pv, cs = pred_map.get(name, (float("nan"), float("nan")))
+                if not math.isfinite(abs_v) or abs_v < 1e-8 or not math.isfinite(pv):
+                    continue
+                ratio = float(pv) / (abs_v + 1e-8)
+                var_to_vals.setdefault(name, []).append(abs_v)
+                var_to_ratios.setdefault(name, []).append(ratio)
+                if math.isfinite(cs):
+                    var_to_cos.setdefault(name, []).append(float(cs))
+                seen_vars.add(name)
+
+    rows: List[Dict[str, float]] = []
+    for name in var_to_vals.keys():
+        vals = np.array(var_to_vals.get(name, []), dtype=np.float32)
+        rats = np.array(var_to_ratios.get(name, []), dtype=np.float32)
+        coss = np.array(var_to_cos.get(name, []), dtype=np.float32) if name in var_to_cos else np.array([], dtype=np.float32)
+        if len(vals) < min_count:
+            continue
+        row = {
+            "variable": name,
+            "count": int(len(vals)),
+            "median_abs_val": float(np.median(vals)),
+            f"prop_abs_val_le_{small_thr}": float(np.mean(vals <= small_thr)),
+            "mean_scale_ratio": float(np.mean(rats)),
+            "median_scale_ratio": float(np.median(rats)),
+            "cos_median": float(np.median(coss)) if coss.size > 0 else float("nan"),
+        }
+        rows.append(row)
+    if not rows:
+        print("[WARN] No variables met min_count for audit; skipping save")
+        return
+    df_var = pd.DataFrame(rows).sort_values("count", ascending=False)
+    os.makedirs(args.output_dir, exist_ok=True)
+    out_csv = os.path.join(args.output_dir, "var_scale_audit.csv")
+    df_var.to_csv(out_csv, index=False)
+    print(f"Saved var-scale audit CSV to: {out_csv}")
+
+    # Scatter plot
+    if plt is not None:
+        try:
+            x = df_var[f"prop_abs_val_le_{small_thr}"].to_numpy(dtype=float)
+            y = df_var["mean_scale_ratio"].to_numpy(dtype=float)
+            sizes = np.sqrt(df_var["count"].to_numpy(dtype=float)).clip(min=1.0) * 2.0
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(x, y, s=sizes, alpha=0.65, c="tab:blue")
+            ax.set_xlabel(f"Prop(|val| ≤ {small_thr})")
+            ax.set_ylabel("Mean scale ratio (recon/|val|)")
+            ax.set_title(f"Var-scale audit ({part} set)")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            out_png = os.path.join(args.output_dir, "var_scale_audit_scatter.png")
+            fig.savefig(out_png, dpi=220)
+            plt.close(fig)
+            # Simple Pearson correlation
+            mask = np.isfinite(x) & np.isfinite(y)
+            if mask.sum() >= 3:
+                try:
+                    corr = float(np.corrcoef(x[mask], y[mask])[0, 1])
+                    print(f"Pearson corr(prop_small, mean_scale_ratio) = {corr:.4f}")
+                except Exception:
+                    pass
+            print(f"Saved var-scale scatter to: {out_png}")
+        except Exception as e:
+            print(f"[WARN] Failed to plot var-scale audit: {e}")
+    else:
+        print("[INFO] matplotlib not available; skipping scatter plot")
+
 def _run_stage_ab():
     ap = argparse.ArgumentParser(
         add_help=False,
@@ -1034,6 +1165,13 @@ def _run_stage_ab():
     ap.add_argument("--set_index", type=int, default=None)
     ap.add_argument("--stats_csv", type=str, default=getattr(cfg, "params_map_path", ""))
     ap.add_argument("--event_emb_csv", type=str, default="")
+    # Per-variable scale audit (optional)
+    ap.add_argument("--audit_var_scale", action="store_true", default=False, help="Run per-variable scale audit and scatter plot")
+    ap.add_argument("--audit_partition", type=str, choices=["train", "valid", "test"], default="train", help="Dataset partition to audit")
+    ap.add_argument("--audit_small_thr", type=float, default=0.2, help="Threshold for small |val| proportion")
+    ap.add_argument("--audit_max_patients", type=int, default=200, help="Max patients to sample for audit (use <=0 for all)")
+    ap.add_argument("--audit_min_count", type=int, default=10, help="Min samples per variable to include in audit CSV")
+    ap.add_argument("--audit_keep_first_n_vars", type=int, default=0, help="If >0, audit only first N variables encountered; default 0 means all")
     args, _ = ap.parse_known_args()
 
     if args.output_dir is None:
@@ -1278,6 +1416,13 @@ def _run_stage_ab():
 
     if getattr(args, "named_recon", "off") != "off":
         _run_named_recon_print(model, args)
+
+    # Optional: per-variable scale audit
+    if getattr(args, "audit_var_scale", False):
+        try:
+            _run_var_scale_audit(model, args)
+        except Exception as e:
+            print(f"[WARN] var-scale audit failed: {e}")
 
 
 def _inject_ckpt_type_from_stage():
