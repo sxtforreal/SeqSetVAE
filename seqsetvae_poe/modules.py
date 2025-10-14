@@ -361,8 +361,8 @@ def recon_loss(
     recon_unit = recon / (recon_norm + epsilon)
     target_unit = target / (target_norm + epsilon)
 
-    # Direction Chamfer
-    sim_matrix = torch.bmm(recon_unit, target_unit.transpose(1, 2))
+    # Direction Chamfer (unsigned)
+    sim_matrix = torch.bmm(recon_unit, target_unit.transpose(1, 2)).abs()
     dissim_matrix = 1 - sim_matrix
     min_dissim_recon = torch.min(dissim_matrix, dim=2)[0].mean(dim=1)
     min_dissim_target = torch.min(dissim_matrix, dim=1)[0].mean(dim=1)
@@ -376,10 +376,12 @@ def recon_loss(
     min_mag_target = torch.min(mag_distances, dim=1)[0].mean(dim=1)
     mag_chamfer = torch.mean(min_mag_recon + min_mag_target) / 2
 
-    # Full Chamfer (L2 on vectors, for global position constraint)
+    # Full Chamfer (sign-invariant L2 on vectors)
     recon_exp = recon.unsqueeze(2)
     target_exp = target.unsqueeze(1)
-    distances = torch.sum((recon_exp - target_exp) ** 2, dim=-1)
+    dist_pos = torch.sum((recon_exp - target_exp) ** 2, dim=-1)
+    dist_neg = torch.sum((recon_exp + target_exp) ** 2, dim=-1)
+    distances = torch.minimum(dist_pos, dist_neg)
     min_dist_recon_to_target = torch.min(distances, dim=2)[0].mean(dim=1)
     min_dist_target_to_recon = torch.min(distances, dim=1)[0].mean(dim=1)
     chamfer_loss = torch.mean(min_dist_recon_to_target + min_dist_target_to_recon) / 2

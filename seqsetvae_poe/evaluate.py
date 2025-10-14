@@ -826,7 +826,8 @@ def _greedy_match_recon_to_vars(
     eps = 1e-8
     recon_norm = np.linalg.norm(recon, axis=1) + eps
     recon_dir = recon / recon_norm[:, None]
-    sim = np.matmul(recon_dir, var_dirs.T)
+    # Unsigned cosine for var matching to be sign-invariant
+    sim = np.abs(np.matmul(recon_dir, var_dirs.T))
     N, M = sim.shape
     recon_order = np.argsort(recon_norm)[::-1]
     taken_vars = set()
