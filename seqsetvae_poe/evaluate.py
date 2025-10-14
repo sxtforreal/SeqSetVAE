@@ -1029,6 +1029,8 @@ def _run_var_scale_audit(model: torch.nn.Module, args):
     var_to_vals: Dict[str, List[float]] = {}
     var_to_ratios: Dict[str, List[float]] = {}
     var_to_cos: Dict[str, List[float]] = {}
+    keep_first_n = int(getattr(args, "audit_keep_first_n_vars", 0))
+    seen_vars: set[str] = set()
 
     for i in idxs:
         df, _pid = ds[i]
@@ -1064,6 +1066,9 @@ def _run_var_scale_audit(model: torch.nn.Module, args):
             pred_map: Dict[str, Tuple[float, float]] = {n: (pv, cs) for (n, pv, cs) in assigns}
 
             for name, v in zip(names, val_np.tolist()):
+                if keep_first_n > 0 and name not in seen_vars and len(seen_vars) >= keep_first_n:
+                    # skip new variables if we already have N distinct vars collected
+                    continue
                 abs_v = float(abs(v))
                 pv, cs = pred_map.get(name, (float("nan"), float("nan")))
                 if not math.isfinite(abs_v) or abs_v < 1e-8 or not math.isfinite(pv):
@@ -1073,6 +1078,7 @@ def _run_var_scale_audit(model: torch.nn.Module, args):
                 var_to_ratios.setdefault(name, []).append(ratio)
                 if math.isfinite(cs):
                     var_to_cos.setdefault(name, []).append(float(cs))
+                seen_vars.add(name)
 
     rows: List[Dict[str, float]] = []
     for name in var_to_vals.keys():
@@ -1165,6 +1171,7 @@ def _run_stage_ab():
     ap.add_argument("--audit_small_thr", type=float, default=0.2, help="Threshold for small |val| proportion")
     ap.add_argument("--audit_max_patients", type=int, default=200, help="Max patients to sample for audit (use <=0 for all)")
     ap.add_argument("--audit_min_count", type=int, default=10, help="Min samples per variable to include in audit CSV")
+    ap.add_argument("--audit_keep_first_n_vars", type=int, default=0, help="If >0, audit only first N variables encountered; default 0 means all")
     args, _ = ap.parse_known_args()
 
     if args.output_dir is None:
