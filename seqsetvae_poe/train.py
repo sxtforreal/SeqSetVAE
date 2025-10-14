@@ -13,6 +13,7 @@ import argparse
 import os
 import sys
 import lightning.pytorch as pl
+import torch
 from lightning.pytorch.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
@@ -23,6 +24,73 @@ from lightning.pytorch.loggers import TensorBoardLogger
 import config as cfg  # type: ignore
 from dataset import DataModule, MortalityDataModule  # type: ignore
 from model import SetVAEOnlyPretrain, PoESeqSetVAEPretrain, MortalityClassifier, _load_state_dict, _build_poe_from_state  # type: ignore
+
+
+def _load_state_dict_flex(path: str) -> dict:
+    """Load a checkpoint file and return a plain state_dict.
+
+    - Unwraps under 'state_dict' if present
+    - Strips leading 'model.' prefix if present
+    """
+    try:
+        state = pl.utilities.cloud_io.load(path, map_location="cpu")  # type: ignore
+    except Exception:
+        state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    if isinstance(state, dict) and any(k.startswith("model.") for k in state.keys()):
+        state = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
+    return state
+
+
+def _detect_setvae_prefix(keys: list[str]) -> str:
+    """Detect the most likely SetVAE prefix in a state_dict's keys."""
+    candidates = [
+        "set_encoder.",
+        "setvae.setvae.",
+        "setvae.",
+    ]
+    counts = {p: 0 for p in candidates}
+    for k in keys:
+        for p in candidates:
+            if k.startswith(p):
+                counts[p] += 1
+    best = max(counts.items(), key=lambda kv: kv[1])
+    return best[0] if best[1] > 0 else ""
+
+
+def _remap_setvae_from_A_to_target(
+    state_stageA: dict,
+    target_model_state: dict,
+    drop_flows: bool = True,
+) -> dict:
+    """Map Stage A SetVAE weights to target model's SetVAE prefix and filter by matching shape.
+
+    Returns a dict containing only remapped SetVAE weights compatible with the target model.
+    """
+    src_prefix = _detect_setvae_prefix(list(state_stageA.keys()))
+    # Determine destination prefix from model state
+    dst_prefix = "set_encoder."
+    if not any(k.startswith(dst_prefix) for k in target_model_state.keys()):
+        # Rare older layout fallback
+        if any(k.startswith("setvae.setvae.") for k in target_model_state.keys()):
+            dst_prefix = "setvae.setvae."
+        elif any(k.startswith("setvae.") for k in target_model_state.keys()):
+            dst_prefix = "setvae."
+
+    if not src_prefix:
+        return {}
+
+    remapped = {}
+    for k, v in state_stageA.items():
+        if not k.startswith(src_prefix):
+            continue
+        if drop_flows and ".flows." in k:
+            continue
+        target_key = dst_prefix + k[len(src_prefix):]
+        if target_key in target_model_state and target_model_state[target_key].shape == v.shape:
+            remapped[target_key] = v
+    return remapped
 
 
 def _strip_stage_from_argv():
@@ -208,6 +276,7 @@ def _run_stage_b():
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--init_ckpt", type=str, default=None)
+    parser.add_argument("--stageA_ckpt", type=str, default=None, help="Path to Stage A SetVAE checkpoint for merging into B1 init")
     parser.add_argument("--log_every_n_steps", type=int, default=getattr(cfg, "log_every_n_steps", 50))
     parser.add_argument("--limit_val_batches", type=float, default=getattr(cfg, "limit_val_batches", 1.0))
     parser.add_argument("--val_check_interval", type=float, default=getattr(cfg, "val_check_interval", 0.1))
@@ -299,19 +368,56 @@ def _run_stage_b():
         unfreeze_dim_reducer=bool(args.unfreeze_dim_reducer),
     )
 
+    # Default behavior: if --stageA_ckpt provided, merge its SetVAE weights into initializer (or model state)
+    fused_loaded = False
+    base_state: dict | None = None
     if args.init_ckpt is not None and os.path.isfile(args.init_ckpt):
+        base_state = _load_state_dict_flex(args.init_ckpt)
+    elif args.init_ckpt:
+        print(f"[WARN] init_ckpt not found: {args.init_ckpt}")
+
+    if args.stageA_ckpt is not None and os.path.isfile(args.stageA_ckpt):
         try:
-            state = pl.utilities.cloud_io.load(args.init_ckpt, map_location="cpu")  # type: ignore
-        except Exception:
-            import torch
-            state = torch.load(args.init_ckpt, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        try:
-            missing, unexpected = model.load_state_dict(state, strict=False)
-            print(f"Initialized weights: missing={len(missing)}, unexpected={len(unexpected)}")
+            state_A = _load_state_dict_flex(args.stageA_ckpt)
+            target_model_state = model.state_dict()
+            setvae_from_A = _remap_setvae_from_A_to_target(state_A, target_model_state, drop_flows=True)
+
+            # Choose base to fuse into: provided init_ckpt if available, else current model state
+            if base_state is None:
+                base_state = target_model_state
+
+            # Remove existing target setvae keys, then overlay from A
+            dst_prefix = "set_encoder."
+            if not any(k.startswith(dst_prefix) for k in target_model_state.keys()):
+                if any(k.startswith("setvae.setvae.") for k in target_model_state.keys()):
+                    dst_prefix = "setvae.setvae."
+                elif any(k.startswith("setvae.") for k in target_model_state.keys()):
+                    dst_prefix = "setvae."
+
+            fused = {k: v for k, v in base_state.items() if not k.startswith(dst_prefix)}
+            fused.update(setvae_from_A)
+
+            incompatible = model.load_state_dict(fused, strict=False)
+            print(
+                f"Initialized with fused StageA->B1: "
+                f"missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)}, "
+                f"A_setvae_applied={len(setvae_from_A)}"
+            )
+            fused_loaded = True
         except Exception as e:
-            print(f"Failed to initialize from init_ckpt: {e}")
+            print(f"[WARN] Failed to merge Stage A SetVAE into B1 init: {e}")
+
+    if not fused_loaded:
+        # Fallback to original behavior: load init_ckpt directly if present
+        if base_state is not None:
+            try:
+                incompatible = model.load_state_dict(base_state, strict=False)
+                print(
+                    f"Initialized from init_ckpt: missing={len(incompatible.missing_keys)}, "
+                    f"unexpected={len(incompatible.unexpected_keys)}"
+                )
+            except Exception as e:
+                print(f"Failed to initialize from init_ckpt: {e}")
 
     out_root = args.output_dir if args.output_dir else "./output"
     stage_name = "Stage_B2" if bool(args.partial_unfreeze) else "Stage_B1"
