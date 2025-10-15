@@ -367,12 +367,19 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         if self.poe_mode == "conditional":
             set_aggs = torch.stack([z_mu_post_list[t] for t in range(S)], dim=1)  # [B,S,D]
             z_mu_post_list = []  # clear
+        # Preallocate tensors for time series to avoid repeated cat
+        mu_p_buf = torch.empty(B, S, self.latent_dim, device=device)
+        logvar_p_buf = torch.empty(B, S, self.latent_dim, device=device)
+        mu_post_buf = torch.empty(B, S, self.latent_dim, device=device)
+        logvar_post_buf = torch.empty(B, S, self.latent_dim, device=device)
+        h_seq_buf = torch.empty(B, S, self.latent_dim, device=device)
+
         for t in range(S):
             # Prior from previous hidden
             prior_params_t = self.prior_head(h)  # [B, 2D]
             mu_p_t, logvar_p_t = prior_params_t.chunk(2, dim=-1)
-            mu_p_seq.append(mu_p_t)
-            logvar_p_seq.append(logvar_p_t)
+            mu_p_buf[:, t, :] = mu_p_t
+            logvar_p_buf[:, t, :] = logvar_p_t
             # Adaptive PoE beta (scalar per step)
             if self.use_adaptive_poe:
                 mu_qx_t = z_mu[:, t, :]
@@ -411,8 +418,8 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 mu_post_t, logvar_post_t = self._poe(
                     z_mu[:, t, :], z_logvar[:, t, :], mu_p_t, logvar_p_t, beta_t
                 )
-            z_mu_post_list.append(mu_post_t.unsqueeze(1))
-            z_logvar_post_list.append(logvar_post_t.unsqueeze(1))
+            mu_post_buf[:, t, :] = mu_post_t
+            logvar_post_buf[:, t, :] = logvar_post_t
             # KL(q_post || p_prior)
             kl_t = self._kl_diag_gauss(mu_post_t, logvar_post_t, mu_p_t, logvar_p_t)  # [B]
             # Free bits per step
@@ -424,13 +431,13 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             # Update GRU state with posterior mean and time embedding
             inp_t = mu_post_t + time_emb[:, t, :]
             h = self.gru_cell(inp_t, h)
-            h_states.append(h.unsqueeze(1))  # [B,1,D]
+            h_seq_buf[:, t, :] = h
 
-        mu_p = torch.cat(mu_p_seq, dim=0).view(B, S, -1) if len(mu_p_seq) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
-        logvar_p = torch.cat(logvar_p_seq, dim=0).view(B, S, -1) if len(logvar_p_seq) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
-        mu_post = torch.cat(z_mu_post_list, dim=1) if len(z_mu_post_list) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
-        logvar_post = torch.cat(z_logvar_post_list, dim=1) if len(z_logvar_post_list) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
-        h_seq = torch.cat(h_states, dim=1) if len(h_states) > 0 else torch.zeros(B, S, self.latent_dim, device=device)
+        mu_p = mu_p_buf
+        logvar_p = logvar_p_buf
+        mu_post = mu_post_buf
+        logvar_post = logvar_post_buf
+        h_seq = h_seq_buf
         kl_total = torch.stack(kl_list, dim=1).mean() if len(kl_list) > 0 else torch.tensor(0.0, device=device)
 
         # Task C: next-step change prediction using h_t

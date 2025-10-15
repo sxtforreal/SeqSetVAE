@@ -56,7 +56,13 @@ class _PlanarFlow(nn.Module):
 class MAB(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
-        self.multihead = nn.MultiheadAttention(dim, heads)
+        # Prefer batch_first to avoid transposes; safe fallback for older Torch
+        self._mha_batch_first = True
+        try:
+            self.multihead = nn.MultiheadAttention(dim, heads, batch_first=True)
+        except TypeError:
+            self.multihead = nn.MultiheadAttention(dim, heads)
+            self._mha_batch_first = False
         self.ln1 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
             nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
@@ -64,10 +70,13 @@ class MAB(nn.Module):
         self.ln2 = nn.LayerNorm(dim)
 
     def forward(self, q, kv):
-        q_t = q.transpose(0, 1)
-        kv_t = kv.transpose(0, 1)
-        attn_output, _ = self.multihead(q_t, kv_t, kv_t)
-        attn_output = attn_output.transpose(0, 1)
+        if self._mha_batch_first:
+            attn_output, _ = self.multihead(q, kv, kv)
+        else:
+            q_t = q.transpose(0, 1)
+            kv_t = kv.transpose(0, 1)
+            attn_output, _ = self.multihead(q_t, kv_t, kv_t)
+            attn_output = attn_output.transpose(0, 1)
         a = self.ln1(attn_output)
         ff_out = self.ff(a)
         return self.ln2(ff_out)
@@ -305,10 +314,8 @@ class SetVAEModule(nn.Module):
         else:
             reduced = var
 
-        # Improved normalization method
+        # Improved normalization method (deterministic epsilon for stability)
         norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
-        # Add small random noise to prevent division by zero
-        norms = norms + torch.randn_like(norms) * 1e-8
         reduced_normalized = reduced / (norms + 1e-8)
         x = reduced_normalized * val
 
