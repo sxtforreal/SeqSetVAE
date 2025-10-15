@@ -314,10 +314,8 @@ class SetVAEModule(nn.Module):
         else:
             reduced = var
 
-        # Improved normalization method
+        # Improved normalization method (deterministic epsilon for stability)
         norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
-        # Add small random noise to prevent division by zero
-        norms = norms + torch.randn_like(norms) * 1e-8
         reduced_normalized = reduced / (norms + 1e-8)
         x = reduced_normalized * val
 

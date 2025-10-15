@@ -98,24 +98,31 @@ class SetVAEDataset(Dataset):
         Returns:
             pd.DataFrame: Event set containing variables, values, and metadata
         """
-        # Find which file contains the requested index
-        for i in range(len(self.parquet_files)):
-            if idx < self.offsets[i + 1]:
-                df = self._load_df(i)
-                length = self.lengths[i]
+        # Binary search over offsets to find file index
+        import bisect
+        i = bisect.bisect_right(self.offsets, idx) - 1
+        i = max(0, min(i, len(self.parquet_files) - 1))
+        df = self._load_df(i)
+        length = self.lengths[i]
 
-                # Find the specific set within the file
-                set_indices = df["set_index"].unique()
-                local_set_idx = idx - self.offsets[i]
-                target_set_index = set_indices[local_set_idx]
+        # Cache per-file unique set_index order to avoid recomputing
+        if not hasattr(self, "_set_index_cache"):
+            self._set_index_cache = {}
+        if i not in self._set_index_cache:
+            self._set_index_cache[i] = df["set_index"].unique()
+        set_indices = self._set_index_cache[i]
+        local_set_idx = idx - self.offsets[i]
+        if local_set_idx < 0 or local_set_idx >= len(set_indices):
+            raise IndexError("global idx out of range for computed offsets")
+        target_set_index = set_indices[local_set_idx]
 
-                # Extract the event set
-                sub_df = df[df["set_index"] == target_set_index].copy()
-                if len(sub_df) != length:
-                    raise ValueError(
-                        f"Expected sub_df length {length}, got {len(sub_df)}"
-                    )
-                return sub_df
+        # Extract the event set
+        sub_df = df[df["set_index"] == target_set_index]
+        if len(sub_df) != length:
+            raise ValueError(
+                f"Expected sub_df length {length}, got {len(sub_df)}"
+            )
+        return sub_df.copy()
 
 
 class LengthWeightedSampler(Sampler):
@@ -282,22 +289,15 @@ class SetVAEDataModule(pl.LightningDataModule):
             var_tsr = torch.stack([self.cached_embs[var] for var in sub_df["variable"]])
             var_tsr = var_tsr.unsqueeze(0)  # Add batch dimension
 
-            # Extract and normalize medical values
-            val_tsr = torch.tensor(sub_df["value"].to_numpy(dtype=np.float32)).reshape(
-                -1, 1
-            )
-            event_types = sub_df["variable"].to_numpy()
-            normalized_vals = torch.zeros_like(val_tsr)
-
-            # Apply z-score normalization using pre-computed statistics
-            for i, event in enumerate(event_types):
-                if event in self.params_map:
-                    mean = self.params_map[event]["mean"]
-                    std = self.params_map[event]["std"]
-                    normalized_vals[i] = (val_tsr[i] - mean) / std
-                else:
-                    # Keep original value if no normalization stats available
-                    normalized_vals[i] = val_tsr[i]
+            # Extract and normalize medical values (vectorized)
+            val_np = sub_df["value"].to_numpy(dtype=np.float32)
+            val_tsr = torch.from_numpy(val_np).view(-1, 1)
+            var_series = sub_df["variable"]
+            means = var_series.map(lambda v: self.params_map.get(v, {}).get("mean", np.nan)).to_numpy(dtype=np.float32)
+            stds = var_series.map(lambda v: self.params_map.get(v, {}).get("std", np.nan)).to_numpy(dtype=np.float32)
+            means_t = torch.from_numpy(np.nan_to_num(means, nan=0.0)).view(-1, 1)
+            stds_t = torch.from_numpy(np.nan_to_num(stds, nan=1.0)).view(-1, 1)
+            normalized_vals = (val_tsr - means_t) / stds_t
 
             normalized_vals = normalized_vals.unsqueeze(0)  # Add batch dimension
             return {"var": var_tsr, "val": normalized_vals}
@@ -415,14 +415,14 @@ def dynamic_collate_fn(
         )
 
         # Normalize medical values using pre-computed statistics
-        raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
-        norm_vals = torch.zeros_like(raw_vals)
-        for i, ev in enumerate(df["variable"].to_numpy()):
-            if ev in params_map:
-                m, s = params_map[ev]["mean"], params_map[ev]["std"]
-                norm_vals[i] = (raw_vals[i] - m) / s
-            else:
-                norm_vals[i] = raw_vals[i]
+            val_np = df["value"].to_numpy(dtype=np.float32)
+            raw_vals = torch.from_numpy(val_np).view(-1, 1)
+            var_series = df["variable"]
+            means = var_series.map(lambda v: params_map.get(v, {}).get("mean", np.nan)).to_numpy(dtype=np.float32)
+            stds = var_series.map(lambda v: params_map.get(v, {}).get("std", np.nan)).to_numpy(dtype=np.float32)
+            means_t = torch.from_numpy(np.nan_to_num(means, nan=0.0)).view(-1, 1)
+            stds_t = torch.from_numpy(np.nan_to_num(stds, nan=1.0)).view(-1, 1)
+            norm_vals = (raw_vals - means_t) / stds_t
 
         # Process time information
         minute_tsr = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(-1, 1)
@@ -636,14 +636,14 @@ class SeqSetVAEDataModule(pl.LightningDataModule):
             )
 
             # Normalize medical values
-            raw_vals = torch.tensor(df["value"].to_numpy(dtype=np.float32)).view(-1, 1)
-            norm_vals = torch.zeros_like(raw_vals)
-            for i, ev in enumerate(df["variable"].to_numpy()):
-                if ev in self.params_map:
-                    m, s = self.params_map[ev]["mean"], self.params_map[ev]["std"]
-                    norm_vals[i] = (raw_vals[i] - m) / s
-                else:
-                    norm_vals[i] = raw_vals[i]
+            val_np = df["value"].to_numpy(dtype=np.float32)
+            raw_vals = torch.from_numpy(val_np).view(-1, 1)
+            var_series = df["variable"]
+            means = var_series.map(lambda v: self.params_map.get(v, {}).get("mean", np.nan)).to_numpy(dtype=np.float32)
+            stds = var_series.map(lambda v: self.params_map.get(v, {}).get("std", np.nan)).to_numpy(dtype=np.float32)
+            means_t = torch.from_numpy(np.nan_to_num(means, nan=0.0)).view(-1, 1)
+            stds_t = torch.from_numpy(np.nan_to_num(stds, nan=1.0)).view(-1, 1)
+            norm_vals = (raw_vals - means_t) / stds_t
 
             # Process time information
             minute_tsr = torch.tensor(df["minute"].to_numpy(dtype=np.float32)).view(
