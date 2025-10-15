@@ -194,6 +194,8 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self.recon_gamma = float(recon_gamma)
         self.recon_scale_calib = float(recon_scale_calib)
         self.recon_beta_var = float(recon_beta_var)
+        # Amplitude regression weight (signed val via projection); 0 disables
+        self.recon_amp_weight = 1.0
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
 
@@ -460,6 +462,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 gamma=self.recon_gamma,
                 beta_var=self.recon_beta_var,
                 scale_calib_weight=self.recon_scale_calib,
+                amp_weight=self.recon_amp_weight,
+                base_unit=reduced_normalized,
+                target_val=s["val"],
             )
         recon_total = recon_total / max(1, S)
         return recon_total, kl_total, next_change_loss

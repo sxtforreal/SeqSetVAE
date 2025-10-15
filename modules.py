@@ -301,6 +301,10 @@ def recon_loss(
     beta_var=0.1,
     scale_calib_weight: float = 0.0,
     epsilon=1e-8,
+    amp_weight: float = 0.0,
+    base_unit=None,
+    target_val=None,
+    amp_tau: float = 0.05,
 ):
     """
     Reconstruction loss for unordered sets, using Chamfer distances for direction, magnitude, and full vectors.
@@ -328,8 +332,8 @@ def recon_loss(
     recon_unit = recon / (recon_norm + epsilon)
     target_unit = target / (target_norm + epsilon)
 
-    # Direction Chamfer
-    sim_matrix = torch.bmm(recon_unit, target_unit.transpose(1, 2))
+    # Direction Chamfer (unsigned): treat opposite directions as equivalent
+    sim_matrix = torch.bmm(recon_unit, target_unit.transpose(1, 2)).abs()
     dissim_matrix = 1 - sim_matrix
     min_dissim_recon = torch.min(dissim_matrix, dim=2)[0].mean(dim=1)
     min_dissim_target = torch.min(dissim_matrix, dim=1)[0].mean(dim=1)
@@ -343,10 +347,12 @@ def recon_loss(
     min_mag_target = torch.min(mag_distances, dim=1)[0].mean(dim=1)
     mag_chamfer = torch.mean(min_mag_recon + min_mag_target) / 2
 
-    # Full Chamfer (L2 on vectors, for global position constraint)
+    # Full Chamfer (sign-invariant L2 on vectors): allow flipped matching
     recon_exp = recon.unsqueeze(2)
     target_exp = target.unsqueeze(1)
-    distances = torch.sum((recon_exp - target_exp) ** 2, dim=-1)
+    dist_pos = torch.sum((recon_exp - target_exp) ** 2, dim=-1)
+    dist_neg = torch.sum((recon_exp + target_exp) ** 2, dim=-1)
+    distances = torch.minimum(dist_pos, dist_neg)
     min_dist_recon_to_target = torch.min(distances, dim=2)[0].mean(dim=1)
     min_dist_target_to_recon = torch.min(distances, dim=1)[0].mean(dim=1)
     chamfer_loss = torch.mean(min_dist_recon_to_target + min_dist_target_to_recon) / 2
@@ -362,10 +368,37 @@ def recon_loss(
     scale_ratio = mean_recon_norm / (mean_target_norm + 1e-8)
     scale_penalty = scale_calib_weight * (scale_ratio - 1.0) ** 2
 
-    # Total loss
-    total_loss = (
-        alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term + scale_penalty
-    )
+    # Total (base) loss
+    total_loss = alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term + scale_penalty
+
+    # Optional amplitude regression (signed): project recon onto base direction and regress to target val
+    if amp_weight > 0.0 and base_unit is not None and target_val is not None:
+        try:
+            b = base_unit
+            tv = target_val
+            # Ensure shapes [B,N,D] and [B,N,1]
+            if b.dim() == 4:
+                b = b.squeeze(0)
+            if tv.dim() == 4:
+                tv = tv.squeeze(0)
+            b_unit = b / (torch.norm(b, dim=-1, keepdim=True) + epsilon)
+            # Unsigned cosine matching to select target per recon token
+            sim_rb = torch.bmm((recon / (torch.norm(recon, dim=-1, keepdim=True) + epsilon)), b_unit.transpose(1, 2)).abs()
+            idx = torch.argmax(sim_rb, dim=2)  # [B,N]
+            idx_exp_d = idx.unsqueeze(-1).expand(-1, -1, b_unit.size(-1))
+            idx_exp_1 = idx.unsqueeze(-1)
+            b_sel = torch.gather(b_unit, dim=1, index=idx_exp_d)  # [B,N,D]
+            tval_sel = torch.gather(tv, dim=1, index=idx_exp_1).squeeze(-1)  # [B,N]
+            a_hat = (recon * b_sel).sum(dim=-1)  # [B,N]
+            a_true = tval_sel
+            # Down-weight tiny targets to reduce noise
+            w = (a_true.abs() / amp_tau).clamp(0.0, 1.0)
+            amp_l1 = F.smooth_l1_loss(a_hat, a_true, reduction="none")
+            amp_loss = (w * amp_l1).mean()
+            total_loss = total_loss + amp_weight * amp_loss
+        except Exception:
+            pass
+
     return total_loss
 
 
