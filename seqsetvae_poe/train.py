@@ -170,7 +170,8 @@ def _run_stage_a():
     parser.add_argument("--recon_beta_var", type=float, default=0.0)
     # Dims
     parser.add_argument("--input_dim", type=int, default=getattr(cfg, "input_dim", 768))
-    parser.add_argument("--reduced_dim", type=int, default=getattr(cfg, "reduced_dim", 256))
+    # Default to no learnable reduction by setting reduced_dim == input_dim
+    parser.add_argument("--reduced_dim", type=int, default=getattr(cfg, "input_dim", 768))
     parser.add_argument("--latent_dim", type=int, default=getattr(cfg, "latent_dim", 256))
     parser.add_argument("--levels", type=int, default=getattr(cfg, "levels", 2))
     parser.add_argument("--heads", type=int, default=getattr(cfg, "heads", 2))
