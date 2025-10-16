@@ -968,19 +968,22 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             print(f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})")
         print("===============================================================")
 
-        # 新的 unmatched/recon analysis：
-        #  - 对原始集合中未被匹配到的变量，打印它与所有重建向量的最小和最大余弦（绝对值），并标注各自对应的 recon var
-        #  - 对所有重建向量（recon），打印其与匹配变量的余弦的全局最小和最大值，并标注 recon var
+        # Unmatched/recon analysis:
+        #  - For original variables that were not matched, print the min and max
+        #    absolute cosine to any reconstruction, and label each with the
+        #    corresponding recon variable
+        #  - For all recon tokens, print the global min and max cosine to their
+        #    matched variables, each labeled with the recon variable
         try:
             set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
             print("---- Unmatched originals: min/max cosine to any recon ----")
-            # 构建 matched 的集合（原集合中出现过的匹配名）
+            # Build the set of original variable names that were matched
             matched_in_set = set(n for (n, _v, _c) in matched_nomask)
-            # 统一方向归一化
+            # Unit-direction normalization
             eps = 1e-8
             recon_norm = np.linalg.norm(recon_nomask_np, axis=1, keepdims=True) + eps
             recon_dir = recon_nomask_np / recon_norm
-            # recon 索引到其匹配到的变量名（recon var）的映射，用于标注
+            # Mapping from recon index to its matched variable name (label)
             recon_var_labels = [nm for (nm, _pv, _cs) in assignments_nomask]
             for j, orig_name in enumerate(set_event_names):
                 if orig_name in matched_in_set:
@@ -1004,7 +1007,8 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         except Exception as e:
             print(f"[WARN] unmatched-orig analysis failed: {e}")
 
-        # 额外：对所有 recon（基于 greedy 匹配的 cosine），打印全局最小/最大并标注对应的 recon var
+        # Additionally: for recon tokens (based on greedy-matched cosine),
+        # print global min/max and label the corresponding recon variable
         try:
             if assignments_nomask:
                 cos_arr = np.array([c for (_n, _v, c) in assignments_nomask], dtype=np.float32)
