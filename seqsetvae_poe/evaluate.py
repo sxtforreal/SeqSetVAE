@@ -890,14 +890,25 @@ def _run_named_recon_print(model: torch.nn.Module, args):
     vocab_event_names: Optional[List[str]] = None
     vocab_dirs_np: Optional[np.ndarray] = None
     device = next(model.parameters()).device
+    # For evaluation-only matching in original input space, prepare a linear lift
+    # from reduced_dim back to input_dim using pseudoinverse of the learned reducer.
+    lift_A: Optional[torch.Tensor] = None  # shape [reduced_dim, input_dim]
+    lift_b: Optional[torch.Tensor] = None  # bias vector (reduced_dim)
+    try:
+        dim_red = getattr(encoder, "dim_reducer", None)
+        if dim_red is not None and hasattr(dim_red, "weight") and dim_red.weight is not None:
+            # dim_reducer: y = W x + b, W shape [R, D]. To lift y->x_hat in original D,
+            # use x_hat ≈ (pinv(W)) y  (we implement as (y - b) @ (pinv(W))^T).
+            W = dim_red.weight  # [R, D]
+            lift_A = torch.linalg.pinv(W).t().contiguous().to(device)  # (pinv(W))^T => [R, D]
+            lift_b = (dim_red.bias.to(device) if getattr(dim_red, "bias", None) is not None else None)
+    except Exception:
+        lift_A, lift_b = None, None
     if getattr(args, "named_recon", "off") == "global":
         vocab_names, vocab_vecs = _load_global_vocab_embeddings(args.data_dir, getattr(args, "event_emb_csv", ""))
         vocab_t = torch.from_numpy(vocab_vecs).unsqueeze(0).to(device)
-        if getattr(encoder, "dim_reducer", None) is not None:
-            vocab_red = encoder.dim_reducer(vocab_t)
-        else:
-            vocab_red = vocab_t
-        vocab_dirs = vocab_red / (torch.norm(vocab_red, p=2, dim=-1, keepdim=True) + 1e-8)
+        # Match in ORIGINAL input space: do NOT reduce; normalize in 768-D (or input_dim)
+        vocab_dirs = vocab_t / (torch.norm(vocab_t, p=2, dim=-1, keepdim=True) + 1e-8)
         vocab_dirs_np = vocab_dirs.squeeze(0).detach().cpu().numpy()
         vocab_event_names = [str(n) for n in vocab_names]
 
@@ -915,9 +926,18 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         else:
             var_red = var_t
         recon_nomask_t = _encode_decode_set(encoder, var_red, val_t)
+        # Build directions for matching in ORIGINAL input space
         with torch.no_grad():
-            var_dirs = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
-        recon_nomask_np = recon_nomask_t.squeeze(0).detach().cpu().numpy()
+            var_dirs = var_t / (torch.norm(var_t, p=2, dim=-1, keepdim=True) + 1e-8)
+        # Lift recon from reduced space back to original input space for matching
+        if lift_A is not None and recon_nomask_t.size(-1) == lift_A.size(0):
+            y = recon_nomask_t
+            if lift_b is not None and y.size(-1) == lift_b.numel():
+                y = y - lift_b.view(1, 1, -1)
+            recon_lift = torch.matmul(y, lift_A)  # [1,N,D]
+            recon_nomask_np = recon_lift.squeeze(0).detach().cpu().numpy()
+        else:
+            recon_nomask_np = recon_nomask_t.squeeze(0).detach().cpu().numpy()
 
         if getattr(args, "named_recon", "off") == "global":
             assert vocab_dirs_np is not None and vocab_event_names is not None
