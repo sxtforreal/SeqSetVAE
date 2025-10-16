@@ -968,6 +968,44 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             print(f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})")
         print("===============================================================")
 
+        # Additional analysis for global-mode unmatched predictions: compare against best in-set match
+        if getattr(args, "named_recon", "off") == "global":
+            try:
+                set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
+                print("---- Unmatched analysis vs SET ----")
+                if len(unmatched_nomask) == 0 or set_var_dirs_np.size == 0:
+                    print("(no unmatched predictions or empty set)")
+                else:
+                    names_set = set(set_event_names)
+                    header = (
+                        "wrong_var | cos_wrong | best_in_set | cos_best_set | Δcos | "
+                        "pred_val(best_denorm) | true_val(best_denorm)"
+                    )
+                    print(header)
+                    for i, (wrong_name, pred_val_norm, cos_wrong) in enumerate(assignments_nomask):
+                        if wrong_name in names_set:
+                            continue  # only analyze truly-unmatched entries
+                        r = recon_nomask_np[i]
+                        r_norm = float(np.linalg.norm(r) + 1e-8)
+                        if not np.isfinite(r_norm) or r_norm <= 0.0:
+                            continue
+                        r_dir = r / r_norm
+                        cos_set = np.abs(set_var_dirs_np @ r_dir)
+                        if cos_set.size == 0:
+                            continue
+                        j_star = int(np.argmax(cos_set))
+                        best_name = set_event_names[j_star]
+                        cos_best = float(cos_set[j_star])
+                        delta = float(cos_wrong - cos_best)
+                        pred_best_denorm = _denorm_value(best_name, float(pred_val_norm))
+                        true_best_denorm = _denorm_value(best_name, float(val_np[j_star]))
+                        print(
+                            f"{wrong_name} | {cos_wrong:.3f} | {best_name} | {cos_best:.3f} | {delta:+.3f} | "
+                            f"{pred_best_denorm:.6f} | {true_best_denorm:.6f}"
+                        )
+            except Exception as e:
+                print(f"[WARN] unmatched analysis failed: {e}")
+
     if getattr(args, "patient_index", None) is not None and getattr(args, "set_index", None) is not None:
         if args.patient_index < 0 or args.patient_index >= len(ds):
             print(f"[WARN] patient_index out of range [0,{len(ds)-1}]")
