@@ -159,10 +159,20 @@ class SetVAEModule(nn.Module):
         self.posterior_logvar_max = float(posterior_logvar_max)
         self.enable_posterior_std_augmentation = bool(enable_posterior_std_augmentation)
         self.posterior_std_aug_sigma = float(posterior_std_aug_sigma)
-        if reduced_dim is not None:
-            self.dim_reducer = nn.Linear(input_dim, reduced_dim)
-            embed_input = reduced_dim
-            out_output = reduced_dim
+        # Treat reduced_dim equal to input_dim (or non-positive/None) as "no reducer"
+        rd_effective = None
+        try:
+            if reduced_dim is not None:
+                rd_val = int(reduced_dim)
+                if rd_val > 0 and rd_val != int(input_dim):
+                    rd_effective = rd_val
+        except Exception:
+            rd_effective = None
+
+        if rd_effective is not None:
+            self.dim_reducer = nn.Linear(input_dim, rd_effective)
+            embed_input = rd_effective
+            out_output = rd_effective
         else:
             self.dim_reducer = None
             embed_input = input_dim
