@@ -968,26 +968,57 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             print(f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})")
         print("===============================================================")
 
-        # 新的 unmatched analysis：对原始集合中未被匹配到的变量，打印它与所有重建向量的最小余弦（绝对值）
+        # 新的 unmatched/recon analysis：
+        #  - 对原始集合中未被匹配到的变量，打印它与所有重建向量的最小和最大余弦（绝对值），并标注各自对应的 recon var
+        #  - 对所有重建向量（recon），打印其与匹配变量的余弦的全局最小和最大值，并标注 recon var
         try:
             set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
-            print("---- Unmatched originals: min cosine to any recon ----")
+            print("---- Unmatched originals: min/max cosine to any recon ----")
             # 构建 matched 的集合（原集合中出现过的匹配名）
             matched_in_set = set(n for (n, _v, _c) in matched_nomask)
             # 统一方向归一化
             eps = 1e-8
             recon_norm = np.linalg.norm(recon_nomask_np, axis=1, keepdims=True) + eps
             recon_dir = recon_nomask_np / recon_norm
+            # recon 索引到其匹配到的变量名（recon var）的映射，用于标注
+            recon_var_labels = [nm for (nm, _pv, _cs) in assignments_nomask]
             for j, orig_name in enumerate(set_event_names):
                 if orig_name in matched_in_set:
                     continue
                 v = set_var_dirs_np[j]
                 v_norm = v / (np.linalg.norm(v) + eps)
                 cosines = np.abs(recon_dir @ v_norm)
-                min_cos = float(cosines.min()) if cosines.size > 0 else float("nan")
-                print(f"{orig_name}: min_cos_to_recon = {min_cos:.3f}")
+                if cosines.size == 0:
+                    print(f"{orig_name}: min_cos_to_recon = nan | max_cos_to_recon = nan")
+                    continue
+                min_idx = int(np.argmin(cosines))
+                max_idx = int(np.argmax(cosines))
+                min_cos = float(cosines[min_idx])
+                max_cos = float(cosines[max_idx])
+                min_label = recon_var_labels[min_idx] if 0 <= min_idx < len(recon_var_labels) else "?"
+                max_label = recon_var_labels[max_idx] if 0 <= max_idx < len(recon_var_labels) else "?"
+                print(
+                    f"{orig_name}: min_cos_to_recon = {min_cos:.3f} (recon_var={min_label}) | "
+                    f"max_cos_to_recon = {max_cos:.3f} (recon_var={max_label})"
+                )
         except Exception as e:
             print(f"[WARN] unmatched-orig analysis failed: {e}")
+
+        # 额外：对所有 recon（基于 greedy 匹配的 cosine），打印全局最小/最大并标注对应的 recon var
+        try:
+            if assignments_nomask:
+                cos_arr = np.array([c for (_n, _v, c) in assignments_nomask], dtype=np.float32)
+                min_idx = int(np.argmin(cos_arr))
+                max_idx = int(np.argmax(cos_arr))
+                min_cos = float(cos_arr[min_idx])
+                max_cos = float(cos_arr[max_idx])
+                min_name = assignments_nomask[min_idx][0]
+                max_name = assignments_nomask[max_idx][0]
+                print("---- Recon predictions: cosine extremes (to matched var) ----")
+                print(f"min_cos = {min_cos:.3f} (recon_var={min_name})")
+                print(f"max_cos = {max_cos:.3f} (recon_var={max_name})")
+        except Exception as e:
+            print(f"[WARN] recon-extremes analysis failed: {e}")
 
     if getattr(args, "patient_index", None) is not None and getattr(args, "set_index", None) is not None:
         if args.patient_index < 0 or args.patient_index >= len(ds):
