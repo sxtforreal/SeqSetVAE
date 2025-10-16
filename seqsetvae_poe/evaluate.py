@@ -100,12 +100,66 @@ def _detect_num_flows_in_state(state: Dict[str, torch.Tensor]) -> int:
     return max(flow_indices) + 1
 
 
+def _detect_setvae_prefix(keys: List[str]) -> str:
+    candidates = [
+        "set_encoder.",
+        "setvae.setvae.",
+        "setvae.",
+    ]
+    counts = {p: 0 for p in candidates}
+    for k in keys:
+        for p in candidates:
+            if k.startswith(p):
+                counts[p] += 1
+    best = max(counts.items(), key=lambda kv: kv[1])
+    return best[0] if best[1] > 0 else "set_encoder."
+
+
+def _infer_dims_from_state(state: Dict[str, torch.Tensor]) -> Tuple[int, Optional[int], int]:
+    """Infer (input_dim, reduced_dim, latent_dim) from a pretrained state dict.
+
+    - If a dim_reducer exists: use its weight shape [R, D] -> reduced_dim=R, input_dim=D
+    - Else: no reducer; infer input_dim from decoder out.weight shape [D, latent], and latent_dim from embed.0.weight shape [latent, D]
+    """
+    keys = list(state.keys())
+    prefix = _detect_setvae_prefix(keys)
+    # latent_dim from embed first layer if present
+    latent_dim = int(state.get(prefix + "embed.0.weight", torch.empty(0, 0)).shape[0]) if (prefix + "embed.0.weight") in state else int(getattr(cfg, "latent_dim", 128))
+
+    # Check for reducer
+    w_key = prefix + "dim_reducer.weight"
+    if w_key in state:
+        W = state[w_key]
+        reduced_dim = int(W.shape[0])
+        input_dim = int(W.shape[1])
+        return input_dim, reduced_dim, latent_dim
+
+    # No reducer: fall back to decoder out weight to get input_dim
+    out_key = prefix + "out.weight"
+    if out_key in state:
+        out_w = state[out_key]
+        input_dim = int(out_w.shape[0])
+    else:
+        # Last resort
+        input_dim = int(getattr(cfg, "input_dim", 768))
+    return input_dim, None, latent_dim
+
+
 def _build_model_pretrain(ckpt_type: str, lr: float, state: Optional[Dict[str, torch.Tensor]] = None) -> torch.nn.Module:
+    # Infer dims from checkpoint when available to ensure shape compatibility
+    if state is not None:
+        input_dim_inf, reduced_dim_inf, latent_dim_inf = _infer_dims_from_state(state)
+    else:
+        input_dim_inf = int(getattr(cfg, "input_dim", 768))
+        # For Stage A default we might have no reduction; prefer matching input_dim
+        reduced_dim_inf = int(getattr(cfg, "reduced_dim", input_dim_inf))
+        latent_dim_inf = int(getattr(cfg, "latent_dim", 128))
+
     if ckpt_type == "poe":
         model = PoESeqSetVAEPretrain(
-            input_dim=getattr(cfg, "input_dim", 768),
-            reduced_dim=getattr(cfg, "reduced_dim", 256),
-            latent_dim=getattr(cfg, "latent_dim", 128),
+            input_dim=input_dim_inf,
+            reduced_dim=(reduced_dim_inf if reduced_dim_inf is not None else input_dim_inf),
+            latent_dim=latent_dim_inf,
             levels=getattr(cfg, "levels", 2),
             heads=getattr(cfg, "heads", 2),
             m=getattr(cfg, "m", 16),
@@ -128,9 +182,9 @@ def _build_model_pretrain(ckpt_type: str, lr: float, state: Optional[Dict[str, t
         num_flows = _detect_num_flows_in_state(state) if state is not None else 0
         use_flows = num_flows > 0
         model = SetVAEOnlyPretrain(
-            input_dim=getattr(cfg, "input_dim", 768),
-            reduced_dim=getattr(cfg, "reduced_dim", 256),
-            latent_dim=getattr(cfg, "latent_dim", 128),
+            input_dim=input_dim_inf,
+            reduced_dim=(reduced_dim_inf if reduced_dim_inf is not None else input_dim_inf),
+            latent_dim=latent_dim_inf,
             levels=getattr(cfg, "levels", 2),
             heads=getattr(cfg, "heads", 2),
             m=getattr(cfg, "m", 16),
