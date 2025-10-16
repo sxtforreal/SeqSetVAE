@@ -853,103 +853,6 @@ def _greedy_match_recon_to_vars(
     return out  # type: ignore
 
 
-def _sorted_edge_bipartite_match(
-    recon: np.ndarray,
-    var_dirs: np.ndarray,
-    variable_names: List[str],
-    *,
-    topk: int = 0,
-    prefer_set: Optional[set[str]] = None,
-    set_bias: float = 0.0,
-) -> List[Tuple[str, float, float]]:
-    """
-    Approximate maximum-weight bipartite matching by sorting all edges.
-    - Enforces one-to-one between recon rows and variable columns.
-    - Optionally prunes to Top-K candidates per recon for speed.
-    - Optionally adds a bias to in-set variables to prefer covering the set.
-    Returns list aligned to recon rows: (variable_name, pred_value, cosine).
-    """
-    eps = 1e-8
-    # Normalize recon to unit direction and compute unsigned cosine similarities
-    recon_norm = np.linalg.norm(recon, axis=1) + eps  # [N]
-    recon_dir = recon / recon_norm[:, None]
-    sim = np.abs(np.matmul(recon_dir, var_dirs.T))  # [N,M]
-
-    # Optional bias towards variables in the current set
-    if prefer_set is not None and set_bias > 0.0:
-        bias = np.zeros_like(sim)
-        for j, name in enumerate(variable_names):
-            if name in prefer_set:
-                bias[:, j] = set_bias
-        sim = sim + bias
-
-    N, M = sim.shape
-
-    # Candidate pruning
-    cand_mask = np.ones_like(sim, dtype=bool)
-    if topk is not None and isinstance(topk, int) and topk > 0 and topk < M:
-        cand_mask[:] = False
-        idx_topk = np.argpartition(-sim, kth=min(topk, M - 1), axis=1)[:, :topk]
-        for i in range(N):
-            cand_mask[i, idx_topk[i]] = True
-        # Ensure at least the best per row is kept
-        best_j_each = np.argmax(sim, axis=1)
-        cand_mask[np.arange(N), best_j_each] = True
-
-    # Build edge list
-    edges: List[Tuple[float, int, int]] = []  # (sim, i, j)
-    it = np.nditer(np.zeros((N,)), flags=['multi_index'])
-    # Iterate rows to avoid constructing huge edge arrays for very large vocab
-    for i in range(N):
-        row = sim[i]
-        if M <= 2048:
-            cols = np.arange(M)[cand_mask[i]]
-        else:
-            # For very large M, keep only top-k (or top-1 if no topk)
-            if topk is not None and topk > 0:
-                cols = np.argpartition(-row, kth=min(topk, M - 1))[:topk]
-            else:
-                cols = np.array([int(np.argmax(row))])
-        for j in cols:
-            edges.append((float(row[j]), i, int(j)))
-
-    # Sort edges by similarity descending
-    edges.sort(key=lambda x: x[0], reverse=True)
-
-    assigned_row = np.full(N, -1, dtype=int)
-    used_cols = np.zeros(M, dtype=bool)
-
-    for s, i, j in edges:
-        if assigned_row[i] == -1 and not used_cols[j]:
-            assigned_row[i] = j
-            used_cols[j] = True
-
-    # Backfill any remaining unassigned rows with their best available column
-    for i in range(N):
-        if assigned_row[i] != -1:
-            continue
-        # pick best unused column
-        row = sim[i]
-        # Mask already used columns
-        masked = row.copy()
-        masked[used_cols] = -np.inf
-        j = int(np.argmax(masked))
-        if not np.isfinite(masked[j]):
-            # fallback to global best (even if used) to avoid -inf
-            j = int(np.argmax(row))
-        assigned_row[i] = j
-        used_cols[j] = True
-
-    out: List[Tuple[str, float, float]] = []
-    for i in range(N):
-        j = int(assigned_row[i])
-        pred_val = float(recon_norm[i])
-        # Undo set bias for reporting cosine by recomputing pure cosine
-        pure_cos = float(np.abs(np.dot(recon_dir[i], var_dirs[j])))
-        out.append((variable_names[j], pred_val, pure_cos))
-    return out
-
-
 def _run_named_recon_print(model: torch.nn.Module, args):
     print("Running named reconstruction printing ...")
     encoder = model.set_encoder if hasattr(model, "set_encoder") else getattr(model, "setvae", None)
@@ -1024,43 +927,9 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             var_dirs_np_local = (var_dirs.squeeze(0).detach().cpu().numpy())
             event_names_local = df_set["variable"].astype(str).tolist()
 
-        # Optional whitening in matching space
-        if getattr(args, "match_whiten", False):
-            try:
-                X = var_dirs_np_local.astype(np.float64, copy=False)
-                # Covariance on unit directions
-                cov = np.cov(X.T)
-                # Eigen-decomposition for symmetric covariance
-                evals, evecs = np.linalg.eigh(cov + 1e-6 * np.eye(cov.shape[0]))
-                W = evecs @ np.diag(1.0 / np.sqrt(np.maximum(evals, 1e-8))) @ evecs.T
-                var_dirs_np_local = (X @ W.T).astype(np.float32)
-                # Apply same whitening to recon and renormalize
-                recon_nomask_np = (recon_nomask_np @ W.T).astype(np.float32)
-            except Exception:
-                pass
-        # Re-normalize after optional whitening
-        def _renorm(x: np.ndarray) -> np.ndarray:
-            n = np.linalg.norm(x, axis=1, keepdims=True) + 1e-8
-            return x / n
-        var_dirs_np_local = _renorm(var_dirs_np_local)
-        recon_nomask_np = recon_nomask_np  # magnitude kept for predicted values; directions normalized inside matcher
-
-        # Choose matching algorithm
-        algo = getattr(args, "match_algo", "greedy")
-        if algo == "greedy":
-            assignments_nomask = _greedy_match_recon_to_vars(
-                recon_nomask_np, var_dirs_np_local, event_names_local
-            )
-        else:
-            prefer = set(df_set["variable"].astype(str).tolist()) if getattr(args, "named_recon", "off") == "global" else set(event_names_local)
-            assignments_nomask = _sorted_edge_bipartite_match(
-                recon_nomask_np,
-                var_dirs_np_local,
-                event_names_local,
-                topk=int(getattr(args, "match_topk", 0) or 0),
-                prefer_set=prefer,
-                set_bias=float(getattr(args, "match_set_bias", 0.0) or 0.0),
-            )
+        assignments_nomask = _greedy_match_recon_to_vars(
+            recon_nomask_np, var_dirs_np_local, event_names_local
+        )
 
         set_event_names: List[str] = df_set["variable"].astype(str).tolist()
         def _split(assignments_list: List[Tuple[str, float, float]]):
@@ -1099,43 +968,26 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             print(f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})")
         print("===============================================================")
 
-        # Additional analysis for global-mode unmatched predictions: compare against best in-set match
-        if getattr(args, "named_recon", "off") == "global":
-            try:
-                set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
-                print("---- Unmatched analysis vs SET ----")
-                if len(unmatched_nomask) == 0 or set_var_dirs_np.size == 0:
-                    print("(no unmatched predictions or empty set)")
-                else:
-                    names_set = set(set_event_names)
-                    header = (
-                        "wrong_var | cos_wrong | best_in_set | cos_best_set | Δcos | "
-                        "pred_val(best_denorm) | true_val(best_denorm)"
-                    )
-                    print(header)
-                    for i, (wrong_name, pred_val_norm, cos_wrong) in enumerate(assignments_nomask):
-                        if wrong_name in names_set:
-                            continue  # only analyze truly-unmatched entries
-                        r = recon_nomask_np[i]
-                        r_norm = float(np.linalg.norm(r) + 1e-8)
-                        if not np.isfinite(r_norm) or r_norm <= 0.0:
-                            continue
-                        r_dir = r / r_norm
-                        cos_set = np.abs(set_var_dirs_np @ r_dir)
-                        if cos_set.size == 0:
-                            continue
-                        j_star = int(np.argmax(cos_set))
-                        best_name = set_event_names[j_star]
-                        cos_best = float(cos_set[j_star])
-                        delta = float(cos_wrong - cos_best)
-                        pred_best_denorm = _denorm_value(best_name, float(pred_val_norm))
-                        true_best_denorm = _denorm_value(best_name, float(val_np[j_star]))
-                        print(
-                            f"{wrong_name} | {cos_wrong:.3f} | {best_name} | {cos_best:.3f} | {delta:+.3f} | "
-                            f"{pred_best_denorm:.6f} | {true_best_denorm:.6f}"
-                        )
-            except Exception as e:
-                print(f"[WARN] unmatched analysis failed: {e}")
+        # 新的 unmatched analysis：对原始集合中未被匹配到的变量，打印它与所有重建向量的最小余弦（绝对值）
+        try:
+            set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
+            print("---- Unmatched originals: min cosine to any recon ----")
+            # 构建 matched 的集合（原集合中出现过的匹配名）
+            matched_in_set = set(n for (n, _v, _c) in matched_nomask)
+            # 统一方向归一化
+            eps = 1e-8
+            recon_norm = np.linalg.norm(recon_nomask_np, axis=1, keepdims=True) + eps
+            recon_dir = recon_nomask_np / recon_norm
+            for j, orig_name in enumerate(set_event_names):
+                if orig_name in matched_in_set:
+                    continue
+                v = set_var_dirs_np[j]
+                v_norm = v / (np.linalg.norm(v) + eps)
+                cosines = np.abs(recon_dir @ v_norm)
+                min_cos = float(cosines.min()) if cosines.size > 0 else float("nan")
+                print(f"{orig_name}: min_cos_to_recon = {min_cos:.3f}")
+        except Exception as e:
+            print(f"[WARN] unmatched-orig analysis failed: {e}")
 
     if getattr(args, "patient_index", None) is not None and getattr(args, "set_index", None) is not None:
         if args.patient_index < 0 or args.patient_index >= len(ds):
@@ -1335,11 +1187,6 @@ def _run_stage_ab():
     ap.add_argument("--set_index", type=int, default=None)
     ap.add_argument("--stats_csv", type=str, default=getattr(cfg, "params_map_path", ""))
     ap.add_argument("--event_emb_csv", type=str, default="")
-    # Matching controls for named recon
-    ap.add_argument("--match_algo", type=str, choices=["greedy", "global_greedy"], default="greedy", help="Matching algorithm: greedy (per-row) or global_greedy (edge-sorted one-to-one)")
-    ap.add_argument("--match_topk", type=int, default=0, help="Top-K candidate pruning per recon (0 disables)")
-    ap.add_argument("--match_whiten", action="store_true", default=False, help="Whiten matching space using vocab covariance")
-    ap.add_argument("--match_set_bias", type=float, default=0.0, help="Additive cosine bias for variables in the current set (global mode)")
     # Per-variable scale audit (optional)
     ap.add_argument("--audit_var_scale", action="store_true", default=False, help="Run per-variable scale audit and scatter plot")
     ap.add_argument("--audit_partition", type=str, choices=["train", "valid", "test"], default="train", help="Dataset partition to audit")
