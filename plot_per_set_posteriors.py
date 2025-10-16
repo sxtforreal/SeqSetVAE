@@ -10,7 +10,7 @@ import config
 
 
 # ---------------
-# 路径（根据你的环境修改）
+# Paths (edit for your environment)
 # ---------------
 CKPT_PATH = \
     "/home/sunx/data/aiiih/projects/sunx/projects/SeqSetVAE/outputs/SeqSetVAE-PT/checkpoints/SeqSetVAE_pretrain_batch4.ckpt"
@@ -21,7 +21,7 @@ PARAMS_MAP = \
 LABELS_PATH = \
     "/home/sunx/data/aiiih/data/mimic/processed/oc.csv"
 
-# 输出图像（正/负样本 × mean/var）
+# Output images (pos/neg samples × mean/var)
 OUT_POS_MEAN = "heatmap_pos_mean.png"
 OUT_POS_VAR = "heatmap_pos_var.png"
 OUT_NEG_MEAN = "heatmap_neg_mean.png"
@@ -74,9 +74,11 @@ def build_dataloader():
 
 
 def encode_sets_batch(set_encoder, sets, device: torch.device):
-    """将一个病人的所有 set padding 到同长，一次性编码，得到 [S,D] 的 mu/logvar。
+    """Pad all sets for one patient to the same length and encode once to get
+    [S, D] posterior mean and log-variance.
 
-    返回：mu_b, logvar_b 形状均为 [S, D]；若该病人无有效 set，返回 (None, None)。
+    Returns: (mu_b, logvar_b) both with shape [S, D]; returns (None, None) if
+    the patient has no valid sets.
     """
     if len(sets) == 0:
         return None, None
@@ -101,11 +103,12 @@ def encode_sets_batch(set_encoder, sets, device: torch.device):
 
 def collect_one_pos_one_neg_matrices(model: SeqSetVAEPretrain, dl, device: torch.device):
     """
-    选择一个正样本和一个负样本；对每个样本提取每个 set 的后验（最后一层）mu 与 var，
-    返回形如：
-        pos = {"label":1, "mu": np.ndarray[D,S], "var": np.ndarray[D,S]}
-        neg = {"label":0, "mu": np.ndarray[D,S], "var": np.ndarray[D,S]}
-    其中 D=config.latent_dim，S=该病人的 set 数；矩阵按 [维度×set] 排列，方便画热图。
+    Select one positive and one negative sample; for each sample, extract the
+    last-layer posterior per set (mu and var), and return records like:
+        pos = {"label":1, "mu": np.ndarray[D, S], "var": np.ndarray[D, S]}
+        neg = {"label":0, "mu": np.ndarray[D, S], "var": np.ndarray[D, S]}
+    where D=config.latent_dim and S=the number of sets for that patient. The
+    matrices are arranged as [dimension × set] to ease heatmap plotting.
     """
     pos_rec, neg_rec = None, None
     amp = torch.cuda.is_available()
@@ -114,12 +117,12 @@ def collect_one_pos_one_neg_matrices(model: SeqSetVAEPretrain, dl, device: torch
         enabled=amp, dtype=(torch.float16 if amp else torch.float32)
     ):
         for batch in dl:
-            # 移动到设备
+            # Move tensors to device
             for k, v in list(batch.items()):
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
 
-            # 拆分为该 batch（通常为 1 个病人）的 set 列表
+            # Split into this batch patient's list of sets (usually 1 patient)
             pats = model._split_sets(
                 batch["var"], batch["val"], batch["minute"], batch["set_id"], batch.get("padding_mask")
             )
@@ -131,7 +134,7 @@ def collect_one_pos_one_neg_matrices(model: SeqSetVAEPretrain, dl, device: torch
                     continue
                 var_b = torch.exp(logvar_b)  # [S, D]
 
-                # 转置为 [D, S] 便于以 y=维度, x=set 作图
+                # Transpose to [D, S] for plotting with y=dimension, x=set index
                 mu_mat = mu_b.float().T.cpu().numpy()
                 var_mat = var_b.float().T.cpu().numpy()
 
@@ -148,19 +151,21 @@ def collect_one_pos_one_neg_matrices(model: SeqSetVAEPretrain, dl, device: torch
 
 def plot_heatmap(matrix: np.ndarray, title: str, out_file: str, value_type: str = "mean"):
     """
-    画单个样本的热图：matrix 形状为 [D, S]，y=维度(0..D-1)，x=set index(0..S-1)。
-    value_type: "mean" 使用对称色轴；"var" 使用非负色轴并做分位裁剪。
+    Plot a single-sample heatmap: matrix shape [D, S], y=dimension (0..D-1),
+    x=set index (0..S-1).
+    value_type: "mean" uses a symmetric color scale; "var" uses a nonnegative
+    scale with percentile clipping.
     """
     plt.figure(figsize=(10, 6))
 
-    # 色轴范围
+    # Color scale range
     if value_type == "mean":
         vmax = float(np.nanmax(np.abs(matrix))) if matrix.size > 0 else 1.0
         vmax = vmax if vmax > 1e-6 else 1.0
         vmin = -vmax
         cmap = "RdBu_r"
     else:
-        # 方差：0..p95，避免极端值拉伸
+        # Variance: 0..p95 to avoid extreme stretching
         if matrix.size == 0:
             vmin, vmax = 0.0, 1.0
         else:

@@ -968,13 +968,14 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             print(f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})")
         print("===============================================================")
 
-        # 新的 unmatched analysis：对原始集合中未被匹配到的变量，打印它与所有重建向量的最小余弦（绝对值）
+        # Unmatched analysis: for each original-set variable not matched,
+        # print its minimum absolute cosine to any reconstruction vector
         try:
             set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
             print("---- Unmatched originals: min cosine to any recon ----")
-            # 构建 matched 的集合（原集合中出现过的匹配名）
+            # Build the set of variables from the original set that were matched
             matched_in_set = set(n for (n, _v, _c) in matched_nomask)
-            # 统一方向归一化
+            # Normalize directions consistently
             eps = 1e-8
             recon_norm = np.linalg.norm(recon_nomask_np, axis=1, keepdims=True) + eps
             recon_dir = recon_nomask_np / recon_norm

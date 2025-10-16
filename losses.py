@@ -472,21 +472,21 @@ def get_sota_loss_strategy(medical_scenario: str = "multi_condition_screening", 
 
 def get_recommended_strategy(class_imbalance_ratio, noise_level="low", requires_calibration=False):
     """
-    根据数据特征推荐最佳策略
-    
+    Recommend the best strategy based on data characteristics.
+
     Args:
-        class_imbalance_ratio: 类别不平衡比例 (minority/majority)
-        noise_level: 数据噪声水平 ("low", "medium", "high")
-        requires_calibration: 是否需要概率校准
-        
+        class_imbalance_ratio: Class imbalance ratio (minority/majority)
+        noise_level: Data noise level ("low", "medium", "high")
+        requires_calibration: Whether probability calibration is required
+
     Returns:
-        strategy_name: 推荐的策略名称
+        strategy_name: The recommended strategy name
     """
     if requires_calibration:
         return "treatment_response_prediction"
-    elif class_imbalance_ratio < 0.1:  # 严重不平衡
+    elif class_imbalance_ratio < 0.1:  # Severe imbalance
         return "rare_disease_detection"
     elif noise_level == "high":
         return "diagnostic_assistance"
     else:
-        return "multi_condition_screening"  # 默认选择
+        return "multi_condition_screening"  # default choice

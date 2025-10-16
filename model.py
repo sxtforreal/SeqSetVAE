@@ -1631,13 +1631,13 @@ class SeqSetVAE(pl.LightningModule):
             recon_loss = total_recon_loss / valid_patients
             kl_loss = total_kl_loss / valid_patients
         
-        # 🏆 SOTA Loss Strategy: 基于2024年最新学术研究
-        # 集成多项前沿技术：SoftAdapt, Asymmetric Loss, Self-Distillation, Gradient Adaptation
+        # 🏆 SOTA Loss Strategy: based on recent 2024 research
+        # Integrates advanced techniques: SoftAdapt, Asymmetric Loss, Self-Distillation, Gradient Adaptation
         
-        # 初始化SOTA损失策略 (懒加载，仅在第一次调用时创建)
+        # Initialize SOTA loss strategy (lazy; created on first use)
         if not hasattr(self, '_sota_loss_strategy'):
             from losses import get_sota_loss_strategy
-            # 根据医疗场景选择最优策略
+            # Choose the best strategy for the medical scenario
             medical_scenario = getattr(self, 'medical_scenario', 'multi_condition_screening')
             self._sota_loss_strategy = get_sota_loss_strategy(
                 medical_scenario=medical_scenario,
@@ -1645,10 +1645,10 @@ class SeqSetVAE(pl.LightningModule):
             )
             print(f"🔬 Initialized SOTA loss strategy for: {medical_scenario}")
         
-        # 获取当前训练步骤作为epoch近似
-        current_epoch = getattr(self, 'current_step', 0) // 100  # 假设每100步为一个epoch
+        # Use current training steps as an epoch approximation
+        current_epoch = getattr(self, 'current_step', 0) // 100  # assume every 100 steps is ~1 epoch
         
-        # 收集主头和辅助头的参数用于梯度分析（兼容不同 head）
+        # Collect main and auxiliary head parameters for gradient analysis (head-agnostic)
         if self.head_type == "gaussian_mil":
             main_params = [self.cls_head.mu, self.cls_head.log_tau2, self.cls_head.log_prior]
             aux_params = list(self.cls_head.gate.parameters())
@@ -1657,7 +1657,7 @@ class SeqSetVAE(pl.LightningModule):
             aux_params = list(self.cls_head['aux_classifier'].parameters())
         
         try:
-            # 🚀 使用SOTA损失策略计算损失
+            # 🚀 Compute loss using the SOTA strategy
             pred_loss, loss_breakdown = self._sota_loss_strategy.compute_loss(
                 main_logits=logits,
                 aux_logits=aux_logits,
@@ -1667,23 +1667,23 @@ class SeqSetVAE(pl.LightningModule):
                 aux_params=aux_params
             )
             
-            # 存储详细的损失分解用于监控
+            # Store the detailed loss breakdown for monitoring
             if stage == "train":
                 for key, value in loss_breakdown.items():
                     if isinstance(value, torch.Tensor):
                         setattr(self, f'_last_{key}', value.detach())
             
         except Exception as e:
-            # 降级到简化策略（确保训练不会中断）
+            # Fall back to a simplified strategy (ensure training continues)
             print(f"⚠️ SOTA loss computation failed, falling back to simplified strategy: {e}")
             
-            # 主损失：Focal Loss
+            # Main loss: Focal Loss
             if self.focal_loss_fn is not None:
                 main_pred_loss = self.focal_loss_fn(logits, label)
             else:
                 main_pred_loss = F.cross_entropy(logits, label, label_smoothing=0.1)
                 
-            # 辅助损失：不对称损失 (处理极端不平衡)
+            # Auxiliary loss: Asymmetric loss (handles extreme imbalance)
             try:
                 from losses import AsymmetricLoss
                 if not hasattr(self, '_asymmetric_loss'):
@@ -1692,7 +1692,7 @@ class SeqSetVAE(pl.LightningModule):
             except:
                 aux_pred_loss = F.cross_entropy(aux_logits, label, label_smoothing=0.15)
             
-            # EMA自蒸馏损失
+            # EMA self-distillation loss
             if not hasattr(self, '_ema_teacher'):
                 self._ema_teacher = F.softmax(logits.detach(), dim=1)
             else:
@@ -1704,7 +1704,7 @@ class SeqSetVAE(pl.LightningModule):
                 reduction='batchmean'
             ) * 9.0  # temperature^2 scaling
             
-            # 动态权重组合
+            # Dynamic weighting
             main_weight = 0.6
             aux_weight = 0.3  
             distill_weight = 0.1
