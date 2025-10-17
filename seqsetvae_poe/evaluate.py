@@ -100,12 +100,48 @@ def _detect_num_flows_in_state(state: Dict[str, torch.Tensor]) -> int:
     return max(flow_indices) + 1
 
 
-def _build_model_pretrain(ckpt_type: str, lr: float, state: Optional[Dict[str, torch.Tensor]] = None) -> torch.nn.Module:
+def _infer_dims_from_state(state: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    """Best-effort inference of input/reduced/latent dims from a pretraining state_dict."""
+    dims: Dict[str, int] = {}
+    # Prefer explicit linear reducer if present: weight shape [R, D]
+    w = state.get("set_encoder.dim_reducer.weight", None)
+    if isinstance(w, torch.Tensor) and w.dim() == 2:
+        R, D = w.shape
+        dims["reduced_dim"] = int(R)
+        dims["input_dim"] = int(D)
+    # Embed/out layers always exist; their shapes imply dims
+    ew = state.get("set_encoder.embed.0.weight", None)  # [latent_dim, embed_input]
+    if isinstance(ew, torch.Tensor) and ew.dim() == 2:
+        ld, embed_in = ew.shape
+        dims["latent_dim"] = int(ld)
+        # If reducer absent, embed_in corresponds to effective input/reduced dim
+        dims.setdefault("reduced_dim", int(embed_in))
+        dims.setdefault("input_dim", int(embed_in))
+    ow = state.get("set_encoder.out.weight", None)  # [out_output, latent_dim]
+    if isinstance(ow, torch.Tensor) and ow.dim() == 2:
+        out_out, ld2 = ow.shape
+        dims["latent_dim"] = int(ld2)
+        # If reducer absent, out_out corresponds to effective input/reduced dim
+        dims.setdefault("reduced_dim", int(out_out))
+        dims.setdefault("input_dim", int(out_out))
+    # Fall back to mu_logvar shapes to confirm latent dim
+    mlw = state.get("set_encoder.mu_logvar.4.weight", None)  # [2*latent_dim, latent_dim]
+    if isinstance(mlw, torch.Tensor) and mlw.dim() == 2:
+        dims["latent_dim"] = int(mlw.shape[1])
+    return dims
+
+
+def _build_model_pretrain(
+    ckpt_type: str,
+    lr: float,
+    dims: Dict[str, int],
+    state: Optional[Dict[str, torch.Tensor]] = None,
+) -> torch.nn.Module:
     if ckpt_type == "poe":
         model = PoESeqSetVAEPretrain(
-            input_dim=getattr(cfg, "input_dim", 768),
-            reduced_dim=getattr(cfg, "reduced_dim", 256),
-            latent_dim=getattr(cfg, "latent_dim", 128),
+            input_dim=int(dims.get("input_dim", getattr(cfg, "input_dim", 768))),
+            reduced_dim=int(dims.get("reduced_dim", getattr(cfg, "reduced_dim", 256))),
+            latent_dim=int(dims.get("latent_dim", getattr(cfg, "latent_dim", 128))),
             levels=getattr(cfg, "levels", 2),
             heads=getattr(cfg, "heads", 2),
             m=getattr(cfg, "m", 16),
@@ -128,9 +164,9 @@ def _build_model_pretrain(ckpt_type: str, lr: float, state: Optional[Dict[str, t
         num_flows = _detect_num_flows_in_state(state) if state is not None else 0
         use_flows = num_flows > 0
         model = SetVAEOnlyPretrain(
-            input_dim=getattr(cfg, "input_dim", 768),
-            reduced_dim=getattr(cfg, "reduced_dim", 256),
-            latent_dim=getattr(cfg, "latent_dim", 128),
+            input_dim=int(dims.get("input_dim", getattr(cfg, "input_dim", 768))),
+            reduced_dim=int(dims.get("reduced_dim", getattr(cfg, "reduced_dim", 256))),
+            latent_dim=int(dims.get("latent_dim", getattr(cfg, "latent_dim", 128))),
             levels=getattr(cfg, "levels", 2),
             heads=getattr(cfg, "heads", 2),
             m=getattr(cfg, "m", 16),
@@ -1249,6 +1285,10 @@ def _run_stage_ab():
     ap.add_argument("--audit_max_patients", type=int, default=200, help="Max patients to sample for audit (use <=0 for all)")
     ap.add_argument("--audit_min_count", type=int, default=10, help="Min samples per variable to include in audit CSV")
     ap.add_argument("--audit_keep_first_n_vars", type=int, default=0, help="If >0, audit only first N variables encountered; default 0 means all")
+    # Optional CLI overrides for dims (useful when config defaults mismatch checkpoint)
+    ap.add_argument("--input_dim", type=int, default=None)
+    ap.add_argument("--reduced_dim", type=int, default=None)
+    ap.add_argument("--latent_dim", type=int, default=None)
     args, _ = ap.parse_known_args()
 
     if args.output_dir is None:
@@ -1269,7 +1309,21 @@ def _run_stage_ab():
 
     state = _load_state_dict_pretrain(args.checkpoint)
     ckpt_type = _detect_ckpt_type(state, prefer=args.ckpt_type)
-    model = _build_model_pretrain(ckpt_type, lr=getattr(cfg, "lr", 3e-4), state=state)
+    # Infer dims from state, then allow CLI overrides to take precedence
+    inferred = _infer_dims_from_state(state)
+    dims = dict(inferred)
+    if args.input_dim is not None:
+        dims["input_dim"] = int(args.input_dim)
+    if args.reduced_dim is not None:
+        dims["reduced_dim"] = int(args.reduced_dim)
+    if args.latent_dim is not None:
+        dims["latent_dim"] = int(args.latent_dim)
+    model = _build_model_pretrain(
+        ckpt_type,
+        lr=getattr(cfg, "lr", 3e-4),
+        dims=dims,
+        state=state,
+    )
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"Loaded weights: missing={len(missing)}, unexpected={len(unexpected)}")
     model.eval()
