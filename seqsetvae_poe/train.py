@@ -168,6 +168,10 @@ def _run_stage_a():
     parser.add_argument("--recon_gamma", type=float, default=3.0)
     parser.add_argument("--recon_scale_calib", type=float, default=1.0)
     parser.add_argument("--recon_beta_var", type=float, default=0.0)
+    # Sinkhorn (方案A)
+    parser.add_argument("--use_sinkhorn", action="store_true", default=True)
+    parser.add_argument("--sinkhorn_eps", type=float, default=0.1)
+    parser.add_argument("--sinkhorn_iters", type=int, default=100)
     # Dims
     parser.add_argument("--input_dim", type=int, default=getattr(cfg, "input_dim", 768))
     # Default to no learnable reduction by setting reduced_dim == input_dim
@@ -214,6 +218,9 @@ def _run_stage_a():
         recon_gamma=args.recon_gamma,
         recon_scale_calib=args.recon_scale_calib,
         recon_beta_var=args.recon_beta_var,
+        use_sinkhorn=bool(args.use_sinkhorn),
+        sinkhorn_eps=args.sinkhorn_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
         kl_fairness_weight=float(args.kl_fairness_weight),
         kl_spread_tol=float(args.kl_spread_tol),
         kl_over_weight=float(args.kl_over_weight),
@@ -315,6 +322,10 @@ def _run_stage_b():
     parser.add_argument("--recon_gamma", type=float, default=2.5)
     parser.add_argument("--recon_scale_calib", type=float, default=1.0)
     parser.add_argument("--recon_beta_var", type=float, default=0.0)
+    # Sinkhorn (方案A)
+    parser.add_argument("--use_sinkhorn", action="store_true", default=True)
+    parser.add_argument("--sinkhorn_eps", type=float, default=0.1)
+    parser.add_argument("--sinkhorn_iters", type=int, default=100)
     parser.add_argument("--partial_unfreeze", action="store_true", default=False)
     parser.add_argument("--unfreeze_dim_reducer", action="store_true", default=False)
 
@@ -365,6 +376,9 @@ def _run_stage_b():
         recon_gamma=args.recon_gamma,
         recon_scale_calib=args.recon_scale_calib,
         recon_beta_var=args.recon_beta_var,
+        use_sinkhorn=bool(args.use_sinkhorn),
+        sinkhorn_eps=args.sinkhorn_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
         partial_unfreeze=bool(args.partial_unfreeze),
         unfreeze_dim_reducer=bool(args.unfreeze_dim_reducer),
     )

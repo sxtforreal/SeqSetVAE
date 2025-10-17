@@ -88,6 +88,10 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         recon_gamma: float = 3.0,
         recon_scale_calib: float = 0.0,
         recon_beta_var: float = 0.1,
+        # Sinkhorn-OT options for reconstruction (方案A)
+        use_sinkhorn: bool = False,
+        sinkhorn_eps: float = 0.1,
+        sinkhorn_iters: int = 100,
         # Partial unfreezing options (when freeze_set_encoder=True)
         partial_unfreeze: bool = False,
         unfreeze_dim_reducer: bool = False,
@@ -194,6 +198,10 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self.recon_gamma = float(recon_gamma)
         self.recon_scale_calib = float(recon_scale_calib)
         self.recon_beta_var = float(recon_beta_var)
+        # Sinkhorn options
+        self.use_sinkhorn = bool(use_sinkhorn)
+        self.sinkhorn_eps = float(sinkhorn_eps)
+        self.sinkhorn_iters = int(sinkhorn_iters)
         # Amplitude regression weight (signed val via projection); 0 disables
         self.recon_amp_weight = 1.0
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
@@ -461,7 +469,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
             reduced_normalized = reduced / (norms + 1e-8)
             target_x = reduced_normalized * s["val"]
-            recon_total += chamfer_recon(
+        recon_total += chamfer_recon(
                 recon,
                 target_x,
                 alpha=self.recon_alpha,
@@ -469,9 +477,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 gamma=self.recon_gamma,
                 beta_var=self.recon_beta_var,
                 scale_calib_weight=self.recon_scale_calib,
-                amp_weight=self.recon_amp_weight,
-                base_unit=reduced_normalized,
-                target_val=s["val"],
+            use_sinkhorn=self.use_sinkhorn,
+            sinkhorn_eps=self.sinkhorn_eps,
+            sinkhorn_iters=self.sinkhorn_iters,
             )
         recon_total = recon_total / max(1, S)
         return recon_total, kl_total, next_change_loss
@@ -600,11 +608,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         var_stability_weight: float = 0.01,
         per_dim_free_bits: float = 0.002,
         # Reconstruction weighting (perm-invariant Chamfer components)
-        recon_alpha: float = 1.0,
-        recon_beta: float = 2.0,
-        recon_gamma: float = 3.0,
-        recon_scale_calib: float = 0.5,
-        recon_beta_var: float = 0.01,
+        recon_alpha: float = 4.0,
+        recon_beta: float = 1.5,
+        recon_gamma: float = 1.5,
+        recon_scale_calib: float = 1.5,
+        recon_beta_var: float = 0.02,
+        # Sinkhorn-OT options for reconstruction (方案A)
+        use_sinkhorn: bool = True,
+        sinkhorn_eps: float = 0.1,
+        sinkhorn_iters: int = 100,
         # perturbation params
         p_stale: float = 0.1,
         p_live: float = 0.02,
@@ -673,6 +685,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self.recon_gamma = float(recon_gamma)
         self.recon_scale_calib = float(recon_scale_calib)
         self.recon_beta_var = float(recon_beta_var)
+        # Sinkhorn options
+        self.use_sinkhorn = bool(use_sinkhorn)
+        self.sinkhorn_eps = float(sinkhorn_eps)
+        self.sinkhorn_iters = int(sinkhorn_iters)
         # Capacity schedule
         self.use_kl_capacity = use_kl_capacity
         self.capacity_per_dim_end = capacity_per_dim_end
@@ -854,6 +870,9 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             gamma=self.recon_gamma,
             beta_var=self.recon_beta_var,
             scale_calib_weight=self.recon_scale_calib,
+            use_sinkhorn=self.use_sinkhorn,
+            sinkhorn_eps=self.sinkhorn_eps,
+            sinkhorn_iters=self.sinkhorn_iters,
         )
         # Last-layer raw KL to N(0,I) (no extra regularizers)
         _z_last, mu_last, logvar_last = z_list[-1]
