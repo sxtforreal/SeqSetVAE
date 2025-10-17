@@ -1009,38 +1009,58 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         print(f"#Events:    {len(set_event_names)} (match scope: {getattr(args, 'named_recon', 'off')}, vocab={vocab_len})")
         print("---------------------------------------------------------------")
         print("Original events (name -> de-normalized original value):")
-        for name, val_norm in zip(set_event_names, val_np.tolist()):
+        carried_flags: List[int]
+        if "is_carry" in df_set.columns:
+            try:
+                carried_flags = df_set["is_carry"].astype(float).fillna(0.0).astype(int).tolist()  # type: ignore
+            except Exception:
+                carried_flags = [0] * len(df_set)
+        else:
+            carried_flags = [0] * len(df_set)
+        for idx, (name, val_norm) in enumerate(zip(set_event_names, val_np.tolist())):
             val_orig = _denorm_value(name, float(val_norm))
-            print(f"  - {name}: {val_orig:.6f}")
+            cflag = carried_flags[idx] if 0 <= idx < len(carried_flags) else 0
+            carry_str = "carried" if cflag else "not carried"
+            print(f"  - {name}: {val_orig:.6f} ({carry_str})")
         print("---------------------------------------------------------------")
         print("Reconstruction matched results (No-mask):")
-        col_header = ["variable", "Pred value (denorm)", "cosine"]
+        # Map original variable -> carried (any occurrence carried => carried)
+        carry_map: Dict[str, bool] = {}
+        if "is_carry" in df_set.columns:
+            try:
+                for nm, cf in zip(df_set["variable"].astype(str).tolist(), carried_flags):
+                    carry_map[nm] = carry_map.get(nm, False) or bool(cf)
+            except Exception:
+                carry_map = {}
+        col_header = ["variable", "Pred value (denorm)", "cosine", "carried"]
         print(" | ".join(col_header))
         for (n, v, c) in matched_nomask:
-            print(f"{n} | {_denorm_value(n, float(v)):.6f} | {c:.3f}")
+            cflag = carry_map.get(n, False)
+            print(f"{n} | {_denorm_value(n, float(v)):.6f} | {c:.3f} | {int(cflag)}")
         print("---------------------------------------------------------------")
         print("Unmatched predictions (No-mask):")
         for (n, v, c) in unmatched_nomask:
             print(f"{n}: {_denorm_value(n, float(v)):.6f}  (cos={c:.3f})")
         print("===============================================================")
 
-        # Unmatched/recon analysis:
-        #  - For original variables that were not matched, print the min and max
-        #    absolute cosine to any reconstruction, and label each with the
-        #    corresponding recon variable
-        #  - For all recon tokens, print the global min and max cosine to their
-        #    matched variables, each labeled with the recon variable
+        # Unmatched/recon analysis (revised):
+        # 1) For original variables that were not matched, print per-variable
+        #    min/max absolute cosine to any recon, labeling the corresponding recon var.
+        # 2) For recon-only predictions (names not in original set), compute global
+        #    min/max absolute cosine to any original variable and print the values
+        #    along with the recon variable names.
         try:
             set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
-            print("---- Unmatched originals: min/max cosine to any recon ----")
             # Build the set of original variable names that were matched
             matched_in_set = set(n for (n, _v, _c) in matched_nomask)
             # Unit-direction normalization
             eps = 1e-8
             recon_norm = np.linalg.norm(recon_nomask_np, axis=1, keepdims=True) + eps
             recon_dir = recon_nomask_np / recon_norm
-            # Mapping from recon index to its matched variable name (label)
+            # Mapping from recon index to its matched/assigned variable name (label)
             recon_var_labels = [nm for (nm, _pv, _cs) in assignments_nomask]
+
+            # (1) Per-original unmatched variables
             for j, orig_name in enumerate(set_event_names):
                 if orig_name in matched_in_set:
                     continue
@@ -1048,7 +1068,8 @@ def _run_named_recon_print(model: torch.nn.Module, args):
                 v_norm = v / (np.linalg.norm(v) + eps)
                 cosines = np.abs(recon_dir @ v_norm)
                 if cosines.size == 0:
-                    print(f"{orig_name}: min_cos_to_recon = nan | max_cos_to_recon = nan")
+                    cflag = carried_flags[j] if 0 <= j < len(carried_flags) else 0
+                    print(f"{orig_name} [carried={cflag}]: min_cos_to_recon = nan | max_cos_to_recon = nan")
                     continue
                 min_idx = int(np.argmin(cosines))
                 max_idx = int(np.argmax(cosines))
@@ -1056,29 +1077,45 @@ def _run_named_recon_print(model: torch.nn.Module, args):
                 max_cos = float(cosines[max_idx])
                 min_label = recon_var_labels[min_idx] if 0 <= min_idx < len(recon_var_labels) else "?"
                 max_label = recon_var_labels[max_idx] if 0 <= max_idx < len(recon_var_labels) else "?"
+                cflag = carried_flags[j] if 0 <= j < len(carried_flags) else 0
                 print(
-                    f"{orig_name}: min_cos_to_recon = {min_cos:.3f} (recon_var={min_label}) | "
+                    f"{orig_name} [carried={cflag}]: min_cos_to_recon = {min_cos:.3f} (recon_var={min_label}) | "
                     f"max_cos_to_recon = {max_cos:.3f} (recon_var={max_label})"
                 )
         except Exception as e:
             print(f"[WARN] unmatched-orig analysis failed: {e}")
 
-        # Additionally: for recon tokens (based on greedy-matched cosine),
-        # print global min/max and label the corresponding recon variable
+        # (2) Recon-only global extremes to any original variable
         try:
-            if assignments_nomask:
-                cos_arr = np.array([c for (_n, _v, c) in assignments_nomask], dtype=np.float32)
-                min_idx = int(np.argmin(cos_arr))
-                max_idx = int(np.argmax(cos_arr))
-                min_cos = float(cos_arr[min_idx])
-                max_cos = float(cos_arr[max_idx])
-                min_name = assignments_nomask[min_idx][0]
-                max_name = assignments_nomask[max_idx][0]
-                print("---- Recon predictions: cosine extremes (to matched var) ----")
-                print(f"min_cos = {min_cos:.3f} (recon_var={min_name})")
-                print(f"max_cos = {max_cos:.3f} (recon_var={max_name})")
+            # Prepare normalized original directions
+            eps = 1e-8
+            set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
+            set_var_norms = np.linalg.norm(set_var_dirs_np, axis=1, keepdims=True) + eps
+            set_var_dirs_np = set_var_dirs_np / set_var_norms
+            # Normalized recon directions
+            recon_norm = np.linalg.norm(recon_nomask_np, axis=1, keepdims=True) + eps
+            recon_dir = recon_nomask_np / recon_norm
+            names_set = set(set_event_names)
+            recon_only_idxs = [i for i, nm in enumerate(recon_var_labels) if nm not in names_set]
+            if len(recon_only_idxs) > 0 and set_var_dirs_np.size > 0:
+                sub = recon_dir[recon_only_idxs]
+                cos_mat = np.abs(sub @ set_var_dirs_np.T)  # [R_only, N_orig]
+                # Global min and max over all pairs
+                flat_min = int(np.argmin(cos_mat))
+                flat_max = int(np.argmax(cos_mat))
+                r_only_count, _N = cos_mat.shape
+                r_min = flat_min // _N
+                r_max = flat_max // _N
+                min_val = float(cos_mat.ravel()[flat_min])
+                max_val = float(cos_mat.ravel()[flat_max])
+                min_recon_name = recon_var_labels[recon_only_idxs[r_min]]
+                max_recon_name = recon_var_labels[recon_only_idxs[r_max]]
+                print(f"Recon-only: min_cos_to_any_original = {min_val:.3f} (recon_var={min_recon_name})")
+                print(f"Recon-only: max_cos_to_any_original = {max_val:.3f} (recon_var={max_recon_name})")
+            else:
+                print("Recon-only: no recon-only predictions or empty originals; skip cosine extremes")
         except Exception as e:
-            print(f"[WARN] recon-extremes analysis failed: {e}")
+            print(f"[WARN] recon-only extremes analysis failed: {e}")
 
     if getattr(args, "patient_index", None) is not None and getattr(args, "set_index", None) is not None:
         if args.patient_index < 0 or args.patient_index >= len(ds):
