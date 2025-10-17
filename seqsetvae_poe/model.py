@@ -457,11 +457,13 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             logits = self.next_change_head(h_seq[:, :-1, :]).squeeze(-1)  # [1, S-1]
             next_change_loss = self._bce(logits, targets)
 
-        # reconstruct from h (use h_t)
+        # reconstruct from h (use h_t) — accumulate per set
         recon_total = 0.0
         for idx, s in enumerate(sets):
             N_t = s["var"].size(1)
-            recon = self.decoder(h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3))
+            recon = self.decoder(
+                h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3)
+            )
             if self.set_encoder.dim_reducer is not None:
                 reduced = self.set_encoder.dim_reducer(s["var"])
             else:
@@ -469,7 +471,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
             reduced_normalized = reduced / (norms + 1e-8)
             target_x = reduced_normalized * s["val"]
-        recon_total += chamfer_recon(
+            recon_total = recon_total + chamfer_recon(
                 recon,
                 target_x,
                 alpha=self.recon_alpha,
@@ -477,9 +479,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 gamma=self.recon_gamma,
                 beta_var=self.recon_beta_var,
                 scale_calib_weight=self.recon_scale_calib,
-            use_sinkhorn=self.use_sinkhorn,
-            sinkhorn_eps=self.sinkhorn_eps,
-            sinkhorn_iters=self.sinkhorn_iters,
+                use_sinkhorn=self.use_sinkhorn,
+                sinkhorn_eps=self.sinkhorn_eps,
+                sinkhorn_iters=self.sinkhorn_iters,
             )
         recon_total = recon_total / max(1, S)
         return recon_total, kl_total, next_change_loss
@@ -652,6 +654,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         regularizer_warmup_steps: int = 2000,
         sched_warmup_steps: int = 2000,
         sched_total_steps: int = 200000,
+        # Optim
+        weight_decay: float = 1e-4,
+        # Switch Sinkhorn on after warmup (0 => always on if enabled)
+        sinkhorn_warmup_steps: int = 2000,
     ):
         super().__init__()
         self.set_encoder = SetVAEModule(
@@ -740,6 +746,8 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self.regularizer_warmup_steps = int(regularizer_warmup_steps)
         self.sched_warmup_steps = int(sched_warmup_steps)
         self.sched_total_steps = int(sched_total_steps)
+        self.weight_decay = float(weight_decay)
+        self.sinkhorn_warmup_steps = int(sinkhorn_warmup_steps)
         self.save_hyperparameters()
 
     # --- helpers ---
@@ -883,6 +891,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         recon = self.set_encoder.decode(z_list, target_n=x_target.size(1), noise_std=noise_std)
 
         # losses
+        # Ramp scale for calibration penalty
+        reg_scale = min(1.0, float(self._step) / float(max(1, self.regularizer_warmup_steps))) if self.training else 1.0
+        # Defer enabling Sinkhorn until warmup completes to ease optimization
+        use_sinkhorn_now = bool(self.use_sinkhorn) and (not self.training or (self._step >= self.sinkhorn_warmup_steps))
         r_loss = chamfer_recon(
             recon,
             x_target,
@@ -890,8 +902,8 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             beta=self.recon_beta,
             gamma=self.recon_gamma,
             beta_var=self.recon_beta_var,
-            scale_calib_weight=self.recon_scale_calib,
-            use_sinkhorn=self.use_sinkhorn,
+            scale_calib_weight=(self.recon_scale_calib * reg_scale),
+            use_sinkhorn=use_sinkhorn_now,
             sinkhorn_eps=self.sinkhorn_eps,
             sinkhorn_iters=self.sinkhorn_iters,
         )
@@ -1113,7 +1125,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
                         pass
 
     def configure_optimizers(self):
-        opt = AdamW(self.parameters(), lr=self.lr)
+        opt = AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         self._manual_scheduler = get_linear_schedule_with_warmup(
             opt,
             num_warmup_steps=int(self.sched_warmup_steps),
