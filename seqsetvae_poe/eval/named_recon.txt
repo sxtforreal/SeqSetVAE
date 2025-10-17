@@ -1,0 +1,261 @@
+Running named reconstruction printing ...
+================ Named Reconstruction ================
+Sample:     1/5
+Patient ID: 276363.0
+Set index:  7
+#Events:    8 (match scope: global, vocab=131)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - D5W: 59.999999
+  - DBP: 72.000000
+  - HR: 128.000001
+  - MBP: 96.000004
+  - O2 Saturation: 99.999997
+  - RR: 36.999998
+  - SBP: 144.000000
+  - TPN: 63.000001
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine
+SBP | 151.752676 | 0.978
+RR | 21.975972 | 0.945
+DBP | 80.523435 | 0.978
+MBP | 96.872985 | 0.973
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+PO2: 196.797241  (cos=0.937)
+RBC: 4.071563  (cos=0.955)
+FiO2: 0.625503  (cos=0.911)
+WBC: 14.604146  (cos=0.687)
+===============================================================
+---- Unmatched originals: min/max cosine to any recon ----
+D5W: min_cos_to_recon = 0.257 (recon_var=WBC) | max_cos_to_recon = 0.897 (recon_var=MBP)
+HR: min_cos_to_recon = 0.263 (recon_var=WBC) | max_cos_to_recon = 0.859 (recon_var=MBP)
+O2 Saturation: min_cos_to_recon = 0.683 (recon_var=WBC) | max_cos_to_recon = 0.914 (recon_var=RR)
+TPN: min_cos_to_recon = 0.281 (recon_var=WBC) | max_cos_to_recon = 0.905 (recon_var=MBP)
+---- Recon predictions: cosine extremes (to matched var) ----
+min_cos = 0.687 (recon_var=WBC)
+max_cos = 0.978 (recon_var=SBP)
+================ Named Reconstruction ================
+Sample:     2/5
+Patient ID: 203027.0
+Set index:  140
+#Events:    11 (match scope: global, vocab=131)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - DBP: 75.000000
+  - Dextrose Other: 5.000834
+  - HR: 80.000000
+  - KCl: 0.100017
+  - MBP: 102.000004
+  - O2 Saturation: 92.999997
+  - RR: 35.999999
+  - SBP: 143.000002
+  - Temperature: 37.833331
+  - Urine: 99.999999
+  - Weight: 75.000002
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine
+O2 Saturation | 97.798660 | 0.683
+RR | 22.723391 | 0.950
+DBP | 75.283015 | 0.983
+MBP | 100.984392 | 0.973
+SBP | 150.021890 | 0.981
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+PO2: 199.078865  (cos=0.936)
+Hct: 31.306576  (cos=0.933)
+FiO2: 0.593330  (cos=0.907)
+RBC: 4.039778  (cos=0.959)
+PTT: 52.619403  (cos=0.920)
+WBC: 13.020393  (cos=0.537)
+===============================================================
+---- Unmatched originals: min/max cosine to any recon ----
+Dextrose Other: min_cos_to_recon = 0.237 (recon_var=WBC) | max_cos_to_recon = 0.890 (recon_var=Hct)
+HR: min_cos_to_recon = 0.266 (recon_var=O2 Saturation) | max_cos_to_recon = 0.859 (recon_var=RBC)
+KCl: min_cos_to_recon = 0.224 (recon_var=WBC) | max_cos_to_recon = 0.903 (recon_var=Hct)
+Temperature: min_cos_to_recon = 0.224 (recon_var=O2 Saturation) | max_cos_to_recon = 0.847 (recon_var=Hct)
+Urine: min_cos_to_recon = 0.152 (recon_var=O2 Saturation) | max_cos_to_recon = 0.870 (recon_var=Hct)
+Weight: min_cos_to_recon = 0.282 (recon_var=O2 Saturation) | max_cos_to_recon = 0.786 (recon_var=Hct)
+---- Recon predictions: cosine extremes (to matched var) ----
+min_cos = 0.537 (recon_var=WBC)
+max_cos = 0.983 (recon_var=DBP)
+================ Named Reconstruction ================
+Sample:     3/5
+Patient ID: 229718.0
+Set index:  14
+#Events:    24 (match scope: global, vocab=131)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - Base Excess: -0.000000
+  - Calcium Free: 1.180000
+  - Chest Tube: 30.000000
+  - D5W: 26.999999
+  - DBP: 59.000000
+  - FiO2: 0.600000
+  - Glucose (Blood): 78.999996
+  - HR: 76.999999
+  - Insulin Regular: 4.000000
+  - KCl: 20.000000
+  - Lactated Ringers: 249.999995
+  - MBP: 78.000004
+  - Neosynephrine: 5.040000
+  - Normal Saline: 4.000000
+  - O2 Saturation: 98.999997
+  - PCO2: 42.000000
+  - PO2: 160.999994
+  - Propofol: 140.000000
+  - RR: 17.000000
+  - SBP: 114.000000
+  - Temperature: 36.400000
+  - Total CO2: 26.000000
+  - Urine: 89.999999
+  - pH Blood: 7.380000
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine
+MBP | 93.316007 | 0.971
+SBP | 135.164301 | 0.946
+Total CO2 | 25.815568 | 0.863
+RR | 22.830492 | 0.947
+FiO2 | 0.652553 | 0.932
+PCO2 | 47.849570 | 0.935
+PO2 | 210.367539 | 0.943
+Urine | 138.414055 | 0.930
+DBP | 73.945105 | 0.976
+O2 Saturation | 97.796758 | 0.909
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+CRR: 0.060398  (cos=0.791)
+Dopamine: 35.269897  (cos=0.928)
+Hct: 32.708365  (cos=0.929)
+Hgb: 11.144885  (cos=0.931)
+Norepinephrine: 0.711739  (cos=0.750)
+pH Urine: 5.963267  (cos=0.932)
+Anion Gap: 14.621899  (cos=0.938)
+INR: 2.104160  (cos=0.929)
+PTT: 56.215453  (cos=0.947)
+ALP: 229.703376  (cos=0.934)
+WBC: 14.334374  (cos=0.904)
+RBC: 4.029582  (cos=0.949)
+Lactate: 3.433586  (cos=0.915)
+BUN: 33.026357  (cos=0.928)
+===============================================================
+---- Unmatched originals: min/max cosine to any recon ----
+Base Excess: min_cos_to_recon = 0.629 (recon_var=Norepinephrine) | max_cos_to_recon = 0.900 (recon_var=Anion Gap)
+Calcium Free: min_cos_to_recon = 0.634 (recon_var=Norepinephrine) | max_cos_to_recon = 0.922 (recon_var=Anion Gap)
+Chest Tube: min_cos_to_recon = 0.564 (recon_var=Norepinephrine) | max_cos_to_recon = 0.853 (recon_var=RBC)
+D5W: min_cos_to_recon = 0.605 (recon_var=Norepinephrine) | max_cos_to_recon = 0.926 (recon_var=pH Urine)
+Glucose (Blood): min_cos_to_recon = 0.669 (recon_var=Norepinephrine) | max_cos_to_recon = 0.883 (recon_var=Anion Gap)
+HR: min_cos_to_recon = 0.606 (recon_var=Norepinephrine) | max_cos_to_recon = 0.883 (recon_var=PTT)
+Insulin Regular: min_cos_to_recon = 0.491 (recon_var=Norepinephrine) | max_cos_to_recon = 0.822 (recon_var=Urine)
+KCl: min_cos_to_recon = 0.678 (recon_var=Norepinephrine) | max_cos_to_recon = 0.904 (recon_var=Anion Gap)
+Lactated Ringers: min_cos_to_recon = 0.609 (recon_var=Norepinephrine) | max_cos_to_recon = 0.913 (recon_var=Anion Gap)
+Neosynephrine: min_cos_to_recon = 0.707 (recon_var=CRR) | max_cos_to_recon = 0.899 (recon_var=ALP)
+Normal Saline: min_cos_to_recon = 0.525 (recon_var=CRR) | max_cos_to_recon = 0.784 (recon_var=Lactate)
+Propofol: min_cos_to_recon = 0.638 (recon_var=Norepinephrine) | max_cos_to_recon = 0.915 (recon_var=RBC)
+Temperature: min_cos_to_recon = 0.543 (recon_var=Norepinephrine) | max_cos_to_recon = 0.874 (recon_var=RBC)
+pH Blood: min_cos_to_recon = 0.580 (recon_var=Norepinephrine) | max_cos_to_recon = 0.928 (recon_var=RBC)
+---- Recon predictions: cosine extremes (to matched var) ----
+min_cos = 0.750 (recon_var=Norepinephrine)
+max_cos = 0.976 (recon_var=DBP)
+================ Named Reconstruction ================
+Sample:     4/5
+Patient ID: 216766.0
+Set index:  47
+#Events:    14 (match scope: global, vocab=131)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - D5W: 10.458330
+  - DBP: 61.000000
+  - FiO2: 0.500000
+  - Fresh Frozen Plasma: -0.000001
+  - HR: 88.000000
+  - KCl: 8.000000
+  - Lactated Ringers: 199.999996
+  - Lorazepam: 2.000000
+  - MBP: 82.000004
+  - Morphine Sulfate: 2.000000
+  - Neosynephrine: 2.250000
+  - O2 Saturation: 93.999997
+  - RR: 23.999999
+  - SBP: 113.000000
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine
+MBP | 98.076560 | 0.973
+RR | 21.024727 | 0.946
+DBP | 66.250424 | 0.982
+SBP | 133.015223 | 0.986
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+BUN: 30.071346  (cos=0.918)
+Urine: 162.891680  (cos=0.929)
+Age: 63.653104  (cos=0.606)
+INR: 1.916638  (cos=0.927)
+ALP: 171.218655  (cos=0.946)
+RBC: 3.961608  (cos=0.947)
+TPN: 72.619912  (cos=0.921)
+PO2: 188.506155  (cos=0.934)
+PTT: 47.674030  (cos=0.916)
+Lactate: 2.965015  (cos=0.814)
+===============================================================
+---- Unmatched originals: min/max cosine to any recon ----
+D5W: min_cos_to_recon = 0.448 (recon_var=Age) | max_cos_to_recon = 0.923 (recon_var=Urine)
+FiO2: min_cos_to_recon = 0.395 (recon_var=Age) | max_cos_to_recon = 0.940 (recon_var=DBP)
+Fresh Frozen Plasma: min_cos_to_recon = 0.579 (recon_var=Age) | max_cos_to_recon = 0.881 (recon_var=ALP)
+HR: min_cos_to_recon = 0.389 (recon_var=Age) | max_cos_to_recon = 0.883 (recon_var=RBC)
+KCl: min_cos_to_recon = 0.441 (recon_var=Age) | max_cos_to_recon = 0.909 (recon_var=ALP)
+Lactated Ringers: min_cos_to_recon = 0.534 (recon_var=Age) | max_cos_to_recon = 0.921 (recon_var=ALP)
+Lorazepam: min_cos_to_recon = 0.457 (recon_var=Age) | max_cos_to_recon = 0.912 (recon_var=ALP)
+Morphine Sulfate: min_cos_to_recon = 0.474 (recon_var=Age) | max_cos_to_recon = 0.880 (recon_var=ALP)
+Neosynephrine: min_cos_to_recon = 0.483 (recon_var=Age) | max_cos_to_recon = 0.906 (recon_var=ALP)
+O2 Saturation: min_cos_to_recon = 0.498 (recon_var=Age) | max_cos_to_recon = 0.924 (recon_var=DBP)
+---- Recon predictions: cosine extremes (to matched var) ----
+min_cos = 0.606 (recon_var=Age)
+max_cos = 0.986 (recon_var=SBP)
+================ Named Reconstruction ================
+Sample:     5/5
+Patient ID: 212492.0
+Set index:  43
+#Events:    10 (match scope: global, vocab=131)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - DBP: 55.000000
+  - GCS_eye: 4.000000
+  - GCS_motor: 6.000000
+  - GCS_verbal: 5.000000
+  - HR: 93.000000
+  - MBP: 72.000004
+  - PO intake: 240.000000
+  - RR: 17.000000
+  - SBP: 120.000000
+  - Urine: 99.999999
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine
+DBP | 66.872646 | 0.981
+SBP | 131.535629 | 0.978
+Urine | 141.738482 | 0.880
+MBP | 89.559427 | 0.955
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+RBC: 3.665962  (cos=0.963)
+Dopamine: 30.926673  (cos=0.895)
+PT: 16.876115  (cos=0.813)
+ALP: 193.121037  (cos=0.950)
+Colloid: 787.457849  (cos=0.762)
+PCO2: 44.561731  (cos=0.942)
+===============================================================
+---- Unmatched originals: min/max cosine to any recon ----
+GCS_eye: min_cos_to_recon = 0.565 (recon_var=Colloid) | max_cos_to_recon = 0.884 (recon_var=ALP)
+GCS_motor: min_cos_to_recon = 0.599 (recon_var=Colloid) | max_cos_to_recon = 0.860 (recon_var=Urine)
+GCS_verbal: min_cos_to_recon = 0.549 (recon_var=Colloid) | max_cos_to_recon = 0.883 (recon_var=ALP)
+HR: min_cos_to_recon = 0.670 (recon_var=Colloid) | max_cos_to_recon = 0.892 (recon_var=MBP)
+PO intake: min_cos_to_recon = 0.549 (recon_var=Colloid) | max_cos_to_recon = 0.846 (recon_var=ALP)
+RR: min_cos_to_recon = 0.321 (recon_var=Colloid) | max_cos_to_recon = 0.950 (recon_var=SBP)
+---- Recon predictions: cosine extremes (to matched var) ----
+min_cos = 0.762 (recon_var=Colloid)
+max_cos = 0.981 (recon_var=DBP)
+Completed!
