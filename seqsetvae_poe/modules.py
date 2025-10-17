@@ -384,28 +384,40 @@ def recon_loss(
     target_unit = target / (target_norm + epsilon)
 
     if use_sinkhorn:
-        # --- Build pairwise costs ---
+        # Run Sinkhorn in float32 for numerical stability under mixed precision.
+        orig_dtype = recon.dtype
+        recon32 = recon.to(torch.float32)
+        target32 = target.to(torch.float32)
+
+        # --- Build pairwise costs (float32) ---
+        recon_norm32 = torch.norm(recon32, dim=-1, keepdim=True)
+        target_norm32 = torch.norm(target32, dim=-1, keepdim=True)
+        recon_unit32 = recon32 / (recon_norm32 + epsilon)
+        target_unit32 = target32 / (target_norm32 + epsilon)
+
         # Direction (unsigned cosine dissimilarity)
-        sim = torch.bmm(recon_unit, target_unit.transpose(1, 2)).abs()
+        sim = torch.bmm(recon_unit32, target_unit32.transpose(1, 2)).abs()
         c_dir = 1.0 - sim  # [B,N,N]
         # Magnitude (absolute difference)
-        mag_r = recon_norm.squeeze(-1)  # [B,N]
-        mag_t = target_norm.squeeze(-1)  # [B,N]
+        mag_r = recon_norm32.squeeze(-1)  # [B,N]
+        mag_t = target_norm32.squeeze(-1)  # [B,N]
         c_mag = (mag_r.unsqueeze(-1) - mag_t.unsqueeze(1)).abs()  # [B,N,N]
         # Vector (sign-invariant L2)
-        r_exp = recon.unsqueeze(2)  # [B,N,1,D]
-        t_exp = target.unsqueeze(1)  # [B,1,N,D]
+        r_exp = recon32.unsqueeze(2)  # [B,N,1,D]
+        t_exp = target32.unsqueeze(1)  # [B,1,N,D]
         d_pos = ((r_exp - t_exp) ** 2).sum(dim=-1)
         d_neg = ((r_exp + t_exp) ** 2).sum(dim=-1)
         c_vec = torch.minimum(d_pos, d_neg)  # [B,N,N]
         # Combined cost
         C = alpha * c_dir + beta * c_mag + gamma * c_vec  # [B,N,N]
 
-        # --- Sinkhorn-Knopp to obtain doubly-stochastic transport plan P ---
+        # --- Sinkhorn-Knopp in float32 with stabilized exponent ---
         B, N, M = C.shape
         assert N == M, "Sinkhorn-OT currently expects square cost (same #tokens)"
-        # Kernels (entropic regularization)
-        K = torch.exp(-C / max(1e-6, float(sinkhorn_eps))).clamp_min(1e-12)
+        # Clamp exponent to avoid under/overflow in exp()
+        inv_eps = 1.0 / max(1e-6, float(sinkhorn_eps))
+        expo = (-C * inv_eps).clamp(min=-50.0, max=50.0)
+        K = torch.exp(expo).clamp_min(1e-12)  # [B,N,N]
         # Uniform marginals a,b
         a = torch.full((B, N), 1.0 / float(N), device=C.device, dtype=C.dtype)
         b = torch.full((B, M), 1.0 / float(M), device=C.device, dtype=C.dtype)
@@ -414,20 +426,53 @@ def recon_loss(
         for _ in range(int(sinkhorn_iters)):
             Kv = torch.bmm(K, v.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
             u = a / Kv
-            Ktu = torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
+            Ktu = (
+                torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
+            )
             v = b / Ktu
         P = u.unsqueeze(-1) * K * v.unsqueeze(-2)  # [B,N,N]
-        # Transport cost per batch, then mean over batch
         ot_cost = (P * C).sum(dim=(1, 2)).mean()
 
-        # Variance regularization (encourage spread in recon)
-        var_term = -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
-        # Scale calibration
-        mean_recon_norm = torch.mean(recon_norm + 1e-8)
-        mean_target_norm = torch.mean(target_norm + 1e-8)
+        # If still unstable, fall back to Chamfer (rare)
+        if not torch.isfinite(ot_cost):
+            # Recompute Chamfer in float32 and return
+            # Direction Chamfer (unsigned)
+            sim_matrix = torch.bmm(recon_unit32, target_unit32.transpose(1, 2)).abs()
+            dissim_matrix = 1 - sim_matrix
+            min_dissim_recon = torch.min(dissim_matrix, dim=2)[0].mean(dim=1)
+            min_dissim_target = torch.min(dissim_matrix, dim=1)[0].mean(dim=1)
+            dir_chamfer = torch.mean(min_dissim_recon + min_dissim_target) / 2
+            # Magnitude Chamfer (absolute difference)
+            mag_distances = (
+                recon_norm32.squeeze(-1).unsqueeze(2) - target_norm32.squeeze(-1).unsqueeze(1)
+            ).abs()
+            min_mag_recon = torch.min(mag_distances, dim=2)[0].mean(dim=1)
+            min_mag_target = torch.min(mag_distances, dim=1)[0].mean(dim=1)
+            mag_chamfer = torch.mean(min_mag_recon + min_mag_target) / 2
+            # Full Chamfer (sign-invariant L2 on vectors)
+            recon_exp = recon32.unsqueeze(2)
+            target_exp = target32.unsqueeze(1)
+            dist_pos = torch.sum((recon_exp - target_exp) ** 2, dim=-1)
+            dist_neg = torch.sum((recon_exp + target_exp) ** 2, dim=-1)
+            distances = torch.minimum(dist_pos, dist_neg)
+            min_dist_recon_to_target = torch.min(distances, dim=2)[0].mean(dim=1)
+            min_dist_target_to_recon = torch.min(distances, dim=1)[0].mean(dim=1)
+            chamfer_loss = torch.mean(min_dist_recon_to_target + min_dist_target_to_recon) / 2
+            var_term_f32 = -beta_var * torch.var(recon32, dim=1, unbiased=False).mean(dim=-1).mean()
+            mean_recon_norm_f32 = torch.mean(recon_norm32 + 1e-8)
+            mean_target_norm_f32 = torch.mean(target_norm32 + 1e-8)
+            scale_ratio_f32 = mean_recon_norm_f32 / (mean_target_norm_f32 + 1e-8)
+            scale_penalty_f32 = scale_calib_weight * (scale_ratio_f32 - 1.0) ** 2
+            total_f32 = alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term_f32 + scale_penalty_f32
+            return total_f32.to(orig_dtype)
+
+        # Variance regularization and scale penalty (float32)
+        var_term = -beta_var * torch.var(recon32, dim=1, unbiased=False).mean(dim=-1).mean()
+        mean_recon_norm = torch.mean(recon_norm32 + 1e-8)
+        mean_target_norm = torch.mean(target_norm32 + 1e-8)
         scale_ratio = mean_recon_norm / (mean_target_norm + 1e-8)
         scale_penalty = scale_calib_weight * (scale_ratio - 1.0) ** 2
-        return ot_cost + var_term + scale_penalty
+        return (ot_cost + var_term + scale_penalty).to(orig_dtype)
 
     # ---- Fallback: original Chamfer losses (multi-to-one) ----
     # Direction Chamfer (unsigned)
