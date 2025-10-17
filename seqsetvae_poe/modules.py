@@ -343,34 +343,39 @@ class SetVAEModule(nn.Module):
 
 
 def recon_loss(
-    recon,
-    target,
-    alpha=1.0,
-    beta=1.0,
-    gamma=3.0,
-    beta_var=0.1,
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 3.0,
+    beta_var: float = 0.1,
     scale_calib_weight: float = 0.0,
-    epsilon=1e-8,
+    epsilon: float = 1e-8,
+    # Sinkhorn-OT options (方案A)
+    use_sinkhorn: bool = False,
+    sinkhorn_eps: float = 0.1,
+    sinkhorn_iters: int = 100,
+    # Compatibility no-ops for callers that pass extra arguments
+    amp_weight: float = 1.0,
+    base_unit: torch.Tensor | None = None,
+    target_val: torch.Tensor | None = None,
 ):
     """
-    Reconstruction loss for unordered sets, using Chamfer distances for direction, magnitude, and full vectors.
-    This ensures permutation-invariant matching, where each target direction/magnitude is covered by the closest recon point.
+    Permutation-invariant reconstruction loss for sets.
+
+    Two modes:
+      - Chamfer (default, multi-to-one): original behavior using nearest-neighbor Chamfer
+      - Sinkhorn-OT (soft one-to-one): entropic OT with cost = α·dir + β·mag + γ·vec
 
     Args:
-        recon: Reconstructed events [batch, n, dim]
-        target: Target events [batch, n, dim]
-        alpha: Weight for direction loss
-        beta: Weight for magnitude loss
-        gamma: Weight for full Chamfer loss
-        beta_var: Weight for variance regularization (encourages higher recon variance)
-        epsilon: Small value to avoid division by zero
-
-    Returns:
-        total_loss: Scalar tensor
+      recon: [B, N, D]
+      target: [B, N, D]
+      alpha/beta/gamma: weights for direction/magnitude/vector components
+      use_sinkhorn: enable differentiable soft assignment with Sinkhorn (方案A)
+      sinkhorn_eps: entropic regularization strength (higher = softer)
+      sinkhorn_iters: Sinkhorn iterations
     """
-    assert (
-        recon.shape == target.shape
-    ), f"Shape mismatch: recon {recon.shape}, target {target.shape}"
+    assert recon.shape == target.shape, f"Shape mismatch: recon {recon.shape}, target {target.shape}"
 
     # Normalize for directions
     recon_norm = torch.norm(recon, dim=-1, keepdim=True)
@@ -378,6 +383,53 @@ def recon_loss(
     recon_unit = recon / (recon_norm + epsilon)
     target_unit = target / (target_norm + epsilon)
 
+    if use_sinkhorn:
+        # --- Build pairwise costs ---
+        # Direction (unsigned cosine dissimilarity)
+        sim = torch.bmm(recon_unit, target_unit.transpose(1, 2)).abs()
+        c_dir = 1.0 - sim  # [B,N,N]
+        # Magnitude (absolute difference)
+        mag_r = recon_norm.squeeze(-1)  # [B,N]
+        mag_t = target_norm.squeeze(-1)  # [B,N]
+        c_mag = (mag_r.unsqueeze(-1) - mag_t.unsqueeze(1)).abs()  # [B,N,N]
+        # Vector (sign-invariant L2)
+        r_exp = recon.unsqueeze(2)  # [B,N,1,D]
+        t_exp = target.unsqueeze(1)  # [B,1,N,D]
+        d_pos = ((r_exp - t_exp) ** 2).sum(dim=-1)
+        d_neg = ((r_exp + t_exp) ** 2).sum(dim=-1)
+        c_vec = torch.minimum(d_pos, d_neg)  # [B,N,N]
+        # Combined cost
+        C = alpha * c_dir + beta * c_mag + gamma * c_vec  # [B,N,N]
+
+        # --- Sinkhorn-Knopp to obtain doubly-stochastic transport plan P ---
+        B, N, M = C.shape
+        assert N == M, "Sinkhorn-OT currently expects square cost (same #tokens)"
+        # Kernels (entropic regularization)
+        K = torch.exp(-C / max(1e-6, float(sinkhorn_eps))).clamp_min(1e-12)
+        # Uniform marginals a,b
+        a = torch.full((B, N), 1.0 / float(N), device=C.device, dtype=C.dtype)
+        b = torch.full((B, M), 1.0 / float(M), device=C.device, dtype=C.dtype)
+        u = torch.ones_like(a)
+        v = torch.ones_like(b)
+        for _ in range(int(sinkhorn_iters)):
+            Kv = torch.bmm(K, v.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
+            u = a / Kv
+            Ktu = torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
+            v = b / Ktu
+        P = u.unsqueeze(-1) * K * v.unsqueeze(-2)  # [B,N,N]
+        # Transport cost per batch, then mean over batch
+        ot_cost = (P * C).sum(dim=(1, 2)).mean()
+
+        # Variance regularization (encourage spread in recon)
+        var_term = -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
+        # Scale calibration
+        mean_recon_norm = torch.mean(recon_norm + 1e-8)
+        mean_target_norm = torch.mean(target_norm + 1e-8)
+        scale_ratio = mean_recon_norm / (mean_target_norm + 1e-8)
+        scale_penalty = scale_calib_weight * (scale_ratio - 1.0) ** 2
+        return ot_cost + var_term + scale_penalty
+
+    # ---- Fallback: original Chamfer losses (multi-to-one) ----
     # Direction Chamfer (unsigned)
     sim_matrix = torch.bmm(recon_unit, target_unit.transpose(1, 2)).abs()
     dissim_matrix = 1 - sim_matrix
@@ -386,9 +438,7 @@ def recon_loss(
     dir_chamfer = torch.mean(min_dissim_recon + min_dissim_target) / 2
 
     # Magnitude Chamfer (absolute difference)
-    mag_distances = torch.abs(
-        recon_norm.unsqueeze(2) - target_norm.unsqueeze(1)
-    ).squeeze(-1)
+    mag_distances = (recon_norm.squeeze(-1).unsqueeze(2) - target_norm.squeeze(-1).unsqueeze(1)).abs()
     min_mag_recon = torch.min(mag_distances, dim=2)[0].mean(dim=1)
     min_mag_target = torch.min(mag_distances, dim=1)[0].mean(dim=1)
     mag_chamfer = torch.mean(min_mag_recon + min_mag_target) / 2
@@ -403,25 +453,15 @@ def recon_loss(
     min_dist_target_to_recon = torch.min(distances, dim=1)[0].mean(dim=1)
     chamfer_loss = torch.mean(min_dist_recon_to_target + min_dist_target_to_recon) / 2
 
-    # Variance regularization: Encourage higher variance in recon (negative to minimize)
-    var_term = (
-        -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
-    )  # Mean over dims, tokens, batch
-
-    # Scale calibration to avoid degenerate shrinking or explosion of norms
+    # Variance regularization
+    var_term = -beta_var * torch.var(recon, dim=1, unbiased=False).mean(dim=-1).mean()
+    # Scale calibration
     mean_recon_norm = torch.mean(recon_norm + 1e-8)
     mean_target_norm = torch.mean(target_norm + 1e-8)
     scale_ratio = mean_recon_norm / (mean_target_norm + 1e-8)
     scale_penalty = scale_calib_weight * (scale_ratio - 1.0) ** 2
 
-    # Total loss
-    total_loss = (
-        alpha * dir_chamfer
-        + beta * mag_chamfer
-        + gamma * chamfer_loss
-        + var_term
-        + scale_penalty
-    )
+    total_loss = alpha * dir_chamfer + beta * mag_chamfer + gamma * chamfer_loss + var_term + scale_penalty
     return total_loss
 
 
