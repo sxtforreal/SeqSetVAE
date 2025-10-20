@@ -457,11 +457,13 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             logits = self.next_change_head(h_seq[:, :-1, :]).squeeze(-1)  # [1, S-1]
             next_change_loss = self._bce(logits, targets)
 
-        # reconstruct from h (use h_t)
+        # reconstruct from h (use h_t) — accumulate per set
         recon_total = 0.0
         for idx, s in enumerate(sets):
             N_t = s["var"].size(1)
-            recon = self.decoder(h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3))
+            recon = self.decoder(
+                h_seq[:, idx], N_t, noise_std=(0.0 if not self.training else 0.3)
+            )
             if self.set_encoder.dim_reducer is not None:
                 reduced = self.set_encoder.dim_reducer(s["var"])
             else:
@@ -469,7 +471,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
             reduced_normalized = reduced / (norms + 1e-8)
             target_x = reduced_normalized * s["val"]
-        recon_total += chamfer_recon(
+            recon_total = recon_total + chamfer_recon(
                 recon,
                 target_x,
                 alpha=self.recon_alpha,
@@ -477,9 +479,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 gamma=self.recon_gamma,
                 beta_var=self.recon_beta_var,
                 scale_calib_weight=self.recon_scale_calib,
-            use_sinkhorn=self.use_sinkhorn,
-            sinkhorn_eps=self.sinkhorn_eps,
-            sinkhorn_iters=self.sinkhorn_iters,
+                use_sinkhorn=self.use_sinkhorn,
+                sinkhorn_eps=self.sinkhorn_eps,
+                sinkhorn_iters=self.sinkhorn_iters,
             )
         recon_total = recon_total / max(1, S)
         return recon_total, kl_total, next_change_loss
@@ -647,6 +649,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         max_beta_ceiling: float = 2.0,
         capacity_per_dim_max: float = 0.20,
         active_ratio_warn_threshold: float = 0.5,
+        # Training stability knobs
+        perturbation_warmup_steps: int = 1000,
+        regularizer_warmup_steps: int = 2000,
+        sched_warmup_steps: int = 2000,
+        sched_total_steps: int = 200000,
+        # Optim
+        weight_decay: float = 1e-4,
+        # Switch Sinkhorn on after warmup (0 => always on if enabled)
+        sinkhorn_warmup_steps: int = 2000,
     ):
         super().__init__()
         self.set_encoder = SetVAEModule(
@@ -730,6 +741,13 @@ class SetVAEOnlyPretrain(pl.LightningModule):
 
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
+        # Warmup configs
+        self.perturbation_warmup_steps = int(perturbation_warmup_steps)
+        self.regularizer_warmup_steps = int(regularizer_warmup_steps)
+        self.sched_warmup_steps = int(sched_warmup_steps)
+        self.sched_total_steps = int(sched_total_steps)
+        self.weight_decay = float(weight_decay)
+        self.sinkhorn_warmup_steps = int(sinkhorn_warmup_steps)
         self.save_hyperparameters()
 
     # --- helpers ---
@@ -790,9 +808,12 @@ class SetVAEOnlyPretrain(pl.LightningModule):
     def _apply_value_dropout(self, val: torch.Tensor, carry: torch.Tensor):
         if not self.training:
             return val
+        scale = min(1.0, float(self._step) / float(max(1, self.perturbation_warmup_steps)))
+        p_stale = float(self.p_stale) * scale
+        p_live = float(self.p_live) * scale
         # Bernoulli masks, independent per token
-        stale_mask = (torch.rand_like(val) < self.p_stale) & (carry > 0.5)
-        live_mask = (torch.rand_like(val) < self.p_live) & (carry <= 0.5)
+        stale_mask = (torch.rand_like(val) < p_stale) & (carry > 0.5)
+        live_mask = (torch.rand_like(val) < p_live) & (carry <= 0.5)
         out = val.clone()
         out[stale_mask] = 0.0
         out[live_mask] = 0.0
@@ -808,17 +829,18 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         if not self.training:
             return
         N = val.size(1)
+        scale = min(1.0, float(self._step) / float(max(1, self.perturbation_warmup_steps)))
         if N == 0:
             return
         device = val.device
         max_masks = self.max_masks_per_set
         if N <= self.small_set_threshold:
-            if torch.rand((), device=device) < self.small_set_mask_prob and N >= 1:
+            if torch.rand((), device=device) < (self.small_set_mask_prob * scale) and N >= 1:
                 # choose 1 index
                 idx = torch.randint(0, N, (1,), device=device)
                 val[:, idx, :] = 0.0
         else:
-            k = int(math.ceil(self.set_mae_ratio * float(N)))
+            k = int(math.ceil((self.set_mae_ratio * scale) * float(N)))
             k = max(0, min(k, max_masks))
             if k > 0:
                 idx = torch.randperm(N, device=device)[:k]
@@ -845,12 +867,14 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         val_in = self._apply_value_dropout(val_in, carry)
         # token masking (Set-MAE)
         self._apply_set_mae_inplace(val_in, carry, original_val)
-        # additive value noise
+        # additive value noise (ramped)
         if self.training and self.val_noise_std > 0:
-            val_in = val_in + self.val_noise_std * torch.randn_like(val_in)
-        # directional jitter on variable vectors
+            scale = min(1.0, float(self._step) / float(max(1, self.perturbation_warmup_steps)))
+            val_in = val_in + (self.val_noise_std * scale) * torch.randn_like(val_in)
+        # directional jitter on variable vectors (ramped)
         if self.training and self.dir_noise_std > 0:
-            v_noisy = v_norm + self.dir_noise_std * torch.randn_like(v_norm)
+            scale = min(1.0, float(self._step) / float(max(1, self.perturbation_warmup_steps)))
+            v_noisy = v_norm + (self.dir_noise_std * scale) * torch.randn_like(v_norm)
             v_noisy = v_noisy / (torch.norm(v_noisy, p=2, dim=-1, keepdim=True) + 1e-8)
         else:
             v_noisy = v_norm
@@ -858,10 +882,19 @@ class SetVAEOnlyPretrain(pl.LightningModule):
 
         # encode/decode
         z_list, _ = self.set_encoder.encode(x_input)
-        noise_std = self.train_decoder_noise_std if self.training else self.eval_decoder_noise_std
+        # decoder noise ramp up
+        if self.training:
+            scale = min(1.0, float(self._step) / float(max(1, self.perturbation_warmup_steps)))
+            noise_std = float(self.train_decoder_noise_std) * scale
+        else:
+            noise_std = float(self.eval_decoder_noise_std)
         recon = self.set_encoder.decode(z_list, target_n=x_target.size(1), noise_std=noise_std)
 
         # losses
+        # Ramp scale for calibration penalty
+        reg_scale = min(1.0, float(self._step) / float(max(1, self.regularizer_warmup_steps))) if self.training else 1.0
+        # Defer enabling Sinkhorn until warmup completes to ease optimization
+        use_sinkhorn_now = bool(self.use_sinkhorn) and (not self.training or (self._step >= self.sinkhorn_warmup_steps))
         r_loss = chamfer_recon(
             recon,
             x_target,
@@ -869,8 +902,8 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             beta=self.recon_beta,
             gamma=self.recon_gamma,
             beta_var=self.recon_beta_var,
-            scale_calib_weight=self.recon_scale_calib,
-            use_sinkhorn=self.use_sinkhorn,
+            scale_calib_weight=(self.recon_scale_calib * reg_scale),
+            use_sinkhorn=use_sinkhorn_now,
             sinkhorn_eps=self.sinkhorn_eps,
             sinkhorn_iters=self.sinkhorn_iters,
         )
@@ -978,9 +1011,11 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             kl_to_uniform = (p * (torch.log(p + eps) - uniform_log)).sum()
             over = F.relu(p - (1.0 / D) * (1.0 + self.kl_spread_tol))
             l2_over = (over ** 2).sum()
-            fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
+            reg_scale = min(1.0, float(self._step) / float(max(1, self.regularizer_warmup_steps)))
+            fairness = (self.kl_fairness_weight * reg_scale) * (kl_to_uniform + self.kl_over_weight * l2_over)
         # Variance stability penalty
-        var_pen = self.var_stability_weight * var_dev
+        reg_scale = min(1.0, float(self._step) / float(max(1, self.regularizer_warmup_steps)))
+        var_pen = (self.var_stability_weight * reg_scale) * var_dev
         total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen
         self.log_dict({"train_loss": total, "train_recon": recon, "train_kl_last": kl, "train_kl_obj_lb": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd, "train_kl_fair": fairness, "train_var_pen": var_pen}, prog_bar=True)
         self._step += 1
@@ -1005,8 +1040,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             kl_to_uniform = (p * (torch.log(p + eps) - uniform_log)).sum()
             over = F.relu(p - (1.0 / D) * (1.0 + self.kl_spread_tol))
             l2_over = (over ** 2).sum()
-            fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
-        var_pen = self.var_stability_weight * var_dev
+            reg_scale = min(1.0, float(self._step) / float(max(1, self.regularizer_warmup_steps)))
+            fairness = (self.kl_fairness_weight * reg_scale) * (kl_to_uniform + self.kl_over_weight * l2_over)
+        reg_scale = min(1.0, float(self._step) / float(max(1, self.regularizer_warmup_steps)))
+        var_pen = (self.var_stability_weight * reg_scale) * var_dev
         total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen
         self.log_dict({"val_loss": total, "val_recon": recon, "val_kl_last": kl, "val_kl_obj_lb": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd, "val_kl_fair": fairness, "val_var_pen": var_pen}, prog_bar=True, on_epoch=True)
         # accumulate kl for epoch-level auto-tune
@@ -1088,9 +1125,11 @@ class SetVAEOnlyPretrain(pl.LightningModule):
                         pass
 
     def configure_optimizers(self):
-        opt = AdamW(self.parameters(), lr=self.lr)
+        opt = AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         self._manual_scheduler = get_linear_schedule_with_warmup(
-            opt, num_warmup_steps=2_000, num_training_steps=200_000
+            opt,
+            num_warmup_steps=int(self.sched_warmup_steps),
+            num_training_steps=int(self.sched_total_steps),
         )
         return opt
 
