@@ -940,12 +940,27 @@ def _run_named_recon_print(model: torch.nn.Module, args):
             lift_b = (dim_red.bias.to(device) if getattr(dim_red, "bias", None) is not None else None)
     except Exception:
         lift_A, lift_b = None, None
+    # Decide matching space
+    req_space = getattr(args, "match_space", "auto")
+    has_reducer = getattr(encoder, "dim_reducer", None) is not None
+    if req_space == "original":
+        match_space = "original"
+    elif req_space == "reduced":
+        match_space = "reduced" if has_reducer else "original"
+    else:
+        match_space = "reduced" if has_reducer else "original"
     if getattr(args, "named_recon", "off") == "global":
         vocab_names, vocab_vecs = _load_global_vocab_embeddings(args.data_dir, getattr(args, "event_emb_csv", ""))
         vocab_t = torch.from_numpy(vocab_vecs).unsqueeze(0).to(device)
-        # Match in ORIGINAL input space: do NOT reduce; normalize in 768-D (or input_dim)
-        vocab_dirs = vocab_t / (torch.norm(vocab_t, p=2, dim=-1, keepdim=True) + 1e-8)
-        vocab_dirs_np = vocab_dirs.squeeze(0).detach().cpu().numpy()
+        if match_space == "reduced" and has_reducer:
+            try:
+                vocab_red = encoder.dim_reducer(vocab_t)
+            except Exception:
+                vocab_red = vocab_t
+            vocab_dirs_t = vocab_red / (torch.norm(vocab_red, p=2, dim=-1, keepdim=True) + 1e-8)
+        else:
+            vocab_dirs_t = vocab_t / (torch.norm(vocab_t, p=2, dim=-1, keepdim=True) + 1e-8)
+        vocab_dirs_np = vocab_dirs_t.squeeze(0).detach().cpu().numpy()
         vocab_event_names = [str(n) for n in vocab_names]
 
     ds = PatientDataset("test" if args.split == "test" else "valid", saved_dir=args.data_dir)
@@ -962,25 +977,28 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         else:
             var_red = var_t
         recon_nomask_t = _encode_decode_set(encoder, var_red, val_t)
-        # Build directions for matching in ORIGINAL input space
+        # Prepare directions and recon in the chosen matching space
         with torch.no_grad():
-            var_dirs = var_t / (torch.norm(var_t, p=2, dim=-1, keepdim=True) + 1e-8)
-        # Lift recon from reduced space back to original input space for matching
-        if lift_A is not None and recon_nomask_t.size(-1) == lift_A.size(0):
-            y = recon_nomask_t
-            if lift_b is not None and y.size(-1) == lift_b.numel():
-                y = y - lift_b.view(1, 1, -1)
-            recon_lift = torch.matmul(y, lift_A)  # [1,N,D]
-            recon_nomask_np = recon_lift.squeeze(0).detach().cpu().numpy()
-        else:
-            recon_nomask_np = recon_nomask_t.squeeze(0).detach().cpu().numpy()
+            if match_space == "reduced" and has_reducer:
+                var_dirs_t = var_red / (torch.norm(var_red, p=2, dim=-1, keepdim=True) + 1e-8)
+                recon_space = recon_nomask_t
+            else:
+                var_dirs_t = var_t / (torch.norm(var_t, p=2, dim=-1, keepdim=True) + 1e-8)
+                if lift_A is not None and recon_nomask_t.size(-1) == lift_A.size(0):
+                    y = recon_nomask_t
+                    if lift_b is not None and y.size(-1) == lift_b.numel():
+                        y = y - lift_b.view(1, 1, -1)
+                    recon_space = torch.matmul(y, lift_A)  # [1,N,D]
+                else:
+                    recon_space = recon_nomask_t
+        recon_nomask_np = recon_space.squeeze(0).detach().cpu().numpy()
 
         if getattr(args, "named_recon", "off") == "global":
             assert vocab_dirs_np is not None and vocab_event_names is not None
             var_dirs_np_local = vocab_dirs_np
             event_names_local: List[str] = vocab_event_names
         else:
-            var_dirs_np_local = (var_dirs.squeeze(0).detach().cpu().numpy())
+            var_dirs_np_local = (var_dirs_t.squeeze(0).detach().cpu().numpy())
             event_names_local = df_set["variable"].astype(str).tolist()
 
         assignments_nomask = _greedy_match_recon_to_vars(
@@ -1006,7 +1024,10 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         print(f"Patient ID: {patient_id}")
         print(f"Set index:  {chosen_set}")
         vocab_len = len(event_names_local)
-        print(f"#Events:    {len(set_event_names)} (match scope: {getattr(args, 'named_recon', 'off')}, vocab={vocab_len})")
+        print(
+            f"#Events:    {len(set_event_names)} (match scope: {getattr(args, 'named_recon', 'off')}, "
+            f"vocab={vocab_len}, space={match_space})"
+        )
         print("---------------------------------------------------------------")
         print("Original events (name -> de-normalized original value):")
         carried_flags: List[int]
@@ -1050,7 +1071,7 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         #    min/max absolute cosine to any original variable and print the values
         #    along with the recon variable names.
         try:
-            set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
+            set_var_dirs_np = var_dirs_t.squeeze(0).detach().cpu().numpy()
             # Build the set of original variable names that were matched
             matched_in_set = set(n for (n, _v, _c) in matched_nomask)
             # Unit-direction normalization
@@ -1089,7 +1110,7 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         try:
             # Prepare normalized original directions
             eps = 1e-8
-            set_var_dirs_np = var_dirs.squeeze(0).detach().cpu().numpy()
+            set_var_dirs_np = var_dirs_t.squeeze(0).detach().cpu().numpy()
             set_var_norms = np.linalg.norm(set_var_dirs_np, axis=1, keepdims=True) + eps
             set_var_dirs_np = set_var_dirs_np / set_var_norms
             # Normalized recon directions
@@ -1315,6 +1336,17 @@ def _run_stage_ab():
     ap.add_argument("--set_index", type=int, default=None)
     ap.add_argument("--stats_csv", type=str, default=getattr(cfg, "params_map_path", ""))
     ap.add_argument("--event_emb_csv", type=str, default="")
+    # Matching space for named reconstruction
+    ap.add_argument(
+        "--match_space",
+        type=str,
+        choices=["auto", "reduced", "original"],
+        default="auto",
+        help=(
+            "Space for named recon matching: 'reduced' uses reduced_dim if available; "
+            "'original' uses input_dim; 'auto' prefers 'reduced' when reducer exists."
+        ),
+    )
     # Per-variable scale audit (optional)
     ap.add_argument("--audit_var_scale", action="store_true", default=False, help="Run per-variable scale audit and scatter plot")
     ap.add_argument("--audit_partition", type=str, choices=["train", "valid", "test"], default="train", help="Dataset partition to audit")
