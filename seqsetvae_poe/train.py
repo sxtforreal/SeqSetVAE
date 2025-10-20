@@ -315,6 +315,13 @@ def _run_stage_b():
     parser.add_argument("--poe_beta_min", type=float, default=0.1)
     parser.add_argument("--poe_beta_max", type=float, default=3.0)
     parser.add_argument("--freeze_set_encoder", action="store_true", default=True)
+    # New: explicitly allow unfreezing the whole SetVAE encoder in Stage B
+    parser.add_argument(
+        "--no_freeze_set_encoder",
+        action="store_true",
+        default=False,
+        help="Do not freeze SetVAE encoder during Stage B (overrides --freeze_set_encoder)",
+    )
     parser.add_argument("--poe_mode", type=str, choices=["conditional", "naive"], default="conditional")
     # Recon weighting & partial unfreeze
     parser.add_argument("--recon_alpha", type=float, default=1.0)
@@ -328,8 +335,42 @@ def _run_stage_b():
     parser.add_argument("--sinkhorn_iters", type=int, default=100)
     parser.add_argument("--partial_unfreeze", action="store_true", default=False)
     parser.add_argument("--unfreeze_dim_reducer", action="store_true", default=False)
+    # New: automatically align reduced_dim with Stage A checkpoint if provided
+    parser.add_argument(
+        "--auto_match_reduced_dim",
+        action="store_true",
+        default=False,
+        help="If set, infer reduced_dim from Stage A checkpoint (or disable reducer if A had none)",
+    )
 
     args = parser.parse_args()
+
+    # Optional: auto-match reduced_dim to Stage A before constructing the model
+    if bool(getattr(args, "auto_match_reduced_dim", False)) and args.stageA_ckpt and os.path.isfile(args.stageA_ckpt):
+        try:
+            state_A = _load_state_dict_flex(args.stageA_ckpt)
+            src_prefix = _detect_setvae_prefix(list(state_A.keys()))
+            rd_key = f"{src_prefix}dim_reducer.weight" if src_prefix else ""
+            if rd_key and rd_key in state_A:
+                rd_A = int(state_A[rd_key].shape[0])
+                if rd_A > 0:
+                    try:
+                        print(f"[INFO] Auto-matching reduced_dim to Stage A: {args.reduced_dim} -> {rd_A}")
+                    except Exception:
+                        pass
+                    args.reduced_dim = rd_A
+            else:
+                # Stage A had no reducer; align by disabling reducer in B (set to input_dim)
+                try:
+                    print(f"[INFO] Stage A has no dim_reducer; auto-setting B reduced_dim to input_dim={int(args.input_dim)}")
+                except Exception:
+                    pass
+                args.reduced_dim = int(args.input_dim)
+        except Exception as e:
+            try:
+                print(f"[WARN] auto_match_reduced_dim failed: {e}")
+            except Exception:
+                pass
 
     dm = DataModule(
         saved_dir=args.data_dir,
@@ -369,7 +410,7 @@ def _run_stage_b():
         use_adaptive_poe=args.use_adaptive_poe,
         poe_beta_min=args.poe_beta_min,
         poe_beta_max=args.poe_beta_max,
-        freeze_set_encoder=args.freeze_set_encoder,
+        freeze_set_encoder=(False if bool(getattr(args, "no_freeze_set_encoder", False)) else bool(args.freeze_set_encoder)),
         poe_mode=args.poe_mode,
         recon_alpha=args.recon_alpha,
         recon_beta=args.recon_beta,
@@ -421,8 +462,9 @@ def _run_stage_b():
                         f"A {'has' if has_rd_A else 'no'} reducer{f' ({rd_A})' if rd_A is not None else ''}, "
                         f"B configured reduced_dim={'none' if rd_B is None else rd_B}.\n"
                         f"       Some SetVAE layers (e.g., dim_reducer/embed/out) may not load due to shape differences.\n"
-                        f"       For maximum reuse, consider running with --reduced_dim="
-                        f"{int(args.input_dim) if not has_rd_A else rd_A}."
+                        f"       For maximum reuse, consider --reduced_dim="
+                        f"{int(args.input_dim) if not has_rd_A else rd_A} or --auto_match_reduced_dim.\n"
+                        f"       If you must keep B's reduced_dim, consider --partial_unfreeze --unfreeze_dim_reducer or --no_freeze_set_encoder."
                     )
                     print(msg)
             except Exception:
