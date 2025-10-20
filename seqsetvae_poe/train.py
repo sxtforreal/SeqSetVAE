@@ -397,6 +397,38 @@ def _run_stage_b():
             target_model_state = model.state_dict()
             setvae_from_A = _remap_setvae_from_A_to_target(state_A, target_model_state, drop_flows=True)
 
+            # --- Compatibility advisory: detect Stage A reduced_dim vs current Stage B ---
+            try:
+                # Infer source SetVAE prefix in Stage A state
+                src_prefix = _detect_setvae_prefix(list(state_A.keys()))
+                # Heuristic: if Stage A used a dim_reducer, the weight exists under '<prefix>dim_reducer.weight'
+                rd_key = f"{src_prefix}dim_reducer.weight" if src_prefix else ""
+                has_rd_A = bool(rd_key and rd_key in state_A)
+                rd_A = int(state_A[rd_key].shape[0]) if has_rd_A else None
+                # Effective B reduced_dim: treat equal to input_dim (or non-positive) as no reducer
+                rd_B = None
+                try:
+                    if args.reduced_dim is not None:
+                        rd_val = int(args.reduced_dim)
+                        if rd_val > 0 and rd_val != int(args.input_dim):
+                            rd_B = rd_val
+                except Exception:
+                    rd_B = None
+                # Warn if mismatch; this impacts which SetVAE layers can be loaded by shape
+                if (has_rd_A and (rd_B is None or rd_A != rd_B)) or ((not has_rd_A) and (rd_B is not None)):
+                    msg = (
+                        f"[WARN] Stage A SetVAE dim_reducer mismatch: "
+                        f"A {'has' if has_rd_A else 'no'} reducer{f' ({rd_A})' if rd_A is not None else ''}, "
+                        f"B configured reduced_dim={'none' if rd_B is None else rd_B}.\n"
+                        f"       Some SetVAE layers (e.g., dim_reducer/embed/out) may not load due to shape differences.\n"
+                        f"       For maximum reuse, consider running with --reduced_dim="
+                        f"{int(args.input_dim) if not has_rd_A else rd_A}."
+                    )
+                    print(msg)
+            except Exception:
+                # Best-effort advisory only; ignore any detection errors
+                pass
+
             # Choose base to fuse into: provided init_ckpt if available, else current model state
             if base_state is None:
                 base_state = target_model_state
