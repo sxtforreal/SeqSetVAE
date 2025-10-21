@@ -95,6 +95,12 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         # Partial unfreezing options (when freeze_set_encoder=True)
         partial_unfreeze: bool = False,
         unfreeze_dim_reducer: bool = False,
+        # Stage A-style regularization to encourage dimension-wise utilization
+        kl_fairness_weight: float = 0.1,
+        kl_spread_tol: float = 1.0,
+        kl_over_weight: float = 1.0,
+        var_stability_weight: float = 0.01,
+        per_dim_free_bits: float = 0.002,
     ):
         super().__init__()
 
@@ -192,6 +198,12 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self._step = 0
         self.enable_next_change = enable_next_change
         self.next_change_weight = next_change_weight
+        # Stage A-style regularization weights
+        self.kl_fairness_weight = float(kl_fairness_weight)
+        self.kl_spread_tol = float(kl_spread_tol)
+        self.kl_over_weight = float(kl_over_weight)
+        self.var_stability_weight = float(var_stability_weight)
+        self.per_dim_free_bits = float(per_dim_free_bits)
         # Recon weights
         self.recon_alpha = float(recon_alpha)
         self.recon_beta = float(recon_beta)
@@ -206,6 +218,8 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         self.recon_amp_weight = 1.0
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
+        # Auto-unfreeze set encoder after first epoch for merged Stage B schedule
+        self._did_auto_unfreeze = False
 
         # Task C head: predict whether next set contains any new (non-carry) event
         if enable_next_change:
@@ -340,6 +354,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         beta_gate_list: list[torch.Tensor] = []
         next_change_loss = torch.tensor(0.0, device=device)
         next_change_targets = []
+        # For fairness & stability
+        kl_dim_sum = torch.zeros(self.latent_dim, device=device)
+        var_dev_sum = torch.tensor(0.0, device=device)
 
         # encode per set: q_x(z|x)
         for i, s in enumerate(sets):
@@ -428,12 +445,25 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 )
             mu_post_buf[:, t, :] = mu_post_t
             logvar_post_buf[:, t, :] = logvar_post_t
-            # KL(q_post || p_prior)
-            kl_t = self._kl_diag_gauss(mu_post_t, logvar_post_t, mu_p_t, logvar_p_t)  # [B]
-            # Free bits per step
-            min_kl = self.free_bits * self.latent_dim
-            kl_t = torch.clamp(kl_t, min=min_kl)
+            # KL(q_post || p_prior) per-dimension
+            var_q = logvar_post_t.exp()
+            var_p = logvar_p_t.exp()
+            kld_dim = 0.5 * (
+                (logvar_p_t - logvar_post_t)
+                + (var_q / (var_p + 1e-8))
+                + ((mu_p_t - mu_post_t) ** 2) / (var_p + 1e-8)
+                - 1.0
+            ).squeeze(0)  # [D]
+            # Per-dimension free bits
+            if self.per_dim_free_bits is not None and self.per_dim_free_bits > 0.0:
+                kld_dim = torch.clamp(kld_dim, min=self.per_dim_free_bits)
+            # Sum over dims for the step scalar KL
+            kl_t = kld_dim.sum(dim=-1, keepdim=False)  # []
             kl_list.append(kl_t)
+            # Accumulate per-dim KL for fairness (averaged later over steps)
+            kl_dim_sum = kl_dim_sum + kld_dim
+            # Variance stability: penalize posterior variance deviating from 1
+            var_dev_sum = var_dev_sum + (var_q - 1.0).pow(2).mean()
             if beta_t is not None:
                 beta_gate_list.append(beta_t.squeeze(-1))
             # Update GRU state with posterior mean and time embedding
@@ -446,7 +476,14 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         mu_post = mu_post_buf
         logvar_post = logvar_post_buf
         h_seq = h_seq_buf
-        kl_total = torch.stack(kl_list, dim=1).mean() if len(kl_list) > 0 else torch.tensor(0.0, device=device)
+        kl_total = torch.stack(kl_list, dim=0).mean() if len(kl_list) > 0 else torch.tensor(0.0, device=device)
+        # Average per-dim KL over steps
+        if len(kl_list) > 0:
+            kl_dim_mean = kl_dim_sum / float(len(kl_list))
+            var_dev_mean = var_dev_sum / float(len(kl_list))
+        else:
+            kl_dim_mean = torch.zeros(self.latent_dim, device=device)
+            var_dev_mean = torch.tensor(0.0, device=device)
 
         # Task C: next-step change prediction using h_t
         if self.enable_next_change and S > 1:
@@ -482,7 +519,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             sinkhorn_iters=self.sinkhorn_iters,
             )
         recon_total = recon_total / max(1, S)
-        return recon_total, kl_total, next_change_loss
+        return recon_total, kl_total, next_change_loss, kl_dim_mean, var_dev_mean
 
     def forward(self, batch):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
@@ -493,26 +530,48 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         # split into sets per patient
         all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
         total_recon, total_kl, total_c, count = 0.0, 0.0, 0.0, 0
+        kl_dim_sum = None
+        var_dev_sum = 0.0
         for sets in all_sets:
-            recon, kl, next_c = self._forward_single(sets)
+            recon, kl, next_c, kl_dim_vec, var_dev = self._forward_single(sets)
             total_recon += recon
             total_kl += kl
             total_c += next_c
+            if kl_dim_sum is None:
+                kl_dim_sum = kl_dim_vec
+            else:
+                kl_dim_sum = kl_dim_sum + kl_dim_vec
+            var_dev_sum = var_dev_sum + var_dev
             count += 1
         if count == 0:
             device = var.device
             zero = torch.tensor(0.0, device=device)
-            return zero, zero, zero
-        return total_recon / count, total_kl / count, total_c / count
+            return zero, zero, zero, torch.zeros(self.latent_dim, device=device), zero
+        kl_dim_mean = kl_dim_sum / float(max(1, count)) if kl_dim_sum is not None else torch.zeros(self.latent_dim, device=var.device)
+        var_dev_mean = var_dev_sum / float(max(1, count))
+        return total_recon / count, total_kl / count, total_c / count, kl_dim_mean, var_dev_mean
 
     # training hooks
     def training_step(self, batch, batch_idx):
-        recon, kl, next_c = self.forward(batch)
+        recon, kl, next_c, kl_dim, var_dev = self.forward(batch)
         beta = self._beta()
         # Capacity annealing (Stage A style): penalize when KL is BELOW capacity
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         kl_objective = F.relu(cap - kl)
-        total = recon + beta * kl_objective + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        # KL fairness: encourage spread across dimensions (normalized distribution close to uniform)
+        fairness = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if kl_dim is not None and kl_dim.numel() > 0 and float(kl_dim.sum().detach().cpu().item()) > 0.0:
+            eps = 1e-8
+            D = float(self.latent_dim)
+            p = kl_dim / (kl_dim.sum() + eps)
+            uniform_log = math.log(1.0 / max(1.0, D))
+            kl_to_uniform = (p * (torch.log(p + eps) - uniform_log)).sum()
+            over = F.relu(p - (1.0 / D) * (1.0 + self.kl_spread_tol))
+            l2_over = (over ** 2).sum()
+            fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
+        # Variance stability
+        var_pen = self.var_stability_weight * var_dev
+        total = recon + beta * kl_objective + fairness + var_pen + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
         log_dict = {
             "train_loss": total,
             "train_recon": recon,
@@ -520,6 +579,8 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             "train_kl_obj": kl_objective,
             "train_beta": beta,
             "train_capacity": cap,
+            "train_kl_fair": fairness,
+            "train_var_pen": var_pen,
         }
         if self.enable_next_change:
             log_dict["train_next_change"] = next_c
@@ -528,12 +589,23 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         return total
 
     def validation_step(self, batch, batch_idx):
-        recon, kl, next_c = self.forward(batch)
+        recon, kl, next_c, kl_dim, var_dev = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         kl_objective = F.relu(cap - kl)
-        total = recon + beta * kl_objective + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
-        log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap}
+        fairness = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if kl_dim is not None and kl_dim.numel() > 0 and float(kl_dim.sum().detach().cpu().item()) > 0.0:
+            eps = 1e-8
+            D = float(self.latent_dim)
+            p = kl_dim / (kl_dim.sum() + eps)
+            uniform_log = math.log(1.0 / max(1.0, D))
+            kl_to_uniform = (p * (torch.log(p + eps) - uniform_log)).sum()
+            over = F.relu(p - (1.0 / D) * (1.0 + self.kl_spread_tol))
+            l2_over = (over ** 2).sum()
+            fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
+        var_pen = self.var_stability_weight * var_dev
+        total = recon + beta * kl_objective + fairness + var_pen + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap, "val_kl_fair": fairness, "val_var_pen": var_pen}
         if self.enable_next_change:
             log_dict["val_next_change"] = next_c
         self.log_dict(log_dict, prog_bar=True, on_epoch=True)
@@ -565,6 +637,19 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         should_step = ((batch_idx + 1) % max(1, accumulate) == 0) or is_last_batch
         if should_step:
             self._manual_scheduler.step()
+
+    def on_train_epoch_end(self):
+        """Auto-unfreeze the SetVAE encoder after the first epoch to merge B1/B2."""
+        try:
+            epoch = int(getattr(self, "current_epoch", 0))
+        except Exception:
+            epoch = 0
+        if not self._did_auto_unfreeze and epoch >= 0:
+            # Unfreeze after completing epoch 0
+            if any((not p.requires_grad) for p in self.set_encoder.parameters()):
+                for p in self.set_encoder.parameters():
+                    p.requires_grad = True
+            self._did_auto_unfreeze = True
 
     # -------- Dynamic evaluation helpers (used by evaluate.py) --------
     @torch.no_grad()
@@ -1454,7 +1539,6 @@ class MortalityClassifier(pl.LightningModule):
         poe_model: 'PoESeqSetVAEPretrain',
         latent_dim: int,
         mu_proj_dim: int = 64,
-        logvar_proj_dim: int = 32,
         scalar_proj_dim: int = 16,
         gru_hidden: int = 128,
         gru_layers: int = 2,
@@ -1469,12 +1553,12 @@ class MortalityClassifier(pl.LightningModule):
             p.requires_grad = False
         self.latent_dim = latent_dim
         self.mu_proj = nn.Sequential(nn.Linear(latent_dim, mu_proj_dim), nn.GELU())
-        self.logvar_proj = nn.Sequential(nn.Linear(latent_dim, logvar_proj_dim), nn.GELU())
-        self.scalar_in_dim = 7
+        # Slightly rich, simplified scalar feature set: [KL_scalar, log1p(Δt)]
+        self.scalar_in_dim = 2
         self.scalar_proj = nn.Sequential(
             nn.Linear(self.scalar_in_dim, 32), nn.GELU(), nn.Linear(32, scalar_proj_dim)
         )
-        feat_dim = mu_proj_dim + logvar_proj_dim + scalar_proj_dim
+        feat_dim = mu_proj_dim + scalar_proj_dim
         self.gru = nn.GRU(
             input_size=feat_dim,
             hidden_size=gru_hidden,
@@ -1517,8 +1601,6 @@ class MortalityClassifier(pl.LightningModule):
         mu_qx_list: List[torch.Tensor] = []
         logvar_qx_list: List[torch.Tensor] = []
         enc_aggs: List[torch.Tensor] = []
-        set_sizes: List[int] = []
-        has_changes: List[float] = []
         set_times: List[torch.Tensor] = []
         for s in sets:
             var, val = s["var"], s["val"]
@@ -1530,8 +1612,6 @@ class MortalityClassifier(pl.LightningModule):
                 enc_aggs.append(enc_tokens.mean(dim=1))
             else:
                 enc_aggs.append(mu_qx)
-            set_sizes.append(int(var.size(1)))
-            has_changes.append(float(s.get("has_change", torch.tensor(0.0)).item()))
             set_times.append(s["set_time"])  # [1]
 
         mu_qx = torch.stack(mu_qx_list, dim=1).to(device)
@@ -1580,18 +1660,13 @@ class MortalityClassifier(pl.LightningModule):
             kl_scalar = kld.sum(dim=-1, keepdim=True)
 
             mu_feat = self.mu_proj(mu_post_t)
-            logv_feat = self.logvar_proj(logvar_post_t)
+            # Simplified scalar features: KL_scalar and log1p(Δt)
             scalar_feat = torch.cat([
-                d2,
-                torch.abs(delta_H),
                 kl_scalar,
-                beta_t,
-                torch.log1p(torch.tensor([[float(set_sizes[t])]], device=device)),
-                torch.tensor([[has_changes[t]]], device=device),
                 log_dt1p,
             ], dim=-1)
             scalar_feat = self.scalar_proj(scalar_feat)
-            feat_t = torch.cat([mu_feat, logv_feat, scalar_feat], dim=-1).squeeze(0)
+            feat_t = torch.cat([mu_feat, scalar_feat], dim=-1).squeeze(0)
             feat_rows.append(feat_t)
 
             h = self.poe.gru_cell(mu_post_t + time_emb[:, t, :], h)
@@ -1615,7 +1690,11 @@ class MortalityClassifier(pl.LightningModule):
             feats.append(X_i)
             masks.append(m_i)
         maxS = max((x.shape[0] for x in feats), default=0)
-        feat_dim = feats[0].shape[1] if len(feats) > 0 and feats[0].ndim == 2 and feats[0].shape[0] > 0 else (self.mu_proj[0].out_features + self.logvar_proj[0].out_features + self.scalar_proj[-1].out_features)
+        feat_dim = (
+            feats[0].shape[1]
+            if len(feats) > 0 and feats[0].ndim == 2 and feats[0].shape[0] > 0
+            else (self.mu_proj[0].out_features + self.scalar_proj[-1].out_features)
+        )
         X_pad = torch.zeros(B, maxS, feat_dim, device=var.device)
         M = torch.zeros(B, maxS, dtype=torch.bool, device=var.device)
         for b in range(B):

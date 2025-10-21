@@ -271,12 +271,13 @@ def _run_stage_a():
 
 
 def _run_stage_b():
-    parser = argparse.ArgumentParser(description="Stage B - PoE+GRU pretraining")
+    parser = argparse.ArgumentParser(description="Stage B - PoE+GRU pretraining (merged B1/B2)")
     # Data & loader
     parser.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
     parser.add_argument("--params_map_path", type=str, default=getattr(cfg, "params_map_path", ""))
     parser.add_argument("--batch_size", type=int, default=getattr(cfg, "batch_size", 4))
     parser.add_argument("--max_epochs", type=int, default=50)
+    parser.add_argument("--freeze_epochs", type=int, default=1, help="#epochs to keep SetVAE encoder frozen before unfreezing")
     parser.add_argument("--num_workers", type=int, default=getattr(cfg, "num_workers", 4))
     parser.add_argument("--precision", type=str, default="16-mixed")
     parser.add_argument("--smoke", action="store_true")
@@ -316,6 +317,12 @@ def _run_stage_b():
     parser.add_argument("--poe_beta_max", type=float, default=3.0)
     parser.add_argument("--freeze_set_encoder", action="store_true", default=True)
     parser.add_argument("--poe_mode", type=str, choices=["conditional", "naive"], default="conditional")
+    # Stage A-style regularizers to mitigate dimension concentration
+    parser.add_argument("--kl_fairness_weight", type=float, default=0.1)
+    parser.add_argument("--kl_spread_tol", type=float, default=1.0)
+    parser.add_argument("--kl_over_weight", type=float, default=1.0)
+    parser.add_argument("--var_stability_weight", type=float, default=0.01)
+    parser.add_argument("--per_dim_free_bits", type=float, default=0.002)
     # Recon weighting & partial unfreeze
     parser.add_argument("--recon_alpha", type=float, default=1.0)
     parser.add_argument("--recon_beta", type=float, default=6.0)
@@ -379,8 +386,13 @@ def _run_stage_b():
         use_sinkhorn=bool(args.use_sinkhorn),
         sinkhorn_eps=args.sinkhorn_eps,
         sinkhorn_iters=args.sinkhorn_iters,
-        partial_unfreeze=bool(args.partial_unfreeze),
-        unfreeze_dim_reducer=bool(args.unfreeze_dim_reducer),
+        partial_unfreeze=False,
+        unfreeze_dim_reducer=False,
+        kl_fairness_weight=float(args.kl_fairness_weight),
+        kl_spread_tol=float(args.kl_spread_tol),
+        kl_over_weight=float(args.kl_over_weight),
+        var_stability_weight=float(args.var_stability_weight),
+        per_dim_free_bits=float(args.per_dim_free_bits),
     )
 
     # Default behavior: if --stageA_ckpt provided, merge its SetVAE weights into initializer (or model state)
@@ -467,7 +479,7 @@ def _run_stage_b():
                 print(f"Failed to initialize from init_ckpt: {e}")
 
     out_root = args.output_dir if args.output_dir else "./output"
-    stage_name = "Stage_B2" if bool(args.partial_unfreeze) else "Stage_B1"
+    stage_name = "Stage_B"
     project_dir = os.path.join(out_root, stage_name)
     os.makedirs(project_dir, exist_ok=True)
     try:
@@ -481,6 +493,10 @@ def _run_stage_b():
     ckpt = ModelCheckpoint(save_top_k=1, monitor="val_loss", mode="min", filename="poe_GRU_PT", dirpath=ckpt_dir)
     early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
     lrmon = LearningRateMonitor(logging_interval="step")
+    # Enable manual unfreeze after --freeze_epochs by setting an initial freeze and relying on model's on_train_epoch_end
+    if args.freeze_set_encoder:
+        for p in model.set_encoder.parameters():
+            p.requires_grad = False
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         precision=args.precision,
@@ -530,7 +546,6 @@ def _run_stage_c():
         poe_model=poe,
         latent_dim=getattr(cfg, "latent_dim", 128),
         mu_proj_dim=64,
-        logvar_proj_dim=32,
         scalar_proj_dim=16,
         gru_hidden=128,
         gru_layers=2,
