@@ -566,6 +566,237 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         if should_step:
             self._manual_scheduler.step()
 
+    # -------- Dynamic evaluation helpers (used by evaluate.py) --------
+    @torch.no_grad()
+    def _compute_kl_dim_stats(self, batch: dict) -> torch.Tensor:
+        """Compute per-dimension KL(q_post || p_prior) averaged over sets.
+
+        This mirrors the GRU prior + (conditional) PoE posterior used during training,
+        but returns a [D]-vector averaged over all sets in the batch.
+        """
+        var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
+        padding_mask = batch.get("padding_mask", None)
+        carry_mask = batch.get("carry_mask", None)
+        all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
+
+        device = var.device
+        latent_dim = int(getattr(self, "latent_dim", 128))
+        kl_dim_sum = torch.zeros(latent_dim, device=device)
+        count = 0
+
+        for sets in all_sets:
+            S = len(sets)
+            if S == 0:
+                continue
+            # Encode per-set posteriors from SetVAE encoder (q_x)
+            mu_qx_list: list[torch.Tensor] = []
+            logvar_qx_list: list[torch.Tensor] = []
+            set_aggs: list[torch.Tensor] = []
+            pos_list: list[torch.Tensor] = []
+            for s in sets:
+                z_list_enc, enc_tokens = self.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+                _z, mu_qx, logvar_qx = z_list_enc[-1]
+                mu_qx_list.append(mu_qx.squeeze(1))       # [1,D]
+                logvar_qx_list.append(logvar_qx.squeeze(1))  # [1,D]
+                pos_list.append(s["set_time"].float())
+                if self.poe_mode == "conditional":
+                    set_aggs.append(enc_tokens.mean(dim=1) if enc_tokens is not None else mu_qx)
+
+            mu_qx = torch.stack(mu_qx_list, dim=1)  # [1,S,D]
+            logvar_qx = torch.stack(logvar_qx_list, dim=1)  # [1,S,D]
+            minutes_seq = torch.stack(pos_list, dim=1)
+            if minutes_seq.dim() == 1:
+                minutes_seq = minutes_seq.unsqueeze(0)
+
+            # Step GRU prior and form PoE posterior
+            B = 1
+            h = torch.zeros(B, self.latent_dim, device=device)
+            time_emb = self._relative_time_bucket_embedding(minutes_seq)  # [1,S,D]
+            if self.poe_mode == "conditional":
+                set_aggs_t = torch.stack([set_aggs[t] for t in range(S)], dim=1)  # [1,S,D]
+
+            for t in range(S):
+                prior_params_t = self.prior_head(h)
+                mu_p_t, logvar_p_t = prior_params_t.chunk(2, dim=-1)  # [1,D]
+
+                # Adaptive PoE gate
+                beta_t = None
+                if self.use_adaptive_poe:
+                    mu_qx_t = mu_qx[:, t, :]
+                    logvar_qx_t = logvar_qx[:, t, :]
+                    var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
+                    d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)  # [1,1]
+                    delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)      # [1,1]
+                    dt = minutes_seq[:, t : t + 1] - (minutes_seq[:, t - 1 : t] if t > 0 else minutes_seq[:, t : t + 1])
+                    log_dt1p = torch.log1p(dt.clamp(min=0.0))
+                    gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
+                    beta_t = self.poe_beta_min + (self.poe_beta_max - self.poe_beta_min) * torch.sigmoid(self.obs_gate(gate_inp))
+
+                if self.poe_mode == "conditional":
+                    set_agg_t = set_aggs_t[:, t, :]
+                    like_inp = torch.cat([set_agg_t, mu_p_t, logvar_p_t], dim=-1)
+                    like_out = self.like_head(like_inp)
+                    log_prec_like_t, h_like_t = like_out.chunk(2, dim=-1)
+                    prec_like_t = F.softplus(log_prec_like_t) + 1e-4  # [1,D]
+                    Lambda_p_t = torch.exp(-logvar_p_t)
+                    if beta_t is not None:
+                        prec_like_t = prec_like_t * beta_t
+                        h_like_t = h_like_t * beta_t
+                    Lambda_post_t = Lambda_p_t + prec_like_t
+                    h_post_t = Lambda_p_t * mu_p_t + h_like_t
+                    mu_post_t = h_post_t / (Lambda_post_t + 1e-8)
+                    logvar_post_t = -torch.log(Lambda_post_t + 1e-8)
+                else:
+                    mu_post_t, logvar_post_t = self._poe(
+                        mu_qx[:, t, :], logvar_qx[:, t, :], mu_p_t, logvar_p_t, beta_t
+                    )
+
+                # Per-dimension KL(q_post || p_prior)
+                var_q = logvar_post_t.exp()
+                var_p = logvar_p_t.exp()
+                kld_dim = 0.5 * (
+                    (logvar_p_t - logvar_post_t)
+                    + (var_q / (var_p + 1e-8))
+                    + ((mu_p_t - mu_post_t) ** 2) / (var_p + 1e-8)
+                    - 1.0
+                ).squeeze(0)  # [D]
+                kl_dim_sum = kl_dim_sum + kld_dim
+                count += 1
+
+                # Update state
+                h = self.gru_cell(mu_post_t + time_emb[:, t, :], h)
+
+        if count <= 0:
+            return torch.zeros(latent_dim, device=var.device)
+        return kl_dim_sum / float(count)
+
+    @torch.no_grad()
+    def dynamic_posterior_for_sets(self, sets: list[dict]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (mu_post_seq, logvar_post_seq) for a single patient's list of sets.
+
+        Shapes: both tensors are [S, D].
+        """
+        device = next(self.parameters()).device
+        S = len(sets)
+        if S == 0:
+            D = int(getattr(self, "latent_dim", 128))
+            return torch.zeros(0, D, device=device), torch.zeros(0, D, device=device)
+
+        mu_qx_list: list[torch.Tensor] = []
+        logvar_qx_list: list[torch.Tensor] = []
+        set_aggs: list[torch.Tensor] = []
+        pos_list: list[torch.Tensor] = []
+        for s in sets:
+            z_list_enc, enc_tokens = self.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+            _z, mu_qx, logvar_qx = z_list_enc[-1]
+            mu_qx_list.append(mu_qx.squeeze(1))
+            logvar_qx_list.append(logvar_qx.squeeze(1))
+            pos_list.append(s["set_time"].float())
+            if self.poe_mode == "conditional":
+                set_aggs.append(enc_tokens.mean(dim=1) if enc_tokens is not None else mu_qx)
+
+        mu_qx = torch.stack(mu_qx_list, dim=1)  # [1,S,D]
+        logvar_qx = torch.stack(logvar_qx_list, dim=1)  # [1,S,D]
+        minutes_seq = torch.stack(pos_list, dim=1)
+        if minutes_seq.dim() == 1:
+            minutes_seq = minutes_seq.unsqueeze(0)
+
+        B = 1
+        h = torch.zeros(B, self.latent_dim, device=device)
+        time_emb = self._relative_time_bucket_embedding(minutes_seq)
+        if self.poe_mode == "conditional":
+            set_aggs_t = torch.stack([set_aggs[t] for t in range(S)], dim=1)  # [1,S,D]
+
+        mu_posts: list[torch.Tensor] = []
+        logvar_posts: list[torch.Tensor] = []
+        for t in range(S):
+            prior_params_t = self.prior_head(h)
+            mu_p_t, logvar_p_t = prior_params_t.chunk(2, dim=-1)
+            beta_t = None
+            if self.use_adaptive_poe:
+                mu_qx_t = mu_qx[:, t, :]
+                logvar_qx_t = logvar_qx[:, t, :]
+                var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
+                d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)
+                delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)
+                dt = minutes_seq[:, t : t + 1] - (minutes_seq[:, t - 1 : t] if t > 0 else minutes_seq[:, t : t + 1])
+                log_dt1p = torch.log1p(dt.clamp(min=0.0))
+                gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
+                beta_t = self.poe_beta_min + (self.poe_beta_max - self.poe_beta_min) * torch.sigmoid(self.obs_gate(gate_inp))
+
+            if self.poe_mode == "conditional":
+                set_agg_t = set_aggs_t[:, t, :]
+                like_inp = torch.cat([set_agg_t, mu_p_t, logvar_p_t], dim=-1)
+                like_out = self.like_head(like_inp)
+                log_prec_like_t, h_like_t = like_out.chunk(2, dim=-1)
+                prec_like_t = F.softplus(log_prec_like_t) + 1e-4
+                Lambda_p_t = torch.exp(-logvar_p_t)
+                if beta_t is not None:
+                    prec_like_t = prec_like_t * beta_t
+                    h_like_t = h_like_t * beta_t
+                Lambda_post_t = Lambda_p_t + prec_like_t
+                h_post_t = Lambda_p_t * mu_p_t + h_like_t
+                mu_post_t = h_post_t / (Lambda_post_t + 1e-8)
+                logvar_post_t = -torch.log(Lambda_post_t + 1e-8)
+            else:
+                mu_post_t, logvar_post_t = self._poe(
+                    mu_qx[:, t, :], logvar_qx[:, t, :], mu_p_t, logvar_p_t, beta_t
+                )
+
+            mu_posts.append(mu_post_t.squeeze(0))
+            logvar_posts.append(logvar_post_t.squeeze(0))
+            h = self.gru_cell(mu_post_t + time_emb[:, t, :], h)
+
+        mu_seq = torch.stack(mu_posts, dim=0)        # [S,D]
+        logvar_seq = torch.stack(logvar_posts, dim=0)  # [S,D]
+        return mu_seq, logvar_seq
+
+    @torch.no_grad()
+    def dynamic_reconstruct_for_sets(self, sets: list[dict]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (orig, recon) for a patient's sets using the dynamic decoder.
+
+        - orig: concatenated target_x across sets, shape [sum_t N_t, R]
+        - recon: concatenated decoder outputs per set-time, same shape as orig
+        """
+        device = next(self.parameters()).device
+        S = len(sets)
+        if S == 0:
+            return torch.zeros(0, int(getattr(self, "reduced_dim", getattr(self, "input_dim", 0))), device=device), \
+                   torch.zeros(0, int(getattr(self, "reduced_dim", getattr(self, "input_dim", 0))), device=device)
+
+        # Compute dynamic posteriors and hidden sequence
+        mu_seq, logvar_seq = self.dynamic_posterior_for_sets(sets)  # [S,D] each
+        # Recreate GRU hidden states using the same progression
+        minutes_seq = torch.stack([s["set_time"].float() for s in sets], dim=1)
+        if minutes_seq.dim() == 1:
+            minutes_seq = minutes_seq.unsqueeze(0)
+        B = 1
+        h = torch.zeros(B, self.latent_dim, device=device)
+        time_emb = self._relative_time_bucket_embedding(minutes_seq)
+
+        orig_list: list[torch.Tensor] = []
+        recon_list: list[torch.Tensor] = []
+        for t, s in enumerate(sets):
+            # Target in reduced space
+            if self.set_encoder.dim_reducer is not None:
+                reduced = self.set_encoder.dim_reducer(s["var"])  # [1,N,R]
+            else:
+                reduced = s["var"]
+            norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+            reduced_normalized = reduced / (norms + 1e-8)
+            target_x = reduced_normalized * s["val"]  # [1,N,R]
+            orig_list.append(target_x.squeeze(0))
+
+            # Hidden update and reconstruction
+            mu_post_t = mu_seq[t : t + 1, :]
+            h = self.gru_cell(mu_post_t, h + time_emb[:, t, :])
+            recon_t = self.decoder(h, target_x.size(1), noise_std=0.0)  # [1,N,R]
+            recon_list.append(recon_t.squeeze(0))
+
+        orig = torch.cat(orig_list, dim=0) if len(orig_list) > 0 else torch.zeros(0, device=device)
+        recon = torch.cat(recon_list, dim=0) if len(recon_list) > 0 else torch.zeros(0, device=device)
+        return orig, recon
+
 
 class SetVAEOnlyPretrain(pl.LightningModule):
     """
