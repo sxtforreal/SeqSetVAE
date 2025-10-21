@@ -530,7 +530,6 @@ def _run_stage_c():
         poe_model=poe,
         latent_dim=getattr(cfg, "latent_dim", 128),
         mu_proj_dim=64,
-        logvar_proj_dim=32,
         scalar_proj_dim=16,
         gru_hidden=128,
         gru_layers=2,

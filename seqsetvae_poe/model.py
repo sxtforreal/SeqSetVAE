@@ -1454,7 +1454,6 @@ class MortalityClassifier(pl.LightningModule):
         poe_model: 'PoESeqSetVAEPretrain',
         latent_dim: int,
         mu_proj_dim: int = 64,
-        logvar_proj_dim: int = 32,
         scalar_proj_dim: int = 16,
         gru_hidden: int = 128,
         gru_layers: int = 2,
@@ -1469,12 +1468,12 @@ class MortalityClassifier(pl.LightningModule):
             p.requires_grad = False
         self.latent_dim = latent_dim
         self.mu_proj = nn.Sequential(nn.Linear(latent_dim, mu_proj_dim), nn.GELU())
-        self.logvar_proj = nn.Sequential(nn.Linear(latent_dim, logvar_proj_dim), nn.GELU())
-        self.scalar_in_dim = 7
+        # Slightly rich, simplified scalar feature set: [KL_scalar, log1p(Δt)]
+        self.scalar_in_dim = 2
         self.scalar_proj = nn.Sequential(
             nn.Linear(self.scalar_in_dim, 32), nn.GELU(), nn.Linear(32, scalar_proj_dim)
         )
-        feat_dim = mu_proj_dim + logvar_proj_dim + scalar_proj_dim
+        feat_dim = mu_proj_dim + scalar_proj_dim
         self.gru = nn.GRU(
             input_size=feat_dim,
             hidden_size=gru_hidden,
@@ -1517,8 +1516,6 @@ class MortalityClassifier(pl.LightningModule):
         mu_qx_list: List[torch.Tensor] = []
         logvar_qx_list: List[torch.Tensor] = []
         enc_aggs: List[torch.Tensor] = []
-        set_sizes: List[int] = []
-        has_changes: List[float] = []
         set_times: List[torch.Tensor] = []
         for s in sets:
             var, val = s["var"], s["val"]
@@ -1530,8 +1527,6 @@ class MortalityClassifier(pl.LightningModule):
                 enc_aggs.append(enc_tokens.mean(dim=1))
             else:
                 enc_aggs.append(mu_qx)
-            set_sizes.append(int(var.size(1)))
-            has_changes.append(float(s.get("has_change", torch.tensor(0.0)).item()))
             set_times.append(s["set_time"])  # [1]
 
         mu_qx = torch.stack(mu_qx_list, dim=1).to(device)
@@ -1580,18 +1575,13 @@ class MortalityClassifier(pl.LightningModule):
             kl_scalar = kld.sum(dim=-1, keepdim=True)
 
             mu_feat = self.mu_proj(mu_post_t)
-            logv_feat = self.logvar_proj(logvar_post_t)
+            # Simplified scalar features: KL_scalar and log1p(Δt)
             scalar_feat = torch.cat([
-                d2,
-                torch.abs(delta_H),
                 kl_scalar,
-                beta_t,
-                torch.log1p(torch.tensor([[float(set_sizes[t])]], device=device)),
-                torch.tensor([[has_changes[t]]], device=device),
                 log_dt1p,
             ], dim=-1)
             scalar_feat = self.scalar_proj(scalar_feat)
-            feat_t = torch.cat([mu_feat, logv_feat, scalar_feat], dim=-1).squeeze(0)
+            feat_t = torch.cat([mu_feat, scalar_feat], dim=-1).squeeze(0)
             feat_rows.append(feat_t)
 
             h = self.poe.gru_cell(mu_post_t + time_emb[:, t, :], h)
@@ -1615,7 +1605,11 @@ class MortalityClassifier(pl.LightningModule):
             feats.append(X_i)
             masks.append(m_i)
         maxS = max((x.shape[0] for x in feats), default=0)
-        feat_dim = feats[0].shape[1] if len(feats) > 0 and feats[0].ndim == 2 and feats[0].shape[0] > 0 else (self.mu_proj[0].out_features + self.logvar_proj[0].out_features + self.scalar_proj[-1].out_features)
+        feat_dim = (
+            feats[0].shape[1]
+            if len(feats) > 0 and feats[0].ndim == 2 and feats[0].shape[0] > 0
+            else (self.mu_proj[0].out_features + self.scalar_proj[-1].out_features)
+        )
         X_pad = torch.zeros(B, maxS, feat_dim, device=var.device)
         M = torch.zeros(B, maxS, dtype=torch.bool, device=var.device)
         for b in range(B):
