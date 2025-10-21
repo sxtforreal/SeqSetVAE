@@ -509,9 +509,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         recon, kl, next_c = self.forward(batch)
         beta = self._beta()
-        # Capacity annealing: encourage KL to reach target capacity
+        # Capacity annealing (Stage A style): penalize when KL is BELOW capacity
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.clamp(kl - cap, min=0.0)
+        kl_objective = F.relu(cap - kl)
         total = recon + beta * kl_objective + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
         log_dict = {
             "train_loss": total,
@@ -531,7 +531,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         recon, kl, next_c = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
-        kl_objective = torch.clamp(kl - cap, min=0.0)
+        kl_objective = F.relu(cap - kl)
         total = recon + beta * kl_objective + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
         log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap}
         if self.enable_next_change:
