@@ -615,8 +615,134 @@ def collect_mu_var_heatmaps(
 
 
 @torch.no_grad()
+def _collect_recon_events_poe_from_sets(
+    model: torch.nn.Module, sets: List[Dict[str, torch.Tensor]]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Collect original and reconstruction arrays using PoE dynamics + decoder.
+
+    This mirrors the PoE model's temporal prior and posterior fusion, decoding
+    each set from the evolving hidden state h_t. Returns (orig, recon) in the
+    reduced/input space expected by compute_recon_metrics.
+    """
+    # Validate minimal PoE attributes
+    if not hasattr(model, "set_encoder") or not hasattr(model, "decoder") or not hasattr(model, "prior_head"):
+        return np.zeros((0, 0), dtype=np.float32), np.zeros((0, 0), dtype=np.float32)
+
+    device = next(model.parameters()).device
+
+    # Pre-encode per-set q_x(z|x)
+    mu_qx_list: List[torch.Tensor] = []
+    logvar_qx_list: List[torch.Tensor] = []
+    set_aggs: List[torch.Tensor] = []
+    pos_list: List[torch.Tensor] = []
+    for s in sets:
+        z_list_enc, enc_tokens = model.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+        _z, mu_qx, logvar_qx = z_list_enc[-1]
+        mu_qx_list.append(mu_qx.squeeze(1))       # [1,D]
+        logvar_qx_list.append(logvar_qx.squeeze(1))  # [1,D]
+        pos_list.append(s["set_time"].float())
+        if getattr(model, "poe_mode", "conditional") == "conditional":
+            set_aggs.append(enc_tokens.mean(dim=1) if enc_tokens is not None else mu_qx)
+
+    if not mu_qx_list:
+        return np.zeros((0, 0), dtype=np.float32), np.zeros((0, 0), dtype=np.float32)
+
+    mu_qx = torch.stack(mu_qx_list, dim=1)  # [1,S,D]
+    logvar_qx = torch.stack(logvar_qx_list, dim=1)  # [1,S,D]
+    minutes_seq = torch.stack(pos_list, dim=1)
+    if minutes_seq.dim() == 1:
+        minutes_seq = minutes_seq.unsqueeze(0)
+
+    B = 1
+    latent_dim = int(getattr(model, "latent_dim", mu_qx.size(-1)))
+    h = torch.zeros(B, latent_dim, device=device)
+    time_emb = model._relative_time_bucket_embedding(minutes_seq) if hasattr(model, "_relative_time_bucket_embedding") else torch.zeros_like(mu_qx)
+    if getattr(model, "poe_mode", "conditional") == "conditional" and set_aggs:
+        set_aggs_t = torch.stack([set_aggs[t] for t in range(mu_qx.size(1))], dim=1)  # [1,S,D]
+
+    orig_cat: List[np.ndarray] = []
+    recon_cat: List[np.ndarray] = []
+
+    # Step through sets
+    S = mu_qx.size(1)
+    for t in range(S):
+        prior_params_t = model.prior_head(h)
+        mu_p_t, logvar_p_t = prior_params_t.chunk(2, dim=-1)  # [1,D]
+
+        # Optional adaptive observation gate
+        beta_t = None
+        if getattr(model, "use_adaptive_poe", False):
+            mu_qx_t = mu_qx[:, t, :]
+            logvar_qx_t = logvar_qx[:, t, :]
+            var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
+            d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)
+            delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)
+            if minutes_seq.size(1) > 0:
+                dt = minutes_seq[:, t : t + 1] - (minutes_seq[:, t - 1 : t] if t > 0 else minutes_seq[:, t : t + 1])
+            else:
+                dt = torch.zeros_like(d2)
+            log_dt1p = torch.log1p(dt.clamp(min=0.0))
+            if hasattr(model, "obs_gate"):
+                gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
+                beta_t = float(model.poe_beta_min) + (float(model.poe_beta_max) - float(model.poe_beta_min)) * torch.sigmoid(model.obs_gate(gate_inp))
+
+        # Form posterior
+        poe_mode = getattr(model, "poe_mode", "conditional")
+        if poe_mode == "conditional" and 'set_aggs_t' in locals():
+            set_agg_t = set_aggs_t[:, t, :]
+            like_inp = torch.cat([set_agg_t, mu_p_t, logvar_p_t], dim=-1)
+            like_out = model.like_head(like_inp)
+            log_prec_like_t, h_like_t = like_out.chunk(2, dim=-1)
+            prec_like_t = F.softplus(log_prec_like_t) + 1e-4
+            Lambda_p_t = torch.exp(-logvar_p_t)
+            if beta_t is not None:
+                prec_like_t = prec_like_t * beta_t
+                h_like_t = h_like_t * beta_t
+            Lambda_post_t = Lambda_p_t + prec_like_t
+            h_post_t = Lambda_p_t * mu_p_t + h_like_t
+            mu_post_t = h_post_t / (Lambda_post_t + 1e-8)
+        else:
+            # naive PoE
+            mu_qx_t = mu_qx[:, t, :]
+            logvar_qx_t = logvar_qx[:, t, :]
+            var_qx = logvar_qx_t.exp()
+            var_p = logvar_p_t.exp()
+            if beta_t is not None:
+                var_qx = var_qx / beta_t
+            var_post = 1.0 / (1.0 / var_qx + 1.0 / var_p)
+            mu_post_t = var_post * (mu_qx_t / var_qx + mu_p_t / var_p)
+
+        # Decode current set from h_t (after updating with posterior mean)
+        N_t = int(sets[t]["var"].size(1))
+        # Update GRU state with posterior + time embedding first (to mirror training)
+        if time_emb is not None and isinstance(time_emb, torch.Tensor) and time_emb.numel() > 0:
+            h = model.gru_cell(mu_post_t + time_emb[:, t, :], h)
+        else:
+            h = model.gru_cell(mu_post_t, h)
+        recon_t = model.decoder(h, N_t, noise_std=0.0)
+
+        # Build target in reduced space
+        if getattr(model.set_encoder, "dim_reducer", None) is not None:
+            reduced = model.set_encoder.dim_reducer(sets[t]["var"])  # [1,N,R]
+        else:
+            reduced = sets[t]["var"]
+        norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+        target_x = reduced / (norms + 1e-8)
+        target_x = target_x * sets[t]["val"]
+
+        orig_cat.append(_to_numpy(target_x.squeeze(0)))
+        recon_cat.append(_to_numpy(recon_t.squeeze(0)))
+
+    orig = np.concatenate(orig_cat, axis=0) if orig_cat else np.zeros((0, 0), dtype=np.float32)
+    recon = np.concatenate(recon_cat, axis=0) if recon_cat else np.zeros((0, 0), dtype=np.float32)
+    return orig, recon
+
+
+@torch.no_grad()
 def collect_recon_events(
-    model: torch.nn.Module, batch: Dict[str, torch.Tensor]
+    model: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+    recon_from: str = "setvae",
 ) -> Tuple[np.ndarray, np.ndarray]:
     device = next(model.parameters()).device
     for k, v in list(batch.items()):
@@ -633,10 +759,16 @@ def collect_recon_events(
     if hasattr(model, "_split_sets"):
         pats = model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
     else:
-        pats = [[{"var": var[0:1, :1, :], "val": val[0:1, :1, :]}]]
+        pats = [[{"var": var[0:1, :1, :], "val": val[0:1, :1, :], "set_time": torch.tensor([0.0], device=var.device)}]]
     if len(pats) == 0 or len(pats[0]) == 0:
         return np.zeros((0, 0), dtype=np.float32), np.zeros((0, 0), dtype=np.float32)
     sets = pats[0]
+
+    # If requested, try PoE-based reconstruction for models that support it
+    if recon_from in {"poe", "auto"}:
+        is_poe = hasattr(model, "decoder") and hasattr(model, "prior_head")
+        if is_poe:
+            return _collect_recon_events_poe_from_sets(model, sets)
     encoder = (
         model.set_encoder if hasattr(model, "set_encoder") else getattr(model, "setvae", None)
     )
@@ -1320,6 +1452,17 @@ def _run_stage_ab():
     ap.add_argument("--num_workers", type=int, default=getattr(cfg, "num_workers", 0))
     ap.add_argument("--num_eval_batches", type=int, default=50, help="Number of batches to estimate KL stats")
     ap.add_argument("--num_vis_samples", type=int, default=2, help="#samples for detailed recon/heatmaps")
+    ap.add_argument(
+        "--recon_from",
+        type=str,
+        choices=["setvae", "poe", "auto"],
+        default="auto",
+        help=(
+            "Source for reconstruction: 'setvae' uses the frozen SetVAE encoder/decoder;\n"
+            "'poe' decodes from PoE dynamic posterior via model.decoder(h_t);\n"
+            "'auto' chooses 'poe' if model has PoE components, else 'setvae'."
+        ),
+    )
     ap.add_argument("--output_dir", type=str, default=None, help="If not set, saves to <ckpt_version_dir>/eval")
     ap.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
     ap.add_argument("--active_threshold", type=float, default=0.01, help="KL threshold for active units")
@@ -1485,7 +1628,7 @@ def _run_stage_ab():
             out_file=os.path.join(args.output_dir, f"heatmap_var_sample_{i}.png"),
             value_type="var",
         )
-        orig, recon = collect_recon_events(model, batch)
+        orig, recon = collect_recon_events(model, batch, recon_from=getattr(args, "recon_from", "auto"))
         _plot_overlay_2d(
             orig,
             recon,
