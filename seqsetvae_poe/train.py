@@ -529,9 +529,46 @@ def _run_stage_b():
     version_dir = os.path.dirname(log_dir) if log_dir.endswith(os.sep + "logs") or log_dir.endswith("/logs") else log_dir
     ckpt_dir = os.path.join(version_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt = ModelCheckpoint(save_top_k=1, monitor="val_loss", mode="min", filename="poe_GRU_PT", dirpath=ckpt_dir)
-    early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
-    lrmon = LearningRateMonitor(logging_interval="step")
+    # Always keep a checkpoint for lowest validation loss
+    val_loss_ckpt = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        save_top_k=1,
+        monitor="val_loss",
+        mode="min",
+        filename="poe_GRU_PT",
+    )
+    # When joint classification is enabled, also track classification metrics robust to imbalance
+    callbacks = [LearningRateMonitor(logging_interval="step"), val_loss_ckpt]
+    if bool(args.enable_cls):
+        callbacks.extend(
+            [
+                ModelCheckpoint(
+                    dirpath=ckpt_dir,
+                    save_top_k=1,
+                    monitor="val_auprc",
+                    mode="max",
+                    filename="poe_cls_auprc",
+                ),
+                ModelCheckpoint(
+                    dirpath=ckpt_dir,
+                    save_top_k=1,
+                    monitor="val_auroc",
+                    mode="max",
+                    filename="poe_cls_auroc",
+                ),
+                ModelCheckpoint(
+                    dirpath=ckpt_dir,
+                    save_top_k=1,
+                    monitor="val_best_acc",
+                    mode="max",
+                    filename="poe_cls_acc",
+                ),
+            ]
+        )
+        early = EarlyStopping(monitor="val_auprc", mode="max", patience=8)
+    else:
+        early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
+    callbacks.append(early)
     # Enable manual unfreeze after --freeze_epochs by setting an initial freeze and relying on model's on_train_epoch_end
     if args.freeze_set_encoder:
         for p in model.set_encoder.parameters():
@@ -539,7 +576,7 @@ def _run_stage_b():
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         precision=args.precision,
-        callbacks=[ckpt, early, lrmon],
+        callbacks=callbacks,
         logger=logger,
         gradient_clip_val=args.gradient_clip_val,
         val_check_interval=args.val_check_interval,
