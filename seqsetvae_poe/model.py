@@ -101,6 +101,11 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         kl_over_weight: float = 1.0,
         var_stability_weight: float = 0.01,
         per_dim_free_bits: float = 0.002,
+        # Joint classification options (Stage C minimal integration)
+        enable_cls: bool = False,
+        cls_loss_weight: float = 0.0,
+        cls_dropout: float = 0.2,
+        pos_weight: float | None = None,
     ):
         super().__init__()
 
@@ -230,6 +235,22 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 nn.Linear(latent_dim, 1),
             )
             self._bce = nn.BCEWithLogitsLoss(reduction="mean")
+        # Optional sequence-level classification head (joint training for Stage C)
+        self.enable_cls = bool(enable_cls)
+        self.cls_loss_weight = float(cls_loss_weight)
+        self.cls_dropout = float(cls_dropout)
+        if self.enable_cls:
+            self.cls_head = nn.Sequential(
+                nn.Linear(latent_dim, max(64, latent_dim // 2)),
+                nn.GELU(),
+                nn.Dropout(self.cls_dropout),
+                nn.Linear(max(64, latent_dim // 2), 1),
+            )
+            self._bce_cls = (
+                nn.BCEWithLogitsLoss(pos_weight=torch.tensor([float(pos_weight)]))
+                if pos_weight is not None
+                else nn.BCEWithLogitsLoss()
+            )
         self.save_hyperparameters()
 
     # --- helpers ---
@@ -340,7 +361,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             all_sets.append(patient_sets)
         return all_sets
 
-    def _forward_single(self, sets, carry_mask=None, minutes_seq=None):
+    def _forward_single(self, sets, carry_mask=None, minutes_seq=None, compute_cls: bool = False):
         S = len(sets)
         device = self.device
         if S == 0:
@@ -506,7 +527,7 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
             reduced_normalized = reduced / (norms + 1e-8)
             target_x = reduced_normalized * s["val"]
-        recon_total += chamfer_recon(
+            recon_total += chamfer_recon(
                 recon,
                 target_x,
                 alpha=self.recon_alpha,
@@ -514,14 +535,18 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 gamma=self.recon_gamma,
                 beta_var=self.recon_beta_var,
                 scale_calib_weight=self.recon_scale_calib,
-            use_sinkhorn=self.use_sinkhorn,
-            sinkhorn_eps=self.sinkhorn_eps,
-            sinkhorn_iters=self.sinkhorn_iters,
+                use_sinkhorn=self.use_sinkhorn,
+                sinkhorn_eps=self.sinkhorn_eps,
+                sinkhorn_iters=self.sinkhorn_iters,
             )
         recon_total = recon_total / max(1, S)
-        return recon_total, kl_total, next_change_loss, kl_dim_mean, var_dev_mean
+        # Optional pooled feature for classification
+        pooled = None
+        if compute_cls:
+            pooled = h_seq.mean(dim=1)  # [1, D]
+        return recon_total, kl_total, next_change_loss, kl_dim_mean, var_dev_mean, pooled
 
-    def forward(self, batch):
+    def forward(self, batch, compute_cls: bool = False):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
         padding_mask = batch.get("padding_mask", None)
         carry_mask = batch.get("carry_mask", None)
@@ -532,8 +557,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         total_recon, total_kl, total_c, count = 0.0, 0.0, 0.0, 0
         kl_dim_sum = None
         var_dev_sum = 0.0
+        cls_feats = []
         for sets in all_sets:
-            recon, kl, next_c, kl_dim_vec, var_dev = self._forward_single(sets)
+            recon, kl, next_c, kl_dim_vec, var_dev, pooled = self._forward_single(sets, compute_cls=compute_cls)
             total_recon += recon
             total_kl += kl
             total_c += next_c
@@ -542,18 +568,23 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             else:
                 kl_dim_sum = kl_dim_sum + kl_dim_vec
             var_dev_sum = var_dev_sum + var_dev
+            if compute_cls and pooled is not None:
+                cls_feats.append(pooled.squeeze(0))
             count += 1
         if count == 0:
             device = var.device
             zero = torch.tensor(0.0, device=device)
-            return zero, zero, zero, torch.zeros(self.latent_dim, device=device), zero
+            return zero, zero, zero, torch.zeros(self.latent_dim, device=device), zero, None
         kl_dim_mean = kl_dim_sum / float(max(1, count)) if kl_dim_sum is not None else torch.zeros(self.latent_dim, device=var.device)
         var_dev_mean = var_dev_sum / float(max(1, count))
-        return total_recon / count, total_kl / count, total_c / count, kl_dim_mean, var_dev_mean
+        cls_tensor = None
+        if compute_cls and len(cls_feats) > 0:
+            cls_tensor = torch.stack(cls_feats, dim=0)  # [B, D]
+        return total_recon / count, total_kl / count, total_c / count, kl_dim_mean, var_dev_mean, cls_tensor
 
     # training hooks
     def training_step(self, batch, batch_idx):
-        recon, kl, next_c, kl_dim, var_dev = self.forward(batch)
+        recon, kl, next_c, kl_dim, var_dev, cls_feats = self.forward(batch, compute_cls=self.enable_cls)
         beta = self._beta()
         # Capacity annealing (Stage A style): penalize when KL is BELOW capacity
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
@@ -572,6 +603,15 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         # Variance stability
         var_pen = self.var_stability_weight * var_dev
         total = recon + beta * kl_objective + fairness + var_pen + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        # Optional classification loss
+        if self.enable_cls and cls_feats is not None and "y" in batch:
+            logits = self.cls_head(cls_feats).squeeze(-1)
+            y = batch["y"].to(logits.dtype)
+            cls_loss = self._bce_cls(logits, y)
+            total = total + self.cls_loss_weight * cls_loss
+            log_cls = cls_loss
+        else:
+            log_cls = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
         log_dict = {
             "train_loss": total,
             "train_recon": recon,
@@ -584,12 +624,14 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         }
         if self.enable_next_change:
             log_dict["train_next_change"] = next_c
+        if self.enable_cls:
+            log_dict["train_cls"] = log_cls
         self.log_dict(log_dict, prog_bar=True)
         self._step += 1
         return total
 
     def validation_step(self, batch, batch_idx):
-        recon, kl, next_c, kl_dim, var_dev = self.forward(batch)
+        recon, kl, next_c, kl_dim, var_dev, cls_feats = self.forward(batch, compute_cls=self.enable_cls)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         kl_objective = F.relu(cap - kl)
@@ -605,9 +647,18 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
         var_pen = self.var_stability_weight * var_dev
         total = recon + beta * kl_objective + fairness + var_pen + (self.next_change_weight * next_c if self.enable_next_change else 0.0)
+        if self.enable_cls and cls_feats is not None and "y" in batch:
+            logits = self.cls_head(cls_feats).squeeze(-1)
+            y = batch["y"].to(logits.dtype)
+            cls_loss = self._bce_cls(logits, y)
+            total = total + self.cls_loss_weight * cls_loss
+        else:
+            cls_loss = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
         log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap, "val_kl_fair": fairness, "val_var_pen": var_pen}
         if self.enable_next_change:
             log_dict["val_next_change"] = next_c
+        if self.enable_cls:
+            log_dict["val_cls"] = cls_loss
         self.log_dict(log_dict, prog_bar=True, on_epoch=True)
         return total
 

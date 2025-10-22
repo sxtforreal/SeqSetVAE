@@ -343,19 +343,46 @@ def _run_stage_b():
     parser.add_argument("--sinkhorn_iters", type=int, default=100)
     parser.add_argument("--partial_unfreeze", action="store_true", default=False)
     parser.add_argument("--unfreeze_dim_reducer", action="store_true", default=False)
+    # Joint classification (minimal integration of Stage C)
+    parser.add_argument("--enable_cls", action="store_true", default=False, help="Enable joint sequence classification head in Stage B")
+    parser.add_argument("--cls_loss_weight", type=float, default=0.6, help="Weight for classification loss in joint objective")
+    parser.add_argument("--cls_dropout", type=float, default=0.2)
+    parser.add_argument("--label_csv", type=str, default=None, help="Label CSV (required when --enable_cls)")
+    parser.add_argument("--no_weighted_sampler", action="store_true", help="Disable class-balanced sampling when --enable_cls")
 
     args = parser.parse_args()
 
-    dm = DataModule(
-        saved_dir=args.data_dir,
-        params_map_path=args.params_map_path,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        smoke=args.smoke,
-        smoke_batch_size=10,
-        apply_A=False,
-    )
+    if args.enable_cls:
+        if not args.label_csv:
+            raise ValueError("--label_csv is required when --enable_cls")
+        dm = MortalityDataModule(
+            saved_dir=args.data_dir,
+            label_csv=args.label_csv,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            smoke=args.smoke,
+            smoke_batch_size=max(2, args.batch_size),
+            use_weighted_sampler=(not args.no_weighted_sampler),
+        )
+        # Setup early to obtain pos_weight for model init
+        try:
+            dm.setup()
+            pos_weight = getattr(dm, "pos_weight", None)
+        except Exception:
+            pos_weight = None
+    else:
+        dm = DataModule(
+            saved_dir=args.data_dir,
+            params_map_path=args.params_map_path,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            smoke=args.smoke,
+            smoke_batch_size=10,
+            apply_A=False,
+        )
+        pos_weight = None
 
     model = PoESeqSetVAEPretrain(
         input_dim=args.input_dim,
@@ -401,6 +428,10 @@ def _run_stage_b():
         kl_over_weight=float(args.kl_over_weight),
         var_stability_weight=float(args.var_stability_weight),
         per_dim_free_bits=float(args.per_dim_free_bits),
+        enable_cls=bool(args.enable_cls),
+        cls_loss_weight=float(args.cls_loss_weight),
+        cls_dropout=float(args.cls_dropout),
+        pos_weight=pos_weight,
     )
 
     # Default behavior: if --stageA_ckpt provided, merge its SetVAE weights into initializer (or model state)
