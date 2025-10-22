@@ -534,6 +534,7 @@ def _run_stage_c():
     parser.add_argument("--precision", type=str, default="16-mixed")
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--no_weighted_sampler", action="store_true", help="Disable class-balanced sampler (default enabled)")
     # Transformer hyperparams (StageA baseline)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
@@ -561,6 +562,7 @@ def _run_stage_c():
         pin_memory=True,
         smoke=args.smoke,
         smoke_batch_size=max(2, args.batch_size),
+        use_weighted_sampler=(not args.no_weighted_sampler),
     )
     dm.setup()
 
@@ -602,9 +604,12 @@ def _run_stage_c():
     version_dir = os.path.dirname(log_dir) if log_dir.endswith(os.sep + "logs") or log_dir.endswith("/logs") else log_dir
     ckpt_dir = os.path.join(version_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
+    # Track multiple metrics and save best by AUPRC; also keep AUROC-best
     callbacks = [
         ModelCheckpoint(dirpath=ckpt_dir, save_top_k=1, monitor="val_auprc", mode="max", filename="mortality_cls"),
-        EarlyStopping(monitor="val_auprc", mode="max", patience=5),
+        ModelCheckpoint(dirpath=ckpt_dir, save_top_k=1, monitor="val_auroc", mode="max", filename="mortality_cls_auroc"),
+        ModelCheckpoint(dirpath=ckpt_dir, save_top_k=1, monitor="val_best_acc", mode="max", filename="mortality_cls_acc"),
+        EarlyStopping(monitor="val_auprc", mode="max", patience=8),
         LearningRateMonitor(logging_interval="step"),
     ]
     trainer = pl.Trainer(
