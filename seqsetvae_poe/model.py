@@ -1581,6 +1581,7 @@ class MortalityClassifier(pl.LightningModule):
         self._val_labels: List[int] = []
         self._test_logits: List[float] = []
         self._test_labels: List[int] = []
+        self._best_thr: float = 0.5
 
         # Optional metrics
         try:
@@ -1773,6 +1774,8 @@ class MortalityClassifier(pl.LightningModule):
         self.log("val_best_acc", best_acc, prog_bar=False)
         self.log("val_sensitivity", sens, prog_bar=False)
         self.log("val_specificity", spec, prog_bar=False)
+        # store for test-time thresholding
+        self._best_thr = float(best_thr)
         self._val_logits.clear()
         self._val_labels.clear()
 
@@ -1793,10 +1796,14 @@ class MortalityClassifier(pl.LightningModule):
             y_prob = torch.sigmoid(torch.tensor(self._test_logits)).numpy()
             auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
             auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
+            thr = float(getattr(self, "_best_thr", 0.5))
+            y_hat = (y_prob >= thr).astype(int)
+            acc = float((y_hat == y_true).mean()) if len(y_true) > 0 else float("nan")
         except Exception:
-            auroc, auprc = float("nan"), float("nan")
+            auroc, auprc, acc = float("nan"), float("nan"), float("nan")
         self.log("test_auroc", auroc, prog_bar=True)
         self.log("test_auprc", auprc, prog_bar=True)
+        self.log("test_acc", acc, prog_bar=True)
         self._test_logits.clear()
         self._test_labels.clear()
 
@@ -1955,6 +1962,7 @@ class StageASetVAETransformerClassifier(pl.LightningModule):
         self._val_labels: List[int] = []
         self._test_logits: List[float] = []
         self._test_labels: List[int] = []
+        self._best_thr: float = 0.5
 
     def _relative_time_bucket_embedding(self, minutes: torch.Tensor) -> torch.Tensor:
         B, S = minutes.shape
@@ -2101,10 +2109,27 @@ class StageASetVAETransformerClassifier(pl.LightningModule):
             y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
             auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
             auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
+            # derive best acc and threshold
+            best_thr = 0.5
+            best_acc = 0.0
+            try:
+                qs = np.linspace(0.05, 0.95, 19)
+                cand = np.unique(np.quantile(y_prob, qs))
+                for t in cand:
+                    y_hat = (y_prob >= t).astype(int)
+                    acc = float((y_hat == y_true).mean())
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_thr = float(t)
+            except Exception:
+                pass
         except Exception:
-            auroc, auprc = float("nan"), float("nan")
+            auroc, auprc, best_thr, best_acc = float("nan"), float("nan"), 0.5, float("nan")
         self.log("val_auroc", auroc, prog_bar=True)
         self.log("val_auprc", auprc, prog_bar=True)
+        self.log("val_best_acc", best_acc, prog_bar=False)
+        self.log("val_best_thr", best_thr, prog_bar=False)
+        self._best_thr = float(best_thr)
         self._val_logits.clear()
         self._val_labels.clear()
 
@@ -2125,10 +2150,14 @@ class StageASetVAETransformerClassifier(pl.LightningModule):
             y_prob = torch.sigmoid(torch.tensor(self._test_logits)).numpy()
             auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
             auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
+            thr = float(getattr(self, "_best_thr", 0.5))
+            y_hat = (y_prob >= thr).astype(int)
+            acc = float((y_hat == y_true).mean()) if len(y_true) > 0 else float("nan")
         except Exception:
-            auroc, auprc = float("nan"), float("nan")
+            auroc, auprc, acc = float("nan"), float("nan"), float("nan")
         self.log("test_auroc", auroc, prog_bar=True)
         self.log("test_auprc", auprc, prog_bar=True)
+        self.log("test_acc", acc, prog_bar=True)
         self._test_logits.clear()
         self._test_labels.clear()
 

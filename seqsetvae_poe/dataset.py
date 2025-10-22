@@ -4,7 +4,7 @@ import random
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 import lightning.pytorch as pl
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -333,6 +333,7 @@ class MortalityDataModule(pl.LightningDataModule):
         pin_memory: bool = True,
         smoke: bool = False,
         smoke_batch_size: int = 8,
+        use_weighted_sampler: bool = True,
     ):
         super().__init__()
         self.saved_dir = saved_dir
@@ -344,6 +345,9 @@ class MortalityDataModule(pl.LightningDataModule):
         self.smoke_batch_size = smoke_batch_size
         self.id_to_label: Dict[str, int] = {}
         self.vcols: Optional[List[str]] = None
+        self.use_weighted_sampler = bool(use_weighted_sampler)
+        self._train_sample_weights: Optional[torch.Tensor] = None
+        self._train_labels: Optional[List[int]] = None
 
     def setup(self, stage=None):
         self.id_to_label = _read_label_map(self.label_csv)
@@ -356,6 +360,14 @@ class MortalityDataModule(pl.LightningDataModule):
         n_pos = max(1, sum(tr_labels))
         n_neg = max(1, len(tr_labels) - n_pos)
         self.pos_weight = float(n_neg) / float(n_pos)
+        self._train_labels = tr_labels
+        # Prepare per-sample weights for class-balanced sampling (positives ~ minority)
+        if self.use_weighted_sampler:
+            N = max(1, len(tr_labels))
+            w_pos = float(N) / (2.0 * float(n_pos))
+            w_neg = float(N) / (2.0 * float(n_neg))
+            weights = [w_pos if lab == 1 else w_neg for lab in tr_labels]
+            self._train_sample_weights = torch.tensor(weights, dtype=torch.double)
         if self.smoke:
             n = len(self.train)
             k = min(self.smoke_batch_size, n)
@@ -400,6 +412,21 @@ class MortalityDataModule(pl.LightningDataModule):
             return DataLoader(
                 subset,
                 batch_size=len(subset),
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                collate_fn=self._collate_with_label,
+            )
+        if self.use_weighted_sampler and self._train_sample_weights is not None:
+            sampler = WeightedRandomSampler(
+                weights=self._train_sample_weights,
+                num_samples=len(self.train),
+                replacement=True,
+            )
+            return DataLoader(
+                self.train,
+                batch_size=self.batch_size,
+                sampler=sampler,
                 shuffle=False,
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
