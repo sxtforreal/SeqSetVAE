@@ -1343,6 +1343,86 @@ def visualize_ood_scramble(
             pass
 
 
+@torch.no_grad()
+def _visualize_per_set_masking_curves(
+    model: torch.nn.Module,
+    dataloader,
+    out_dir: str,
+    num_sets: int = 10,
+    min_len: int = 2,
+):
+    """Plot per-set consistency curves by progressively masking tokens.
+
+    For each selected set, compute the posterior on the full set as reference,
+    then iteratively remove one token at a time following a random order. At each
+    masked count k, compute consistency = 1 / (1 + W2(q_subset, q_full)).
+    """
+    encoder = _get_encoder_from_model(model)
+    if encoder is None or plt is None:
+        return
+    device = next(model.parameters()).device
+    rng = random.Random(4321)
+
+    curves: List[Tuple[List[int], List[float], int]] = []
+    collected = 0
+    for batch in dataloader:
+        # move to device
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+        all_sets = _extract_sets_from_batch(model, batch)
+        for sets in all_sets:
+            for s in sets:
+                var = s["var"].to(device)
+                val = s["val"].to(device)
+                N = int(var.size(1))
+                # need at least 3 tokens to form a curve (mask up to N-1)
+                if N < max(3, int(min_len)):
+                    continue
+                # reference posterior for full set
+                mu_full, log_full = _encode_mu_logvar(encoder, var, val)
+                order = list(range(N))
+                rng.shuffle(order)
+                xs: List[int] = []
+                ys: List[float] = []
+                # progressively mask first k tokens in 'order'; avoid empty set
+                for masked in range(1, N):
+                    remain_idx = sorted(order[masked:])
+                    if len(remain_idx) == 0:
+                        break
+                    v_sub = var[:, remain_idx, :]
+                    x_sub = val[:, remain_idx, :]
+                    mu_sub, log_sub = _encode_mu_logvar(encoder, v_sub, x_sub)
+                    w2 = float(_w2_diag(mu_sub, log_sub, mu_full, log_full).item())
+                    consistency = 1.0 / (1.0 + w2)
+                    xs.append(masked)
+                    ys.append(consistency)
+                if len(xs) > 0:
+                    curves.append((xs, ys, N))
+                    collected += 1
+                if collected >= num_sets:
+                    break
+            if collected >= num_sets:
+                break
+        if collected >= num_sets:
+            break
+
+    if len(curves) == 0:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for i, (xs, ys, N) in enumerate(curves):
+        ax.plot(xs, ys, marker="o", alpha=0.9, label=f"set {i+1} (N={N})")
+    ax.set_xlabel("masked token count")
+    ax.set_ylabel("consistency 1/(1+W2(q_subset, q_full))")
+    ax.set_title("Per-set masking consistency curves")
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=2, fontsize=8, frameon=True)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "mask_consistency_per_set_curves.png"), dpi=240)
+    plt.close(fig)
+
+
 def _plot_kl_hist_and_cdf(kl_vec: np.ndarray, out_dir: str):
     if plt is None:
         return
@@ -2059,6 +2139,25 @@ def _run_pretrain_eval():
         default="sample_from_stats",
         help="Scramble scheme",
     )
+    # Per-set masking curves (consistency vs masked count)
+    ap.add_argument(
+        "--plot_per_set_mask_curves",
+        action="store_true",
+        default=False,
+        help="Plot consistency curves for randomly sampled sets under progressive masking",
+    )
+    ap.add_argument(
+        "--num_sets_for_curves",
+        type=int,
+        default=10,
+        help="How many sets to plot curves for (default 10)",
+    )
+    ap.add_argument(
+        "--min_set_len_for_curves",
+        type=int,
+        default=2,
+        help="Minimum set length to include in per-set curves",
+    )
     # Optional CLI overrides for dims (useful when config defaults mismatch checkpoint)
     ap.add_argument("--input_dim", type=int, default=None)
     ap.add_argument("--reduced_dim", type=int, default=None)
@@ -2354,6 +2453,19 @@ def _run_pretrain_eval():
                 pass
         except Exception as e:
             extra_evals["ood_scramble_error"] = str(e)
+
+    # Optional per-set masking curves (10 random sets by default)
+    if getattr(args, "plot_per_set_mask_curves", False):
+        try:
+            _visualize_per_set_masking_curves(
+                model,
+                dl_vis,
+                out_dir=args.output_dir,
+                num_sets=int(getattr(args, "num_sets_for_curves", 10)),
+                min_len=int(getattr(args, "min_set_len_for_curves", 2)),
+            )
+        except Exception as e:
+            print(f"[WARN] per-set masking curves plotting failed: {e}")
 
     ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
     report = {
