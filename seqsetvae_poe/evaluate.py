@@ -29,6 +29,7 @@ import pandas as pd
 import config as cfg  # type: ignore
 from dataset import MortalityDataModule, DataModule, PatientDataset, _detect_vcols  # type: ignore
 from model import MortalityClassifier, _load_state_dict, _build_poe_from_state, SetVAEOnlyPretrain, PoESeqSetVAEPretrain  # type: ignore
+from modules import recon_loss as _set_recon_loss  # type: ignore
 
 # Optional visualization deps for A/B
 try:
@@ -47,6 +48,16 @@ try:
     import umap  # type: ignore
 except Exception:  # pragma: no cover - optional
     umap = None  # type: ignore
+
+# Optional metrics for OOD/consistency eval
+try:
+    from sklearn.metrics import roc_auc_score as _roc_auc, average_precision_score as _avg_prec  # type: ignore
+    from sklearn.metrics import roc_curve as _roc_curve, precision_recall_curve as _pr_curve  # type: ignore
+except Exception:  # pragma: no cover - optional
+    _roc_auc = None  # type: ignore
+    _avg_prec = None  # type: ignore
+    _roc_curve = None  # type: ignore
+    _pr_curve = None  # type: ignore
 
 # Targeted warning filters to keep logs clean without changing behavior
 warnings.filterwarnings(
@@ -803,6 +814,507 @@ def collect_recon_events(
     return orig, recon
 
 
+# ---------------- Consistency & OOD utilities (mask invariance, scramble) ---------------- #
+
+@torch.no_grad()
+def _get_encoder_from_model(model: torch.nn.Module):
+    if hasattr(model, "set_encoder"):
+        return model.set_encoder
+    enc = getattr(model, "setvae", None)
+    if enc is not None and hasattr(enc, "set_encoder"):
+        return enc.set_encoder
+    return None
+
+
+@torch.no_grad()
+def _extract_sets_from_batch(
+    model: torch.nn.Module, batch: Dict[str, torch.Tensor]
+) -> List[List[Dict[str, torch.Tensor]]]:
+    var, val, minutes, set_id = (
+        batch["var"],
+        batch["val"],
+        batch["minute"],
+        batch["set_id"],
+    )
+    padding_mask = batch.get("padding_mask", None)
+    carry_mask = batch.get("carry_mask", None)
+    if hasattr(model, "_split_sets"):
+        return model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)  # type: ignore
+    # Fallback best-effort split: consecutive identical set_id values define a set
+    all_sets: List[List[Dict[str, torch.Tensor]]] = []
+    B = var.size(0)
+    for b in range(B):
+        v = var[b]
+        x = val[b]
+        s = set_id[b]
+        if padding_mask is not None:
+            mask = ~padding_mask[b]
+            v, x, s = v[mask], x[mask], s[mask]
+        if s.dim() > 1:
+            s = s.squeeze(-1)
+        _, counts = torch.unique_consecutive(s.long(), return_counts=True)
+        idx_splits = torch.split(torch.arange(len(s), device=s.device), [int(c) for c in counts])
+        patient_sets: List[Dict[str, torch.Tensor]] = []
+        for idx in idx_splits:
+            patient_sets.append({"var": v[idx].unsqueeze(0), "val": x[idx].unsqueeze(0)})
+        all_sets.append(patient_sets)
+    return all_sets
+
+
+@torch.no_grad()
+def _encode_mu_logvar(encoder, var: torch.Tensor, val: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Shapes: var [1,N,D], val [1,N,1]
+    if getattr(encoder, "dim_reducer", None) is not None:
+        reduced = encoder.dim_reducer(var)
+    else:
+        reduced = var
+    norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+    x = (reduced / (norms + 1e-8)) * val
+    z_list, _ = encoder.encode(x)
+    _z, mu, logvar = z_list[-1]
+    return mu.squeeze(0).squeeze(0), logvar.squeeze(0).squeeze(0)
+
+
+@torch.no_grad()
+def _w2_diag(mu1: torch.Tensor, logvar1: torch.Tensor, mu2: torch.Tensor, logvar2: torch.Tensor) -> torch.Tensor:
+    # 2-Wasserstein distance squared between diagonal Gaussians
+    var1 = logvar1.exp().clamp(min=1e-8)
+    var2 = logvar2.exp().clamp(min=1e-8)
+    term_mean = (mu1 - mu2).pow(2).sum()
+    term_cov = (var1.sqrt() - var2.sqrt()).pow(2).sum()
+    return term_mean + term_cov
+
+
+@torch.no_grad()
+def _poe_combine_diag(
+    mu_a: torch.Tensor, logvar_a: torch.Tensor, mu_b: torch.Tensor, logvar_b: torch.Tensor, prior_prec: float = 1.0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Combine two posteriors approximately: q_AB ∝ q_A * q_B / p, with p=N(0,I)
+    var_a = logvar_a.exp().clamp(min=1e-8)
+    var_b = logvar_b.exp().clamp(min=1e-8)
+    prec_a = 1.0 / var_a
+    prec_b = 1.0 / var_b
+    prec = (prec_a + prec_b - prior_prec)
+    prec = torch.clamp(prec, min=1e-6)
+    mu = (prec_a * mu_a + prec_b * mu_b) / prec
+    logvar = torch.log(1.0 / prec)
+    return mu, logvar
+
+
+@torch.no_grad()
+def evaluate_mask_consistency(
+    model: torch.nn.Module,
+    dataloader,
+    mask_ratios: List[float] = [0.3, 0.5, 0.7],
+    num_sets: int = 200,
+    repeats: int = 3,
+    disjoint: bool = True,
+) -> Dict[str, Dict[str, float]]:
+    encoder = _get_encoder_from_model(model)
+    if encoder is None:
+        return {}
+    device = next(model.parameters()).device
+    rng = random.Random(123)
+
+    # Accumulators per ratio
+    acc: Dict[float, Dict[str, List[float]]] = {
+        float(r): {"w2_AB": [], "poe_gap": [], "var_shrink_ok": []} for r in mask_ratios
+    }
+
+    seen = 0
+    for batch in dataloader:
+        # Move tensors
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+        all_sets = _extract_sets_from_batch(model, batch)
+        for sets in all_sets:
+            for s in sets:
+                var = s["var"].to(device)
+                val = s["val"].to(device)
+                N = int(var.size(1))
+                if N < 4:
+                    continue
+                # Pre-encode union (full set) once
+                mu_full, logvar_full = _encode_mu_logvar(encoder, var, val)
+                for r in mask_ratios:
+                    k = max(1, int(round(float(r) * N)))
+                    for _ in range(repeats):
+                        idx = list(range(N))
+                        rng.shuffle(idx)
+                        if disjoint:
+                            idx_a = sorted(idx[:k])
+                            idx_b = sorted(idx[k : 2 * k]) if 2 * k <= N else sorted(idx[-k:])
+                        else:
+                            idx_a = sorted([i for i in idx[:k]])
+                            rng.shuffle(idx)
+                            idx_b = sorted([i for i in idx[:k]])
+                        if len(idx_a) == 0 or len(idx_b) == 0:
+                            continue
+                        idx_u = sorted(set(idx_a) | set(idx_b))
+
+                        va = var[:, idx_a, :]
+                        xa = val[:, idx_a, :]
+                        vb = var[:, idx_b, :]
+                        xb = val[:, idx_b, :]
+                        vu = var[:, idx_u, :]
+                        xu = val[:, idx_u, :]
+
+                        mu_a, logvar_a = _encode_mu_logvar(encoder, va, xa)
+                        mu_b, logvar_b = _encode_mu_logvar(encoder, vb, xb)
+                        mu_u, logvar_u = _encode_mu_logvar(encoder, vu, xu)
+
+                        w2_ab = float(_w2_diag(mu_a, logvar_a, mu_b, logvar_b).item())
+                        mu_p, logvar_p = _poe_combine_diag(mu_a, logvar_a, mu_b, logvar_b)
+                        poe_gap = float(_w2_diag(mu_p, logvar_p, mu_u, logvar_u).item())
+
+                        var_a = float(logvar_a.exp().mean().item())
+                        var_b = float(logvar_b.exp().mean().item())
+                        var_u = float(logvar_u.exp().mean().item())
+                        shrink_ok = 1.0 if var_u <= min(var_a, var_b) + 1e-6 else 0.0
+
+                        acc[float(r)]["w2_AB"].append(w2_ab)
+                        acc[float(r)]["poe_gap"].append(poe_gap)
+                        acc[float(r)]["var_shrink_ok"].append(shrink_ok)
+
+                seen += 1
+                if seen >= num_sets:
+                    break
+            if seen >= num_sets:
+                break
+        if seen >= num_sets:
+            break
+
+    out: Dict[str, Dict[str, float]] = {}
+    for r, m in acc.items():
+        def _m(name: str) -> float:
+            arr = m.get(name, [])
+            return float(np.mean(arr)) if len(arr) > 0 else float("nan")
+        out[str(r)] = {
+            "w2_AB_mean": _m("w2_AB"),
+            "poe_gap_mean": _m("poe_gap"),
+            "var_shrink_ok_frac": _m("var_shrink_ok"),
+        }
+    return out
+
+
+@torch.no_grad()
+def _per_set_elbo_score(encoder, var: torch.Tensor, val: torch.Tensor) -> float:
+    # Compute reconstruction loss (Chamfer) + KL(q||p) with p=N(0,I)
+    if getattr(encoder, "dim_reducer", None) is not None:
+        reduced = encoder.dim_reducer(var)
+    else:
+        reduced = var
+    norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
+    x_target = (reduced / (norms + 1e-8)) * val
+    z_list, _ = encoder.encode(x_target)
+    recon = encoder.decode(z_list, target_n=int(x_target.size(1)), use_mean=True, noise_std=0.0)
+    rec = _set_recon_loss(recon, x_target)
+    _z, mu, logvar = z_list[-1]
+    mu = mu.squeeze(0).squeeze(0)
+    logvar = logvar.squeeze(0).squeeze(0)
+    kl = 0.5 * torch.sum(logvar.exp() + mu.pow(2) - 1.0 - logvar)
+    return float((rec + kl).item())
+
+
+@torch.no_grad()
+def evaluate_ood_scramble(
+    model: torch.nn.Module,
+    dataloader,
+    num_sets: int = 200,
+    scheme: str = "permute_vals",
+) -> Dict[str, float]:
+    encoder = _get_encoder_from_model(model)
+    if encoder is None:
+        return {}
+    device = next(model.parameters()).device
+    rng = np.random.default_rng(12345)
+
+    scores: List[float] = []
+    labels: List[int] = []  # 0 = real, 1 = scrambled
+    seen = 0
+    for batch in dataloader:
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+        all_sets = _extract_sets_from_batch(model, batch)
+        for sets in all_sets:
+            for s in sets:
+                var = s["var"].to(device)
+                val = s["val"].to(device)
+                N = int(var.size(1))
+                if N < 4:
+                    continue
+                # Real score
+                score_real = _per_set_elbo_score(encoder, var, val)
+                scores.append(score_real)
+                labels.append(0)
+
+                # Scrambled score
+                perm = rng.permutation(N)
+                val_scr = val[:, perm, :]
+                score_scr = _per_set_elbo_score(encoder, var, val_scr)
+                scores.append(score_scr)
+                labels.append(1)
+
+                seen += 1
+                if seen >= num_sets:
+                    break
+            if seen >= num_sets:
+                break
+        if seen >= num_sets:
+            break
+
+    if len(scores) == 0:
+        return {}
+    scores_np = np.asarray(scores, dtype=np.float64)
+    labels_np = np.asarray(labels, dtype=np.int32)
+    # Higher score => more outlier-like (ELBO approx)
+    # Compute AUROC/AUPRC if available
+    try:
+        auroc = float(_roc_auc(labels_np, scores_np)) if _roc_auc is not None else float("nan")
+    except Exception:
+        auroc = float("nan")
+    try:
+        auprc = float(_avg_prec(labels_np, scores_np)) if _avg_prec is not None else float("nan")
+    except Exception:
+        auprc = float("nan")
+    # Simple separation metrics
+    real_mean = float(scores_np[labels_np == 0].mean()) if (labels_np == 0).any() else float("nan")
+    scr_mean = float(scores_np[labels_np == 1].mean()) if (labels_np == 1).any() else float("nan")
+    return {
+        "auroc": auroc,
+        "auprc": auprc,
+        "mean_score_real": real_mean,
+        "mean_score_scrambled": scr_mean,
+        "mean_gap": (scr_mean - real_mean) if np.isfinite(real_mean) and np.isfinite(scr_mean) else float("nan"),
+    }
+
+
+# ---------------- Visualization helpers for consistency & OOD ---------------- #
+
+def _plot_hist(values: List[float], title: str, out_file: str, xlabel: str):
+    if plt is None or len(values) == 0:
+        return
+    arr = np.asarray(values, dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(arr, bins=40, color="tab:blue", alpha=0.85)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("count")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=220)
+    plt.close(fig)
+
+
+def _plot_hist_overlay(a: List[float], b: List[float], labels: Tuple[str, str], title: str, out_file: str, xlabel: str):
+    if plt is None or (len(a) == 0 and len(b) == 0):
+        return
+    arr_a = np.asarray(a, dtype=np.float32)
+    arr_b = np.asarray(b, dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bins = 40
+    if len(arr_a) > 0:
+        ax.hist(arr_a, bins=bins, color="tab:blue", alpha=0.55, label=labels[0])
+    if len(arr_b) > 0:
+        ax.hist(arr_b, bins=bins, color="tab:orange", alpha=0.55, label=labels[1])
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("count")
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=True)
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=220)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def visualize_mask_consistency(
+    model: torch.nn.Module,
+    dataloader,
+    out_dir: str,
+    mask_ratios: List[float],
+    num_sets: int,
+    repeats: int,
+    disjoint: bool,
+):
+    encoder = _get_encoder_from_model(model)
+    if encoder is None or plt is None:
+        return
+    device = next(model.parameters()).device
+    rng = random.Random(123)
+
+    store: Dict[float, Dict[str, List[float]]] = {float(r): {"w2_AB": [], "poe_gap": [], "var_shrink_ok": []} for r in mask_ratios}
+
+    seen = 0
+    for batch in dataloader:
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+        all_sets = _extract_sets_from_batch(model, batch)
+        for sets in all_sets:
+            for s in sets:
+                var = s["var"].to(device)
+                val = s["val"].to(device)
+                N = int(var.size(1))
+                if N < 4:
+                    continue
+                # Pre-encode union once for speed
+                mu_full, logvar_full = _encode_mu_logvar(encoder, var, val)
+                for r in mask_ratios:
+                    k = max(1, int(round(float(r) * N)))
+                    for _ in range(repeats):
+                        idx = list(range(N))
+                        rng.shuffle(idx)
+                        if disjoint:
+                            idx_a = sorted(idx[:k])
+                            idx_b = sorted(idx[k : 2 * k]) if 2 * k <= N else sorted(idx[-k:])
+                        else:
+                            idx_a = sorted(idx[:k])
+                            rng.shuffle(idx)
+                            idx_b = sorted(idx[:k])
+                        if len(idx_a) == 0 or len(idx_b) == 0:
+                            continue
+                        idx_u = sorted(set(idx_a) | set(idx_b))
+
+                        va, xa = var[:, idx_a, :], val[:, idx_a, :]
+                        vb, xb = var[:, idx_b, :], val[:, idx_b, :]
+                        vu, xu = var[:, idx_u, :], val[:, idx_u, :]
+
+                        mu_a, log_a = _encode_mu_logvar(encoder, va, xa)
+                        mu_b, log_b = _encode_mu_logvar(encoder, vb, xb)
+                        mu_u, log_u = _encode_mu_logvar(encoder, vu, xu)
+
+                        w2 = float(_w2_diag(mu_a, log_a, mu_b, log_b).item())
+                        mu_p, log_p = _poe_combine_diag(mu_a, log_a, mu_b, log_b)
+                        gap = float(_w2_diag(mu_p, log_p, mu_u, log_u).item())
+                        var_a = float(log_a.exp().mean().item())
+                        var_b = float(log_b.exp().mean().item())
+                        var_u = float(log_u.exp().mean().item())
+                        shrink_ok = 1.0 if var_u <= min(var_a, var_b) + 1e-6 else 0.0
+
+                        store[float(r)]["w2_AB"].append(w2)
+                        store[float(r)]["poe_gap"].append(gap)
+                        store[float(r)]["var_shrink_ok"].append(shrink_ok)
+
+                seen += 1
+                if seen >= num_sets:
+                    break
+            if seen >= num_sets:
+                break
+        if seen >= num_sets:
+            break
+
+    # Per-ratio histograms
+    for r, m in store.items():
+        _plot_hist(m["w2_AB"], title=f"W2(A,B) histogram (mask={r:.2f})", out_file=os.path.join(out_dir, f"mask_consistency_w2_hist_r{int(r*100)}.png"), xlabel="W2 distance")
+        _plot_hist(m["poe_gap"], title=f"W2(AB,U) histogram (mask={r:.2f})", out_file=os.path.join(out_dir, f"mask_consistency_poe_gap_hist_r{int(r*100)}.png"), xlabel="W2 distance")
+
+    # Trends across ratios
+    ratios_sorted = sorted(store.keys())
+    mean_w2 = [float(np.mean(store[r]["w2_AB"])) if len(store[r]["w2_AB"]) else np.nan for r in ratios_sorted]
+    mean_gap = [float(np.mean(store[r]["poe_gap"])) if len(store[r]["poe_gap"]) else np.nan for r in ratios_sorted]
+    frac_shrink = [float(np.mean(store[r]["var_shrink_ok"])) if len(store[r]["var_shrink_ok"]) else np.nan for r in ratios_sorted]
+
+    if plt is not None and len(ratios_sorted) > 0:
+        fig, ax1 = plt.subplots(figsize=(7, 5))
+        ax2 = ax1.twinx()
+        ax1.plot(ratios_sorted, mean_w2, marker="o", color="tab:blue", label="mean W2(A,B)")
+        ax1.plot(ratios_sorted, mean_gap, marker="s", color="tab:orange", label="mean W2(AB,U)")
+        ax2.plot(ratios_sorted, frac_shrink, marker="^", color="tab:green", label="var shrink frac")
+        ax1.set_xlabel("mask ratio")
+        ax1.set_ylabel("distance (W2)")
+        ax2.set_ylabel("fraction")
+        ax1.grid(True, alpha=0.3)
+        lines, labels = [], []
+        for ax in (ax1, ax2):
+            line, lab = ax.get_legend_handles_labels()
+            lines += line; labels += lab
+        ax1.legend(lines, labels, frameon=True)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "mask_consistency_trends.png"), dpi=240)
+        plt.close(fig)
+
+
+@torch.no_grad()
+def visualize_ood_scramble(
+    model: torch.nn.Module,
+    dataloader,
+    out_dir: str,
+    num_sets: int,
+    scheme: str,
+):
+    encoder = _get_encoder_from_model(model)
+    if encoder is None or plt is None:
+        return
+    device = next(model.parameters()).device
+    rng = np.random.default_rng(12345)
+
+    scores_real: List[float] = []
+    scores_scr: List[float] = []
+    seen = 0
+    for batch in dataloader:
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+        all_sets = _extract_sets_from_batch(model, batch)
+        for sets in all_sets:
+            for s in sets:
+                var = s["var"].to(device)
+                val = s["val"].to(device)
+                N = int(var.size(1))
+                if N < 4:
+                    continue
+                # Real
+                scores_real.append(_per_set_elbo_score(encoder, var, val))
+                # Scramble
+                perm = rng.permutation(N)
+                val_scr = val[:, perm, :]
+                scores_scr.append(_per_set_elbo_score(encoder, var, val_scr))
+                seen += 1
+                if seen >= num_sets:
+                    break
+            if seen >= num_sets:
+                break
+        if seen >= num_sets:
+            break
+
+    # Overlay histogram
+    _plot_hist_overlay(scores_real, scores_scr, ("real", "scrambled"), title="OOD scramble ELBO-like scores", out_file=os.path.join(out_dir, "ood_score_hist.png"), xlabel="recon+KL (higher=worse)")
+
+    # ROC & PR curves (if sklearn available)
+    if _roc_curve is not None and _pr_curve is not None:
+        try:
+            y = np.array([0] * len(scores_real) + [1] * len(scores_scr), dtype=np.int32)
+            s = np.array(scores_real + scores_scr, dtype=np.float64)
+            fpr, tpr, _ = _roc_curve(y, s)
+            prec, rec, _ = _pr_curve(y, s)
+            # ROC
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.plot(fpr, tpr, color="tab:blue", label="ROC")
+            ax.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.6)
+            ax.set_xlabel("FPR")
+            ax.set_ylabel("TPR")
+            ax.set_title("OOD ROC (scrambled as positive)")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(out_dir, "ood_roc.png"), dpi=240)
+            plt.close(fig)
+            # PR
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.plot(rec, prec, color="tab:orange", label="PR")
+            ax.set_xlabel("Recall")
+            ax.set_ylabel("Precision")
+            ax.set_title("OOD PR (scrambled as positive)")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(out_dir, "ood_pr.png"), dpi=240)
+            plt.close(fig)
+        except Exception:
+            pass
+
+
 def _plot_kl_hist_and_cdf(kl_vec: np.ndarray, out_dir: str):
     if plt is None:
         return
@@ -1498,6 +2010,21 @@ def _run_pretrain_eval():
     ap.add_argument("--audit_max_patients", type=int, default=200, help="Max patients to sample for audit (use <=0 for all)")
     ap.add_argument("--audit_min_count", type=int, default=10, help="Min samples per variable to include in audit CSV")
     ap.add_argument("--audit_keep_first_n_vars", type=int, default=0, help="If >0, audit only first N variables encountered; default 0 means all")
+    # Mask consistency & OOD options
+    # Mask consistency (enabled by default; add --no_eval_mask_consistency to disable)
+    ap.add_argument("--eval_mask_consistency", dest="eval_mask_consistency", action="store_true", help="Evaluate latent consistency across different measurement masks")
+    ap.add_argument("--no_eval_mask_consistency", dest="eval_mask_consistency", action="store_false", help="Disable mask consistency evaluation")
+    ap.set_defaults(eval_mask_consistency=True)
+    ap.add_argument("--mask_ratios", type=float, nargs="*", default=[0.3, 0.5, 0.7], help="Mask ratios to test (fraction of tokens per subset)")
+    ap.add_argument("--consistency_num_sets", type=int, default=200, help="#sets to sample for consistency eval")
+    ap.add_argument("--consistency_repeats", type=int, default=3, help="Repeats per ratio per set")
+    ap.add_argument("--consistency_disjoint", action="store_true", default=True, help="Use disjoint subset masks (else independent random masks)")
+    # OOD scramble (enabled by default; add --no_eval_ood_scramble to disable)
+    ap.add_argument("--eval_ood_scramble", dest="eval_ood_scramble", action="store_true", help="Evaluate outlier detection by scrambling values within sets")
+    ap.add_argument("--no_eval_ood_scramble", dest="eval_ood_scramble", action="store_false", help="Disable OOD scramble evaluation")
+    ap.set_defaults(eval_ood_scramble=True)
+    ap.add_argument("--ood_num_sets", type=int, default=200, help="#sets to sample for OOD scramble eval")
+    ap.add_argument("--ood_scheme", type=str, choices=["permute_vals"], default="permute_vals", help="Scramble scheme")
     # Optional CLI overrides for dims (useful when config defaults mismatch checkpoint)
     ap.add_argument("--input_dim", type=int, default=None)
     ap.add_argument("--reduced_dim", type=int, default=None)
@@ -1699,6 +2226,55 @@ def _run_pretrain_eval():
         "kl_total_vs_mag_rmse": _corr("kl_total", "mag_rmse"),
     }
 
+    # Optional: mask consistency and OOD-scramble evaluations
+    extra_evals: Dict[str, object] = {}
+    if getattr(args, "eval_mask_consistency", False):
+        try:
+            extra_evals["mask_consistency"] = evaluate_mask_consistency(
+                model,
+                dl_vis,
+                mask_ratios=[float(r) for r in getattr(args, "mask_ratios", [0.3, 0.5, 0.7])],
+                num_sets=int(getattr(args, "consistency_num_sets", 200)),
+                repeats=int(getattr(args, "consistency_repeats", 3)),
+                disjoint=bool(getattr(args, "consistency_disjoint", True)),
+            )
+            # Visualize
+            try:
+                visualize_mask_consistency(
+                    model,
+                    dl_vis,
+                    out_dir=args.output_dir,
+                    mask_ratios=[float(r) for r in getattr(args, "mask_ratios", [0.3, 0.5, 0.7])],
+                    num_sets=int(getattr(args, "consistency_num_sets", 200)),
+                    repeats=int(getattr(args, "consistency_repeats", 3)),
+                    disjoint=bool(getattr(args, "consistency_disjoint", True)),
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            extra_evals["mask_consistency_error"] = str(e)
+    if getattr(args, "eval_ood_scramble", False):
+        try:
+            extra_evals["ood_scramble"] = evaluate_ood_scramble(
+                model,
+                dl_vis,
+                num_sets=int(getattr(args, "ood_num_sets", 200)),
+                scheme=str(getattr(args, "ood_scheme", "permute_vals")),
+            )
+            # Visualize
+            try:
+                visualize_ood_scramble(
+                    model,
+                    dl_vis,
+                    out_dir=args.output_dir,
+                    num_sets=int(getattr(args, "ood_num_sets", 200)),
+                    scheme=str(getattr(args, "ood_scheme", "permute_vals")),
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            extra_evals["ood_scramble_error"] = str(e)
+
     ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
     report = {
         "checkpoint": args.checkpoint,
@@ -1752,6 +2328,7 @@ def _run_pretrain_eval():
             "total_kl_below_1e-2": total_kl < 1e-2,
             "risk": (active_ratio < 0.1) or (total_kl < 1e-2),
         },
+        "consistency_ood": extra_evals,
     }
     out_json = os.path.join(args.output_dir, f"pretrain_eval_{ts}.json")
     with open(out_json, "w") as f:
