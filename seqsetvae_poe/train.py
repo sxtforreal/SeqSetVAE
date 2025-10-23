@@ -369,6 +369,9 @@ def _run_stage_b():
         try:
             dm.setup()
             pos_weight = getattr(dm, "pos_weight", None)
+            # Avoid double-balancing: if using WeightedRandomSampler, drop BCE pos_weight
+            if getattr(dm, "use_weighted_sampler", False):
+                pos_weight = None
         except Exception:
             pos_weight = None
     else:
@@ -644,7 +647,8 @@ def _run_stage_c():
             gru_layers=2,
             dropout=args.dropout,
             lr=args.lr,
-            pos_weight=getattr(dm, "pos_weight", None),
+            # Avoid double-balancing: if using WeightedRandomSampler, drop BCE pos_weight
+            pos_weight=(None if getattr(dm, "use_weighted_sampler", False) else getattr(dm, "pos_weight", None)),
         )
     else:
         model = StageASetVAETransformerClassifier(
@@ -658,7 +662,8 @@ def _run_stage_c():
             num_layers=int(args.num_layers),
             dropout=args.dropout,
             lr=args.lr,
-            pos_weight=getattr(dm, "pos_weight", None),
+            # Avoid double-balancing: if using WeightedRandomSampler, drop BCE pos_weight
+            pos_weight=(None if getattr(dm, "use_weighted_sampler", False) else getattr(dm, "pos_weight", None)),
         )
 
     out_root = args.output_dir if args.output_dir else "./output"
