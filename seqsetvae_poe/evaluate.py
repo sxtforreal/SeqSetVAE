@@ -2162,6 +2162,12 @@ def _run_pretrain_eval():
     ap.add_argument("--input_dim", type=int, default=None)
     ap.add_argument("--reduced_dim", type=int, default=None)
     ap.add_argument("--latent_dim", type=int, default=None)
+    # Simplified evaluation mode
+    ap.add_argument(
+        "--simple",
+        action="store_true",
+        help="Simplified evaluation: minimal metrics, no heavy plots or extras",
+    )
     args, _ = ap.parse_known_args()
 
     if args.output_dir is None:
@@ -2176,6 +2182,17 @@ def _run_pretrain_eval():
             version_dir = os.path.dirname(ckpt_dir)
         args.output_dir = os.path.join(version_dir, "eval")
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # If simplified mode, turn off heavy/expensive steps and shrink sample counts
+    if getattr(args, "simple", False):
+        # Reduce compute and disable optional evaluations/plots
+        args.num_eval_batches = min(int(args.num_eval_batches), 30)
+        args.num_vis_samples = 0
+        args.eval_mask_consistency = False
+        args.eval_ood_scramble = False
+        args.plot_per_set_mask_curves = False
+        args.audit_var_scale = False
+        args.named_recon = "off"
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -2234,6 +2251,35 @@ def _run_pretrain_eval():
     dim90 = int(np.sum(frac < 0.90) + 1) if frac.size > 0 else 0
     dim95 = int(np.sum(frac < 0.95) + 1) if frac.size > 0 else 0
     eff_dims = compute_effective_dimensions(kl_dim)
+
+    # In simplified mode, skip plots, posterior moments, recon visualizations, and extras
+    if getattr(args, "simple", False):
+        ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+        simple_report = {
+            "mode": "simple",
+            "checkpoint": args.checkpoint,
+            "ckpt_type": ckpt_type,
+            "split": args.split,
+            "active_threshold": args.active_threshold,
+            "latent_dim": int(getattr(model, "latent_dim", len(kl_dim))),
+            "kl": {
+                "total_kl": total_kl,
+                "active_ratio": active_ratio,
+                "dim90": dim90,
+                "dim95": dim95,
+                "effective_dimensions": eff_dims,
+            },
+            "collapse_flags": {
+                "kl_active_ratio_below_0.1": active_ratio < 0.1,
+                "total_kl_below_1e-2": total_kl < 1e-2,
+                "risk": (active_ratio < 0.1) or (total_kl < 1e-2),
+            },
+        }
+        out_json = os.path.join(args.output_dir, f"pretrain_eval_simple_{ts}.json")
+        with open(out_json, "w") as f:
+            json.dump(simple_report, f, indent=2)
+        print(f"Saved simplified evaluation report to: {out_json}")
+        return
 
     _plot_kl_hist_and_cdf(kl_dim, args.output_dir)
     _plot_bar_topk(kl_dim, args.topk_plot, title="Top-K KL per-dimension", out_file=os.path.join(args.output_dir, "kl_topk.png"), ylabel="KL (nats)")
