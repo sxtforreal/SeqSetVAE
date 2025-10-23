@@ -1,8 +1,8 @@
 ================ Named Reconstruction ================
-Sample:     1/5
+Sample:     1/10
 Patient ID: 276363.0
 Set index:  7
-#Events:    8 (match scope: global, vocab=131)
+#Events:    8 (match scope: global, vocab=131, space=reduced)
 ---------------------------------------------------------------
 Original events (name -> de-normalized original value):
   - D5W: 59.999999 (not carried)
@@ -16,28 +16,28 @@ Original events (name -> de-normalized original value):
 ---------------------------------------------------------------
 Reconstruction matched results (No-mask):
 variable | Pred value (denorm) | cosine | carried
-SBP | 151.752676 | 0.978 | 0
-RR | 21.975972 | 0.945 | 0
-DBP | 80.523435 | 0.978 | 0
-MBP | 96.872985 | 0.973 | 0
+SBP | 167.549971 | 1.000 | 0
+O2 Saturation | 102.379154 | 1.000 | 0
+RR | 30.118480 | 1.000 | 0
+DBP | 78.059618 | 1.000 | 0
 ---------------------------------------------------------------
 Unmatched predictions (No-mask):
-PO2: 196.797241  (cos=0.937)
-RBC: 4.071563  (cos=0.955)
-FiO2: 0.625503  (cos=0.911)
-WBC: 14.604146  (cos=0.687)
+Urine: 273.122245  (cos=1.000)
+GCS_eye: 3.917876  (cos=1.000)
+Temperature: 37.406903  (cos=1.000)
+Weight: 117.401971  (cos=1.000)
 ===============================================================
-D5W [carried=0]: min_cos_to_recon = 0.257 (recon_var=WBC) | max_cos_to_recon = 0.897 (recon_var=MBP)
-HR [carried=0]: min_cos_to_recon = 0.263 (recon_var=WBC) | max_cos_to_recon = 0.859 (recon_var=MBP)
-O2 Saturation [carried=0]: min_cos_to_recon = 0.683 (recon_var=WBC) | max_cos_to_recon = 0.914 (recon_var=RR)
-TPN [carried=0]: min_cos_to_recon = 0.281 (recon_var=WBC) | max_cos_to_recon = 0.905 (recon_var=MBP)
-Recon-only: min_cos_to_any_original = 0.257 (recon_var=WBC)
-Recon-only: max_cos_to_any_original = 0.990 (recon_var=RBC)
+D5W [carried=0]: min_cos_to_recon = 1.000 (recon_var=Temperature) | max_cos_to_recon = 1.000 (recon_var=SBP)
+HR [carried=0]: min_cos_to_recon = 1.000 (recon_var=GCS_eye) | max_cos_to_recon = 1.000 (recon_var=SBP)
+MBP [carried=0]: min_cos_to_recon = 1.000 (recon_var=Temperature) | max_cos_to_recon = 1.000 (recon_var=O2 Saturation)
+TPN [carried=0]: min_cos_to_recon = 0.998 (recon_var=Temperature) | max_cos_to_recon = 0.998 (recon_var=SBP)
+Recon-only: min_cos_to_any_original = 0.998 (recon_var=Temperature)
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=Weight)
 ================ Named Reconstruction ================
-Sample:     2/5
+Sample:     2/10
 Patient ID: 203027.0
 Set index:  140
-#Events:    11 (match scope: global, vocab=131)
+#Events:    11 (match scope: global, vocab=131, space=reduced)
 ---------------------------------------------------------------
 Original events (name -> de-normalized original value):
   - DBP: 75.000000 (carried)
@@ -54,33 +54,30 @@ Original events (name -> de-normalized original value):
 ---------------------------------------------------------------
 Reconstruction matched results (No-mask):
 variable | Pred value (denorm) | cosine | carried
-O2 Saturation | 97.798660 | 0.683 | 1
-RR | 22.723391 | 0.950 | 1
-DBP | 75.283015 | 0.983 | 1
-MBP | 100.984392 | 0.973 | 1
-SBP | 150.021890 | 0.981 | 1
+Weight | 114.469845 | 1.000 | 0
+O2 Saturation | 102.543541 | 1.000 | 1
+DBP | 79.670909 | 1.000 | 1
+Temperature | 37.557963 | 1.000 | 1
+RR | 31.675725 | 1.000 | 1
+SBP | 150.572685 | 1.000 | 1
+MBP | 89.775045 | 1.000 | 1
+Urine | 293.234813 | 1.000 | 1
 ---------------------------------------------------------------
 Unmatched predictions (No-mask):
-PO2: 199.078865  (cos=0.936)
-Hct: 31.306576  (cos=0.933)
-FiO2: 0.593330  (cos=0.907)
-RBC: 4.039778  (cos=0.959)
-PTT: 52.619403  (cos=0.920)
-WBC: 13.020393  (cos=0.537)
+GCS_eye: 4.365175  (cos=1.000)
+Solution: 14.534281  (cos=0.998)
+Bilirubin (Direct): 3.366924  (cos=0.436)
 ===============================================================
-Dextrose Other [carried=1]: min_cos_to_recon = 0.237 (recon_var=WBC) | max_cos_to_recon = 0.890 (recon_var=Hct)
-HR [carried=1]: min_cos_to_recon = 0.266 (recon_var=O2 Saturation) | max_cos_to_recon = 0.859 (recon_var=RBC)
-KCl [carried=1]: min_cos_to_recon = 0.224 (recon_var=WBC) | max_cos_to_recon = 0.903 (recon_var=Hct)
-Temperature [carried=1]: min_cos_to_recon = 0.224 (recon_var=O2 Saturation) | max_cos_to_recon = 0.847 (recon_var=Hct)
-Urine [carried=1]: min_cos_to_recon = 0.152 (recon_var=O2 Saturation) | max_cos_to_recon = 0.870 (recon_var=Hct)
-Weight [carried=0]: min_cos_to_recon = 0.282 (recon_var=O2 Saturation) | max_cos_to_recon = 0.786 (recon_var=Hct)
-Recon-only: min_cos_to_any_original = 0.156 (recon_var=WBC)
-Recon-only: max_cos_to_any_original = 0.991 (recon_var=PO2)
+Dextrose Other [carried=1]: min_cos_to_recon = 0.413 (recon_var=Bilirubin (Direct)) | max_cos_to_recon = 0.999 (recon_var=SBP)
+HR [carried=1]: min_cos_to_recon = 0.421 (recon_var=Bilirubin (Direct)) | max_cos_to_recon = 1.000 (recon_var=RR)
+KCl [carried=1]: min_cos_to_recon = 0.412 (recon_var=Bilirubin (Direct)) | max_cos_to_recon = 0.999 (recon_var=SBP)
+Recon-only: min_cos_to_any_original = 0.412 (recon_var=Bilirubin (Direct))
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=GCS_eye)
 ================ Named Reconstruction ================
-Sample:     3/5
+Sample:     3/10
 Patient ID: 229718.0
 Set index:  14
-#Events:    24 (match scope: global, vocab=131)
+#Events:    24 (match scope: global, vocab=131, space=reduced)
 ---------------------------------------------------------------
 Original events (name -> de-normalized original value):
   - Base Excess: -0.000000 (carried)
@@ -110,54 +107,49 @@ Original events (name -> de-normalized original value):
 ---------------------------------------------------------------
 Reconstruction matched results (No-mask):
 variable | Pred value (denorm) | cosine | carried
-MBP | 93.316007 | 0.971 | 1
-SBP | 135.164301 | 0.946 | 1
-Total CO2 | 25.815568 | 0.863 | 1
-RR | 22.830492 | 0.947 | 0
-FiO2 | 0.652553 | 0.932 | 0
-PCO2 | 47.849570 | 0.935 | 1
-PO2 | 210.367539 | 0.943 | 1
-Urine | 138.414055 | 0.930 | 1
-DBP | 73.945105 | 0.976 | 1
-O2 Saturation | 97.796758 | 0.909 | 0
+SBP | 140.211955 | 1.000 | 1
+Temperature | 37.359399 | 1.000 | 1
+Chest Tube | 48.121614 | 0.997 | 1
+FiO2 | 0.601432 | 1.000 | 0
+HR | 93.002644 | 1.000 | 1
+DBP | 70.937158 | 1.000 | 1
+Total CO2 | 25.465640 | 0.998 | 1
+Base Excess | -0.833345 | 0.979 | 1
+MBP | 85.787082 | 1.000 | 1
+Urine | 217.597131 | 1.000 | 1
+O2 Saturation | 100.002853 | 1.000 | 0
+Glucose (Blood) | 155.739102 | 0.997 | 1
+Normal Saline | 72.005437 | 0.999 | 1
+D5W | 86.880110 | 1.000 | 1
+RR | 23.268221 | 1.000 | 0
 ---------------------------------------------------------------
 Unmatched predictions (No-mask):
-CRR: 0.060398  (cos=0.791)
-Dopamine: 35.269897  (cos=0.928)
-Hct: 32.708365  (cos=0.929)
-Hgb: 11.144885  (cos=0.931)
-Norepinephrine: 0.711739  (cos=0.750)
-pH Urine: 5.963267  (cos=0.932)
-Anion Gap: 14.621899  (cos=0.938)
-INR: 2.104160  (cos=0.929)
-PTT: 56.215453  (cos=0.947)
-ALP: 229.703376  (cos=0.934)
-WBC: 14.334374  (cos=0.904)
-RBC: 4.029582  (cos=0.949)
-Lactate: 3.433586  (cos=0.915)
-BUN: 33.026357  (cos=0.928)
+Fentanyl: 0.101434  (cos=0.998)
+Calcium Gluconate: 1.825770  (cos=0.944)
+Monocytes: 4.686707  (cos=0.876)
+GCS_verbal: 4.084184  (cos=0.999)
+GCS_motor: 5.955783  (cos=1.000)
+Weight: 101.542916  (cos=1.000)
+PO intake: 192.173188  (cos=0.998)
+Solution: 19.387230  (cos=1.000)
+GCS_eye: 3.858098  (cos=1.000)
 ===============================================================
-Base Excess [carried=1]: min_cos_to_recon = 0.629 (recon_var=Norepinephrine) | max_cos_to_recon = 0.900 (recon_var=Anion Gap)
-Calcium Free [carried=1]: min_cos_to_recon = 0.634 (recon_var=Norepinephrine) | max_cos_to_recon = 0.922 (recon_var=Anion Gap)
-Chest Tube [carried=1]: min_cos_to_recon = 0.564 (recon_var=Norepinephrine) | max_cos_to_recon = 0.853 (recon_var=RBC)
-D5W [carried=1]: min_cos_to_recon = 0.605 (recon_var=Norepinephrine) | max_cos_to_recon = 0.926 (recon_var=pH Urine)
-Glucose (Blood) [carried=1]: min_cos_to_recon = 0.669 (recon_var=Norepinephrine) | max_cos_to_recon = 0.883 (recon_var=Anion Gap)
-HR [carried=1]: min_cos_to_recon = 0.606 (recon_var=Norepinephrine) | max_cos_to_recon = 0.883 (recon_var=PTT)
-Insulin Regular [carried=1]: min_cos_to_recon = 0.491 (recon_var=Norepinephrine) | max_cos_to_recon = 0.822 (recon_var=Urine)
-KCl [carried=1]: min_cos_to_recon = 0.678 (recon_var=Norepinephrine) | max_cos_to_recon = 0.904 (recon_var=Anion Gap)
-Lactated Ringers [carried=1]: min_cos_to_recon = 0.609 (recon_var=Norepinephrine) | max_cos_to_recon = 0.913 (recon_var=Anion Gap)
-Neosynephrine [carried=1]: min_cos_to_recon = 0.707 (recon_var=CRR) | max_cos_to_recon = 0.899 (recon_var=ALP)
-Normal Saline [carried=1]: min_cos_to_recon = 0.525 (recon_var=CRR) | max_cos_to_recon = 0.784 (recon_var=Lactate)
-Propofol [carried=1]: min_cos_to_recon = 0.638 (recon_var=Norepinephrine) | max_cos_to_recon = 0.915 (recon_var=RBC)
-Temperature [carried=1]: min_cos_to_recon = 0.543 (recon_var=Norepinephrine) | max_cos_to_recon = 0.874 (recon_var=RBC)
-pH Blood [carried=1]: min_cos_to_recon = 0.580 (recon_var=Norepinephrine) | max_cos_to_recon = 0.928 (recon_var=RBC)
-Recon-only: min_cos_to_any_original = 0.491 (recon_var=Norepinephrine)
-Recon-only: max_cos_to_any_original = 0.986 (recon_var=Hct)
+Calcium Free [carried=1]: min_cos_to_recon = 0.870 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=D5W)
+Insulin Regular [carried=1]: min_cos_to_recon = 0.870 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=Urine)
+KCl [carried=1]: min_cos_to_recon = 0.868 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=DBP)
+Lactated Ringers [carried=1]: min_cos_to_recon = 0.870 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=RR)
+Neosynephrine [carried=1]: min_cos_to_recon = 0.873 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=DBP)
+PCO2 [carried=1]: min_cos_to_recon = 0.868 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=RR)
+PO2 [carried=1]: min_cos_to_recon = 0.865 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=SBP)
+Propofol [carried=1]: min_cos_to_recon = 0.871 (recon_var=Monocytes) | max_cos_to_recon = 1.000 (recon_var=RR)
+pH Blood [carried=1]: min_cos_to_recon = 0.868 (recon_var=Monocytes) | max_cos_to_recon = 0.999 (recon_var=RR)
+Recon-only: min_cos_to_any_original = 0.865 (recon_var=Monocytes)
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=Weight)
 ================ Named Reconstruction ================
-Sample:     4/5
+Sample:     4/10
 Patient ID: 216766.0
 Set index:  47
-#Events:    14 (match scope: global, vocab=131)
+#Events:    14 (match scope: global, vocab=131, space=reduced)
 ---------------------------------------------------------------
 Original events (name -> de-normalized original value):
   - D5W: 10.458330 (not carried)
@@ -177,40 +169,39 @@ Original events (name -> de-normalized original value):
 ---------------------------------------------------------------
 Reconstruction matched results (No-mask):
 variable | Pred value (denorm) | cosine | carried
-MBP | 98.076560 | 0.973 | 0
-RR | 21.024727 | 0.946 | 0
-DBP | 66.250424 | 0.982 | 0
-SBP | 133.015223 | 0.986 | 0
+SBP | 143.597351 | 1.000 | 0
+DBP | 69.991020 | 1.000 | 0
+MBP | 84.735268 | 1.000 | 0
+O2 Saturation | 99.762505 | 1.000 | 0
+RR | 24.993817 | 1.000 | 0
 ---------------------------------------------------------------
 Unmatched predictions (No-mask):
-BUN: 30.071346  (cos=0.918)
-Urine: 162.891680  (cos=0.929)
-Age: 63.653104  (cos=0.606)
-INR: 1.916638  (cos=0.927)
-ALP: 171.218655  (cos=0.946)
-RBC: 3.961608  (cos=0.947)
-TPN: 72.619912  (cos=0.921)
-PO2: 188.506155  (cos=0.934)
-PTT: 47.674030  (cos=0.916)
-Lactate: 2.965015  (cos=0.814)
+Urine: 177.075341  (cos=0.999)
+Weight: 100.011950  (cos=1.000)
+Bilirubin (Total): 3.006720  (cos=0.228)
+Vasopressin: 2.662130  (cos=0.976)
+Temperature: 37.073905  (cos=0.998)
+Albumin: 2.952936  (cos=0.959)
+Emesis: 145.410319  (cos=0.781)
+Chest Tube: 42.748819  (cos=0.995)
+Normal Saline: 58.875612  (cos=0.996)
 ===============================================================
-D5W [carried=0]: min_cos_to_recon = 0.448 (recon_var=Age) | max_cos_to_recon = 0.923 (recon_var=Urine)
-FiO2 [carried=0]: min_cos_to_recon = 0.395 (recon_var=Age) | max_cos_to_recon = 0.940 (recon_var=DBP)
-Fresh Frozen Plasma [carried=1]: min_cos_to_recon = 0.579 (recon_var=Age) | max_cos_to_recon = 0.881 (recon_var=ALP)
-HR [carried=0]: min_cos_to_recon = 0.389 (recon_var=Age) | max_cos_to_recon = 0.883 (recon_var=RBC)
-KCl [carried=0]: min_cos_to_recon = 0.441 (recon_var=Age) | max_cos_to_recon = 0.909 (recon_var=ALP)
-Lactated Ringers [carried=0]: min_cos_to_recon = 0.534 (recon_var=Age) | max_cos_to_recon = 0.921 (recon_var=ALP)
-Lorazepam [carried=0]: min_cos_to_recon = 0.457 (recon_var=Age) | max_cos_to_recon = 0.912 (recon_var=ALP)
-Morphine Sulfate [carried=0]: min_cos_to_recon = 0.474 (recon_var=Age) | max_cos_to_recon = 0.880 (recon_var=ALP)
-Neosynephrine [carried=0]: min_cos_to_recon = 0.483 (recon_var=Age) | max_cos_to_recon = 0.906 (recon_var=ALP)
-O2 Saturation [carried=0]: min_cos_to_recon = 0.498 (recon_var=Age) | max_cos_to_recon = 0.924 (recon_var=DBP)
-Recon-only: min_cos_to_any_original = 0.259 (recon_var=Age)
-Recon-only: max_cos_to_any_original = 0.983 (recon_var=PO2)
+D5W [carried=0]: min_cos_to_recon = 0.205 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 1.000 (recon_var=Weight)
+FiO2 [carried=0]: min_cos_to_recon = 0.211 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 1.000 (recon_var=RR)
+Fresh Frozen Plasma [carried=1]: min_cos_to_recon = 0.196 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 0.997 (recon_var=Weight)
+HR [carried=0]: min_cos_to_recon = 0.217 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 1.000 (recon_var=SBP)
+KCl [carried=0]: min_cos_to_recon = 0.198 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 0.999 (recon_var=Weight)
+Lactated Ringers [carried=0]: min_cos_to_recon = 0.201 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 0.999 (recon_var=Weight)
+Lorazepam [carried=0]: min_cos_to_recon = 0.200 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 0.998 (recon_var=Weight)
+Morphine Sulfate [carried=0]: min_cos_to_recon = 0.206 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 0.998 (recon_var=SBP)
+Neosynephrine [carried=0]: min_cos_to_recon = 0.200 (recon_var=Bilirubin (Total)) | max_cos_to_recon = 0.999 (recon_var=Weight)
+Recon-only: min_cos_to_any_original = 0.196 (recon_var=Bilirubin (Total))
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=Weight)
 ================ Named Reconstruction ================
-Sample:     5/5
+Sample:     5/10
 Patient ID: 212492.0
 Set index:  43
-#Events:    10 (match scope: global, vocab=131)
+#Events:    10 (match scope: global, vocab=131, space=reduced)
 ---------------------------------------------------------------
 Original events (name -> de-normalized original value):
   - DBP: 55.000000 (carried)
@@ -226,24 +217,254 @@ Original events (name -> de-normalized original value):
 ---------------------------------------------------------------
 Reconstruction matched results (No-mask):
 variable | Pred value (denorm) | cosine | carried
-DBP | 66.872646 | 0.981 | 1
-SBP | 131.535629 | 0.978 | 1
-Urine | 141.738482 | 0.880 | 0
-MBP | 89.559427 | 0.955 | 1
+RR | 23.989947 | 1.000 | 1
+SBP | 131.249324 | 1.000 | 1
+DBP | 63.728494 | 0.999 | 1
+GCS_eye | 3.436072 | 0.998 | 1
+Urine | 164.861714 | 1.000 | 0
 ---------------------------------------------------------------
 Unmatched predictions (No-mask):
-RBC: 3.665962  (cos=0.963)
-Dopamine: 30.926673  (cos=0.895)
-PT: 16.876115  (cos=0.813)
-ALP: 193.121037  (cos=0.950)
-Colloid: 787.457849  (cos=0.762)
-PCO2: 44.561731  (cos=0.942)
+Glucose (Blood): 149.179611  (cos=0.995)
+Normal Saline: 59.943580  (cos=0.997)
+Total CO2: 24.974725  (cos=0.971)
+O2 Saturation: 97.910273  (cos=1.000)
+Weight: 87.594693  (cos=0.999)
 ===============================================================
-GCS_eye [carried=1]: min_cos_to_recon = 0.565 (recon_var=Colloid) | max_cos_to_recon = 0.884 (recon_var=ALP)
-GCS_motor [carried=1]: min_cos_to_recon = 0.599 (recon_var=Colloid) | max_cos_to_recon = 0.860 (recon_var=Urine)
-GCS_verbal [carried=1]: min_cos_to_recon = 0.549 (recon_var=Colloid) | max_cos_to_recon = 0.883 (recon_var=ALP)
-HR [carried=1]: min_cos_to_recon = 0.670 (recon_var=Colloid) | max_cos_to_recon = 0.892 (recon_var=MBP)
-PO intake [carried=0]: min_cos_to_recon = 0.549 (recon_var=Colloid) | max_cos_to_recon = 0.846 (recon_var=ALP)
-RR [carried=1]: min_cos_to_recon = 0.321 (recon_var=Colloid) | max_cos_to_recon = 0.950 (recon_var=SBP)
-Recon-only: min_cos_to_any_original = 0.280 (recon_var=Colloid)
-Recon-only: max_cos_to_any_original = 0.982 (recon_var=RBC)
+GCS_motor [carried=1]: min_cos_to_recon = 0.970 (recon_var=Total CO2) | max_cos_to_recon = 1.000 (recon_var=RR)
+GCS_verbal [carried=1]: min_cos_to_recon = 0.971 (recon_var=Total CO2) | max_cos_to_recon = 1.000 (recon_var=RR)
+HR [carried=1]: min_cos_to_recon = 0.971 (recon_var=Total CO2) | max_cos_to_recon = 1.000 (recon_var=RR)
+MBP [carried=1]: min_cos_to_recon = 0.969 (recon_var=Total CO2) | max_cos_to_recon = 1.000 (recon_var=RR)
+PO intake [carried=0]: min_cos_to_recon = 0.969 (recon_var=Total CO2) | max_cos_to_recon = 0.999 (recon_var=RR)
+Recon-only: min_cos_to_any_original = 0.969 (recon_var=Total CO2)
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=O2 Saturation)
+================ Named Reconstruction ================
+Sample:     6/10
+Patient ID: 288719.0
+Set index:  139
+#Events:    12 (match scope: global, vocab=131, space=reduced)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - DBP: 75.000000 (not carried)
+  - GCS_eye: 4.000000 (not carried)
+  - GCS_motor: 6.000000 (not carried)
+  - GCS_verbal: 5.000000 (not carried)
+  - HR: 75.000000 (not carried)
+  - MBP: 78.000004 (not carried)
+  - O2 Saturation: 99.999997 (not carried)
+  - RR: 17.000000 (not carried)
+  - SBP: 89.000000 (not carried)
+  - Temperature: 36.111109 (not carried)
+  - Urine: 99.999999 (not carried)
+  - Weight: 76.900004 (not carried)
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine | carried
+O2 Saturation | 99.669032 | 1.000 | 0
+SBP | 142.741327 | 1.000 | 0
+Urine | 164.191313 | 0.999 | 0
+Temperature | 37.287146 | 1.000 | 0
+RR | 25.652069 | 1.000 | 0
+DBP | 69.248273 | 1.000 | 0
+GCS_eye | 3.576523 | 0.999 | 0
+MBP | 82.084867 | 0.999 | 0
+Weight | 97.116304 | 1.000 | 0
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+D5W: 57.583305  (cos=0.999)
+Normal Saline: 75.074240  (cos=0.999)
+Glucose (Blood): 156.444141  (cos=0.999)
+===============================================================
+GCS_motor [carried=0]: min_cos_to_recon = 0.999 (recon_var=MBP) | max_cos_to_recon = 1.000 (recon_var=SBP)
+GCS_verbal [carried=0]: min_cos_to_recon = 0.999 (recon_var=MBP) | max_cos_to_recon = 1.000 (recon_var=SBP)
+HR [carried=0]: min_cos_to_recon = 0.998 (recon_var=D5W) | max_cos_to_recon = 1.000 (recon_var=RR)
+Recon-only: min_cos_to_any_original = 0.998 (recon_var=D5W)
+Recon-only: max_cos_to_any_original = 0.999 (recon_var=Glucose (Blood))
+================ Named Reconstruction ================
+Sample:     7/10
+Patient ID: 210579.0
+Set index:  54
+#Events:    21 (match scope: global, vocab=131, space=reduced)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - D5W: 99.999999 (carried)
+  - DBP: 44.999999 (not carried)
+  - Fentanyl: 0.100000 (not carried)
+  - FiO2: 0.700000 (not carried)
+  - Fiber: 9.999999 (not carried)
+  - GCS_eye: 2.000000 (not carried)
+  - GCS_motor: 5.000000 (not carried)
+  - GCS_verbal: 1.000000 (not carried)
+  - Gastric Meds: 50.000003 (carried)
+  - Glucose (Blood): 104.999997 (not carried)
+  - HR: 41.999996 (not carried)
+  - Insulin Regular: 3.000000 (not carried)
+  - Jackson-Pratt: 4.999993 (not carried)
+  - MBP: 62.333305 (not carried)
+  - Midazolam: 2.000000 (not carried)
+  - Normal Saline: 35.000000 (not carried)
+  - O2 Saturation: 99.999997 (not carried)
+  - RR: 8.666667 (not carried)
+  - SBP: 97.000001 (not carried)
+  - Temperature: 36.111105 (not carried)
+  - Urine: 39.999999 (not carried)
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine | carried
+GCS_motor | 6.022196 | 1.000 | 0
+SBP | 149.399690 | 1.000 | 0
+GCS_verbal | 4.557475 | 1.000 | 0
+O2 Saturation | 101.269184 | 1.000 | 0
+RR | 25.223660 | 1.000 | 0
+D5W | 103.828226 | 1.000 | 1
+HR | 99.899840 | 1.000 | 0
+Normal Saline | 102.388852 | 0.999 | 0
+Urine | 257.019039 | 1.000 | 0
+Glucose (Blood) | 175.292299 | 1.000 | 0
+DBP | 76.655480 | 1.000 | 0
+MBP | 90.801482 | 1.000 | 0
+Temperature | 37.621492 | 1.000 | 0
+FiO2 | 0.695972 | 1.000 | 0
+GCS_eye | 4.191751 | 1.000 | 0
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+Base Excess: -0.475977  (cos=0.998)
+Neosynephrine: 5.115061  (cos=0.995)
+Propofol: 195.651702  (cos=0.999)
+Weight: 109.416551  (cos=1.000)
+PO intake: 219.997469  (cos=0.999)
+Solution: 17.230887  (cos=0.998)
+===============================================================
+Fentanyl [carried=0]: min_cos_to_recon = 0.994 (recon_var=Neosynephrine) | max_cos_to_recon = 0.999 (recon_var=RR)
+Fiber [carried=0]: min_cos_to_recon = 0.992 (recon_var=Neosynephrine) | max_cos_to_recon = 0.998 (recon_var=HR)
+Gastric Meds [carried=1]: min_cos_to_recon = 0.993 (recon_var=Neosynephrine) | max_cos_to_recon = 0.998 (recon_var=DBP)
+Insulin Regular [carried=0]: min_cos_to_recon = 0.995 (recon_var=Neosynephrine) | max_cos_to_recon = 0.999 (recon_var=Temperature)
+Jackson-Pratt [carried=0]: min_cos_to_recon = 0.993 (recon_var=Neosynephrine) | max_cos_to_recon = 0.997 (recon_var=D5W)
+Midazolam [carried=0]: min_cos_to_recon = 0.994 (recon_var=Neosynephrine) | max_cos_to_recon = 0.999 (recon_var=GCS_motor)
+Recon-only: min_cos_to_any_original = 0.992 (recon_var=Neosynephrine)
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=Weight)
+================ Named Reconstruction ================
+Sample:     8/10
+Patient ID: 203668.0
+Set index:  3
+#Events:    6 (match scope: global, vocab=131, space=reduced)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - D5W: -0.000003 (carried)
+  - DBP: 68.000000 (not carried)
+  - HR: 104.000000 (not carried)
+  - MBP: 92.000005 (not carried)
+  - O2 Saturation: 96.999997 (not carried)
+  - SBP: 132.000001 (not carried)
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine | carried
+O2 Saturation | 97.481279 | 0.998 | 0
+SBP | 145.676390 | 1.000 | 0
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+GCS_eye: 3.669597  (cos=1.000)
+RR: 24.014079  (cos=1.000)
+Urine: 166.208188  (cos=0.999)
+Weight: 102.023014  (cos=1.000)
+===============================================================
+D5W [carried=1]: min_cos_to_recon = 0.998 (recon_var=O2 Saturation) | max_cos_to_recon = 1.000 (recon_var=SBP)
+DBP [carried=0]: min_cos_to_recon = 0.998 (recon_var=O2 Saturation) | max_cos_to_recon = 1.000 (recon_var=SBP)
+HR [carried=0]: min_cos_to_recon = 0.997 (recon_var=O2 Saturation) | max_cos_to_recon = 1.000 (recon_var=SBP)
+MBP [carried=0]: min_cos_to_recon = 0.997 (recon_var=O2 Saturation) | max_cos_to_recon = 1.000 (recon_var=SBP)
+Recon-only: min_cos_to_any_original = 0.999 (recon_var=Urine)
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=Weight)
+================ Named Reconstruction ================
+Sample:     9/10
+Patient ID: 211337.0
+Set index:  13
+#Events:    14 (match scope: global, vocab=131, space=reduced)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - DBP: 56.000000 (carried)
+  - Dextrose Other: 10.000005 (carried)
+  - Fresh Frozen Plasma: 300.999998 (not carried)
+  - Glucose (Blood): 202.999999 (carried)
+  - HR: 94.000000 (carried)
+  - Insulin Regular: 7.000000 (carried)
+  - MBP: 73.000004 (carried)
+  - Normal Saline: 7.000002 (carried)
+  - O2 Saturation: 99.999997 (carried)
+  - PO intake: 100.000002 (carried)
+  - RR: 19.000000 (carried)
+  - SBP: 107.000000 (carried)
+  - Temperature: 36.388892 (carried)
+  - Urine: 0.000001 (carried)
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine | carried
+MBP | 82.936754 | 1.000 | 1
+RR | 24.799311 | 1.000 | 1
+HR | 92.202624 | 1.000 | 1
+Urine | 179.010244 | 1.000 | 1
+SBP | 137.414928 | 1.000 | 1
+Normal Saline | 71.028879 | 0.999 | 1
+DBP | 70.335267 | 1.000 | 1
+O2 Saturation | 97.986276 | 0.999 | 1
+Temperature | 37.162885 | 0.999 | 1
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+Intubated: 0.805475  (cos=0.422)
+Weight: 97.332402  (cos=1.000)
+FiO2: 0.579289  (cos=0.997)
+Total CO2: 24.973563  (cos=0.977)
+GCS_motor: 5.657241  (cos=0.999)
+===============================================================
+Dextrose Other [carried=1]: min_cos_to_recon = 0.409 (recon_var=Intubated) | max_cos_to_recon = 0.999 (recon_var=SBP)
+Fresh Frozen Plasma [carried=0]: min_cos_to_recon = 0.406 (recon_var=Intubated) | max_cos_to_recon = 0.997 (recon_var=Temperature)
+Glucose (Blood) [carried=1]: min_cos_to_recon = 0.407 (recon_var=Intubated) | max_cos_to_recon = 1.000 (recon_var=RR)
+Insulin Regular [carried=1]: min_cos_to_recon = 0.409 (recon_var=Intubated) | max_cos_to_recon = 0.999 (recon_var=RR)
+PO intake [carried=1]: min_cos_to_recon = 0.403 (recon_var=Intubated) | max_cos_to_recon = 0.999 (recon_var=RR)
+Recon-only: min_cos_to_any_original = 0.403 (recon_var=Intubated)
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=Weight)
+================ Named Reconstruction ================
+Sample:     10/10
+Patient ID: 228236.0
+Set index:  258
+#Events:    13 (match scope: global, vocab=131, space=reduced)
+---------------------------------------------------------------
+Original events (name -> de-normalized original value):
+  - D5W: 11.204908 (not carried)
+  - DBP: 68.000000 (carried)
+  - HR: 73.999999 (carried)
+  - KCl: 4.000000 (carried)
+  - MBP: 97.000004 (carried)
+  - Normal Saline: 16.502817 (carried)
+  - O2 Saturation: 98.999997 (carried)
+  - Propofol: 81.818219 (carried)
+  - RR: 20.999999 (carried)
+  - SBP: 151.000000 (carried)
+  - Solution: 8.181821 (carried)
+  - Urine: 89.999999 (carried)
+  - Weight: 89.500003 (carried)
+---------------------------------------------------------------
+Reconstruction matched results (No-mask):
+variable | Pred value (denorm) | cosine | carried
+Weight | 104.316661 | 1.000 | 1
+DBP | 73.946743 | 1.000 | 1
+HR | 88.970203 | 0.999 | 1
+RR | 25.919158 | 1.000 | 1
+MBP | 84.245645 | 1.000 | 1
+Urine | 235.620733 | 1.000 | 1
+SBP | 141.028100 | 1.000 | 1
+O2 Saturation | 99.083921 | 1.000 | 1
+---------------------------------------------------------------
+Unmatched predictions (No-mask):
+FiO2: 0.638304  (cos=1.000)
+ALT: 335.803401  (cos=0.939)
+Bilirubin (Direct): 3.517914  (cos=0.966)
+Temperature: 37.269432  (cos=1.000)
+GCS_motor: 5.731403  (cos=0.999)
+===============================================================
+D5W [carried=0]: min_cos_to_recon = 0.935 (recon_var=ALT) | max_cos_to_recon = 1.000 (recon_var=Urine)
+KCl [carried=1]: min_cos_to_recon = 0.931 (recon_var=ALT) | max_cos_to_recon = 0.999 (recon_var=Urine)
+Normal Saline [carried=1]: min_cos_to_recon = 0.938 (recon_var=ALT) | max_cos_to_recon = 1.000 (recon_var=DBP)
+Propofol [carried=1]: min_cos_to_recon = 0.934 (recon_var=ALT) | max_cos_to_recon = 1.000 (recon_var=Urine)
+Solution [carried=1]: min_cos_to_recon = 0.935 (recon_var=ALT) | max_cos_to_recon = 1.000 (recon_var=DBP)
+Recon-only: min_cos_to_any_original = 0.931 (recon_var=ALT)
+Recon-only: max_cos_to_any_original = 1.000 (recon_var=FiO2)
+Completed!
