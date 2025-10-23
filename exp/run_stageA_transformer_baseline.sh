@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: bash exp/run_stageA_transformer_baseline.sh \
-#   /path/to/stageA_setvae.ckpt \
+# Usage: bash exp/run_transformer_baseline.sh \
+#   /path/to/setvae.ckpt \
 #   /path/to/data_dir \
 #   /path/to/labels.csv \
 #   /path/to/output_dir
@@ -22,18 +22,18 @@ if [[ -z "${STAGEA_CKPT}" || -z "${DATA_DIR}" || -z "${LABELS}" ]]; then
 fi
 
 python -u seqsetvae_poe/train.py \
-  --stage C \
-  --mode stageA_transformer \
-  --stageA_ckpt "${STAGEA_CKPT}" \
+  --branch discriminative \
+  --mode transformer \
+  --setvae_ckpt "${STAGEA_CKPT}" \
   --data_dir "${DATA_DIR}" \
   --label_csv "${LABELS}" \
   --batch_size 64 \
   --num_workers 2 \
   --max_epochs 20 \
-  --lr 1e-3 \
+  --lr 3e-4 \
   --dropout 0.2 \
-  --d_model 128 \
-  --nhead 4 \
-  --num_layers 2 \
+  --d_model 256 \
+  --nhead 8 \
+  --num_layers 3 \
   --output_dir "${OUT_DIR}" \
   --precision 16-mixed

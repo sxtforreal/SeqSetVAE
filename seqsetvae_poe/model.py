@@ -251,6 +251,19 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 if pos_weight is not None
                 else nn.BCEWithLogitsLoss()
             )
+            # Buffers for epoch-level classification metrics
+            self._val_logits: list[float] = []
+            self._val_labels: list[int] = []
+            self._test_logits: list[float] = []
+            self._test_labels: list[int] = []
+            # Optional sklearn metrics (fallback-safe)
+            try:
+                from sklearn.metrics import roc_auc_score as _auc, average_precision_score as _ap  # type: ignore
+                self._roc_auc_score = _auc
+                self._average_precision_score = _ap
+            except Exception:
+                self._roc_auc_score = None
+                self._average_precision_score = None
         self.save_hyperparameters()
 
     # --- helpers ---
@@ -652,6 +665,12 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             y = batch["y"].to(logits.dtype)
             cls_loss = self._bce_cls(logits, y)
             total = total + self.cls_loss_weight * cls_loss
+            # accumulate for epoch-level metrics
+            try:
+                self._val_logits.extend(logits.detach().cpu().tolist())
+                self._val_labels.extend(y.detach().cpu().tolist())
+            except Exception:
+                pass
         else:
             cls_loss = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
         log_dict = {"val_loss": total, "val_recon": recon, "val_kl": kl, "val_kl_obj": kl_objective, "val_beta": beta, "val_capacity": cap, "val_kl_fair": fairness, "val_var_pen": var_pen}
@@ -1412,12 +1431,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         self._val_kl_count = 0
 
     def on_validation_epoch_end(self):
+        kl_epoch = None
         if self._val_kl_count <= 0:
-            return
-        kl_epoch = self._val_kl_sum / max(1, self._val_kl_count)
-        self.log("val_kl_last_epoch", kl_epoch, prog_bar=True)
+            # still try to emit classification metrics if available
+            pass
+        else:
+            kl_epoch = self._val_kl_sum / max(1, self._val_kl_count)
+            self.log("val_kl_last_epoch", kl_epoch, prog_bar=True)
         # Auto-tune if KL below target
-        if self.auto_tune_kl and kl_epoch < self.kl_target_nats:
+        if kl_epoch is not None and self.auto_tune_kl and kl_epoch < self.kl_target_nats:
             self._kl_not_met_epochs += 1
             if self._kl_not_met_epochs >= self.kl_patience_epochs:
                 did_adjust = False
@@ -1453,6 +1475,42 @@ class SetVAEOnlyPretrain(pl.LightningModule):
                             self.trainer.should_stop = True
                     except Exception:
                         pass
+        # Emit epoch-level classification metrics when joint classification is enabled
+        if getattr(self, "enable_cls", False):
+            try:
+                if len(getattr(self, "_val_labels", [])) > 0:
+                    y_true = np.array(self._val_labels, dtype=np.int32)
+                    y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
+                    auroc = float(self._roc_auc_score(y_true, y_prob)) if getattr(self, "_roc_auc_score", None) is not None else float("nan")
+                    auprc = float(self._average_precision_score(y_true, y_prob)) if getattr(self, "_average_precision_score", None) is not None else float("nan")
+                    # Best threshold by accuracy for reference
+                    best_thr = 0.5
+                    best_acc = 0.0
+                    try:
+                        qs = np.linspace(0.05, 0.95, 19)
+                        cand = np.unique(np.quantile(y_prob, qs))
+                        for t in cand:
+                            y_hat = (y_prob >= t).astype(int)
+                            acc = float((y_hat == y_true).mean())
+                            if acc > best_acc:
+                                best_acc = acc
+                                best_thr = float(t)
+                    except Exception:
+                        pass
+                else:
+                    auroc, auprc, best_acc, best_thr = float("nan"), float("nan"), float("nan"), 0.5
+            except Exception:
+                auroc, auprc, best_acc, best_thr = float("nan"), float("nan"), float("nan"), 0.5
+            # Log for callbacks (EarlyStopping/ModelCheckpoint)
+            self.log("val_auroc", auroc, prog_bar=True)
+            self.log("val_auprc", auprc, prog_bar=True)
+            self.log("val_best_acc", best_acc, prog_bar=False)
+            self.log("val_best_thr", best_thr, prog_bar=False)
+            # Clear buffers
+            if hasattr(self, "_val_logits"):
+                self._val_logits.clear()
+            if hasattr(self, "_val_labels"):
+                self._val_labels.clear()
 
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)
@@ -1934,7 +1992,7 @@ def _build_setvae_from_state(state: Dict[str, torch.Tensor]) -> 'SetVAEOnlyPretr
     return model
 
 
-class StageASetVAETransformerClassifier(pl.LightningModule):
+class TransformerSetVAEClassifier(pl.LightningModule):
     """Transformer classifier over per-set SetVAE posterior features (Stage A baseline).
 
     Token features per set t:
