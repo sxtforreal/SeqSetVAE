@@ -23,7 +23,7 @@ fi
 
 python -u seqsetvae_poe/train.py \
   --stage C \
-  --mode stageA_transformer \
+  --mode transformer \
   --stageA_ckpt "${STAGEA_CKPT}" \
   --data_dir "${DATA_DIR}" \
   --label_csv "${LABELS}" \

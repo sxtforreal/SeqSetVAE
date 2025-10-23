@@ -521,7 +521,7 @@ def _run_stage_b():
                 print(f"Failed to initialize from init_ckpt: {e}")
 
     out_root = args.output_dir if args.output_dir else "./output"
-    stage_name = "Stage_B"
+    stage_name = "gru"
     project_dir = os.path.join(out_root, stage_name)
     os.makedirs(project_dir, exist_ok=True)
     try:
@@ -592,9 +592,9 @@ def _run_stage_b():
 
 def _run_stage_c():
     parser = argparse.ArgumentParser(description="Stage C - Mortality classifier on PoE features")
-    parser.add_argument("--mode", type=str, choices=["poe", "stageA_transformer"], default="poe")
+    parser.add_argument("--mode", type=str, choices=["poe", "transformer"], default="poe")
     parser.add_argument("--checkpoint", required=False, type=str, help="PoE checkpoint (.ckpt) when --mode=poe")
-    parser.add_argument("--stageA_ckpt", required=False, type=str, help="Stage A SetVAE checkpoint (.ckpt) when --mode=stageA_transformer")
+    parser.add_argument("--stageA_ckpt", required=False, type=str, help="Stage A SetVAE checkpoint (.ckpt) when --mode=transformer")
     parser.add_argument("--label_csv", required=True, type=str)
     parser.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
     parser.add_argument("--batch_size", type=int, default=4)
@@ -620,7 +620,7 @@ def _run_stage_c():
         poe = _build_poe_from_state(state)
     else:
         if not args.stageA_ckpt:
-            raise ValueError("--stageA_ckpt is required when --mode=stageA_transformer")
+            raise ValueError("--stageA_ckpt is required when --mode=transformer")
         setvae_state = _load_state_dict(args.stageA_ckpt)
         setvae = _build_setvae_from_state(setvae_state)
 
@@ -667,7 +667,7 @@ def _run_stage_c():
         )
 
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "Stage_C" if args.mode == "poe" else "Stage_C_StageATransformer")
+    project_dir = os.path.join(out_root, "Stage_C" if args.mode == "poe" else "Stage_C_transformer")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
