@@ -1022,7 +1022,11 @@ def evaluate_ood_scramble(
     model: torch.nn.Module,
     dataloader,
     num_sets: int = 200,
-    scheme: str = "permute_vals",
+    scheme: str = "sample_from_stats",
+    # Optional resources for stats-based scrambling
+    stats_map: Optional[Dict[str, Tuple[float, float]]] = None,
+    vocab_event_names: Optional[List[str]] = None,
+    vocab_dirs_np: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     encoder = _get_encoder_from_model(model)
     if encoder is None:
@@ -1050,9 +1054,35 @@ def evaluate_ood_scramble(
                 scores.append(score_real)
                 labels.append(0)
 
-                # Scrambled score
-                perm = rng.permutation(N)
-                val_scr = val[:, perm, :]
+                # Scrambled score (single supported scheme)
+                if scheme == "sample_from_stats":
+                    # Require stats_map and vocab resources
+                    if stats_map is None or vocab_event_names is None or vocab_dirs_np is None:
+                        # If resources missing, skip this set
+                        continue
+                    else:
+                        # Map each token's variable embedding to a variable name via cosine on unit directions
+                        with torch.no_grad():
+                            vdirs = var / (torch.norm(var, p=2, dim=-1, keepdim=True) + 1e-8)
+                        vdirs_np = vdirs.squeeze(0).detach().cpu().numpy()  # [N,D]
+                        # Cosine similarity matrix [N,V]
+                        sims = np.matmul(vdirs_np, vocab_dirs_np.T)
+                        sims = np.abs(sims)
+                        best = np.argmax(sims, axis=1)  # [N]
+                        # Sample per variable from original (raw) distribution ~ N(mean,std), then normalize
+                        sampled = np.zeros((N,), dtype=np.float32)
+                        for i in range(N):
+                            name = str(vocab_event_names[best[i]])
+                            m, s_std = stats_map.get(name, (0.0, 1.0))
+                            s_eff = s_std if abs(s_std) > 1e-12 else 1.0
+                            x_raw = float(rng.normal(loc=m, scale=s_eff))
+                            x_norm = (x_raw - m) / s_eff
+                            sampled[i] = np.float32(x_norm)
+                        val_scr = torch.from_numpy(sampled.reshape(1, N, 1)).to(device)
+                else:
+                    # Unknown scheme -> skip
+                    continue
+
                 score_scr = _per_set_elbo_score(encoder, var, val_scr)
                 scores.append(score_scr)
                 labels.append(1)
@@ -1268,10 +1298,8 @@ def visualize_ood_scramble(
                     continue
                 # Real
                 scores_real.append(_per_set_elbo_score(encoder, var, val))
-                # Scramble
-                perm = rng.permutation(N)
-                val_scr = val[:, perm, :]
-                scores_scr.append(_per_set_elbo_score(encoder, var, val_scr))
+                # For now, do not visualize stats-based scramble without extra resources.
+                # Skip plotting detailed scramble overlay to avoid misinterpretation.
                 seen += 1
                 if seen >= num_sets:
                     break
@@ -2024,7 +2052,13 @@ def _run_pretrain_eval():
     ap.add_argument("--no_eval_ood_scramble", dest="eval_ood_scramble", action="store_false", help="Disable OOD scramble evaluation")
     ap.set_defaults(eval_ood_scramble=True)
     ap.add_argument("--ood_num_sets", type=int, default=200, help="#sets to sample for OOD scramble eval")
-    ap.add_argument("--ood_scheme", type=str, choices=["permute_vals"], default="permute_vals", help="Scramble scheme")
+    ap.add_argument(
+        "--ood_scheme",
+        type=str,
+        choices=["sample_from_stats"],
+        default="sample_from_stats",
+        help="Scramble scheme",
+    )
     # Optional CLI overrides for dims (useful when config defaults mismatch checkpoint)
     ap.add_argument("--input_dim", type=int, default=None)
     ap.add_argument("--reduced_dim", type=int, default=None)
@@ -2255,11 +2289,57 @@ def _run_pretrain_eval():
             extra_evals["mask_consistency_error"] = str(e)
     if getattr(args, "eval_ood_scramble", False):
         try:
+            # Optional resources for stats-based scramble
+            vocab_event_names: Optional[List[str]] = None
+            vocab_dirs_np: Optional[np.ndarray] = None
+            stats_map: Dict[str, Tuple[float, float]] = {}
+            try:
+                if getattr(args, "event_emb_csv", "") and os.path.exists(args.event_emb_csv):
+                    names, vecs = _load_global_vocab_embeddings(args.data_dir, args.event_emb_csv)
+                    device = next(model.parameters()).device
+                    vecs_t = torch.from_numpy(vecs).unsqueeze(0).to(device)
+                    # Reduce if encoder has reducer
+                    enc = _get_encoder_from_model(model)
+                    if enc is not None and getattr(enc, "dim_reducer", None) is not None:
+                        try:
+                            vecs_red = enc.dim_reducer(vecs_t)
+                        except Exception:
+                            vecs_red = vecs_t
+                        dirs_t = vecs_red / (torch.norm(vecs_red, p=2, dim=-1, keepdim=True) + 1e-8)
+                    else:
+                        dirs_t = vecs_t / (torch.norm(vecs_t, p=2, dim=-1, keepdim=True) + 1e-8)
+                    vocab_dirs_np = dirs_t.squeeze(0).detach().cpu().numpy()
+                    vocab_event_names = [str(n) for n in names]
+                if getattr(args, "stats_csv", None) and os.path.exists(args.stats_csv):
+                    df_stats = pd.read_csv(args.stats_csv)
+                    key_col = _detect_key_column(df_stats)
+                    # normalize mean/std naming
+                    rename = {}
+                    for c in df_stats.columns:
+                        lc = c.lower()
+                        if lc == "mean":
+                            rename[c] = "mean"
+                        if lc in ("std", "stdev", "stddev"):
+                            rename[c] = "std"
+                    df_stats = df_stats.rename(columns=rename)
+                    if "mean" in df_stats.columns and "std" in df_stats.columns:
+                        for _, r in df_stats.iterrows():
+                            vname = str(r[key_col])
+                            m = float(r["mean"]) if pd.notna(r["mean"]) else 0.0
+                            s_raw = float(r["std"]) if pd.notna(r["std"]) else 1.0
+                            s_eff = s_raw if abs(s_raw) > 1e-12 else 1.0
+                            stats_map[vname] = (m, s_eff)
+            except Exception:
+                pass
+
             extra_evals["ood_scramble"] = evaluate_ood_scramble(
                 model,
                 dl_vis,
                 num_sets=int(getattr(args, "ood_num_sets", 200)),
-                scheme=str(getattr(args, "ood_scheme", "permute_vals")),
+                scheme=str(getattr(args, "ood_scheme", "sample_from_stats")),
+                stats_map=stats_map if len(stats_map) > 0 else None,
+                vocab_event_names=vocab_event_names,
+                vocab_dirs_np=vocab_dirs_np,
             )
             # Visualize
             try:
@@ -2268,7 +2348,7 @@ def _run_pretrain_eval():
                     dl_vis,
                     out_dir=args.output_dir,
                     num_sets=int(getattr(args, "ood_num_sets", 200)),
-                    scheme=str(getattr(args, "ood_scheme", "permute_vals")),
+                    scheme=str(getattr(args, "ood_scheme", "sample_from_stats")),
                 )
             except Exception:
                 pass
