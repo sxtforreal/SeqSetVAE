@@ -1022,7 +1022,7 @@ def evaluate_ood_scramble(
     model: torch.nn.Module,
     dataloader,
     num_sets: int = 200,
-    scheme: str = "permute_vals",
+    scheme: str = "sample_from_stats",
     # Optional resources for stats-based scrambling
     stats_map: Optional[Dict[str, Tuple[float, float]]] = None,
     vocab_event_names: Optional[List[str]] = None,
@@ -1054,16 +1054,12 @@ def evaluate_ood_scramble(
                 scores.append(score_real)
                 labels.append(0)
 
-                # Scrambled score (multiple schemes)
-                if scheme == "permute_vals":
-                    perm = rng.permutation(N)
-                    val_scr = val[:, perm, :]
-                elif scheme == "sample_from_stats":
+                # Scrambled score (single supported scheme)
+                if scheme == "sample_from_stats":
                     # Require stats_map and vocab resources
                     if stats_map is None or vocab_event_names is None or vocab_dirs_np is None:
-                        # Fallback to permute if resources missing
-                        perm = rng.permutation(N)
-                        val_scr = val[:, perm, :]
+                        # If resources missing, skip this set
+                        continue
                     else:
                         # Map each token's variable embedding to a variable name via cosine on unit directions
                         with torch.no_grad():
@@ -1084,9 +1080,8 @@ def evaluate_ood_scramble(
                             sampled[i] = np.float32(x_norm)
                         val_scr = torch.from_numpy(sampled.reshape(1, N, 1)).to(device)
                 else:
-                    # Unknown scheme -> fallback to permute
-                    perm = rng.permutation(N)
-                    val_scr = val[:, perm, :]
+                    # Unknown scheme -> skip
+                    continue
 
                 score_scr = _per_set_elbo_score(encoder, var, val_scr)
                 scores.append(score_scr)
@@ -1303,10 +1298,8 @@ def visualize_ood_scramble(
                     continue
                 # Real
                 scores_real.append(_per_set_elbo_score(encoder, var, val))
-                # Scramble
-                perm = rng.permutation(N)
-                val_scr = val[:, perm, :]
-                scores_scr.append(_per_set_elbo_score(encoder, var, val_scr))
+                # For now, do not visualize stats-based scramble without extra resources.
+                # Skip plotting detailed scramble overlay to avoid misinterpretation.
                 seen += 1
                 if seen >= num_sets:
                     break
@@ -2062,8 +2055,8 @@ def _run_pretrain_eval():
     ap.add_argument(
         "--ood_scheme",
         type=str,
-        choices=["permute_vals", "sample_from_stats"],
-        default="permute_vals",
+        choices=["sample_from_stats"],
+        default="sample_from_stats",
         help="Scramble scheme",
     )
     # Optional CLI overrides for dims (useful when config defaults mismatch checkpoint)
@@ -2343,7 +2336,7 @@ def _run_pretrain_eval():
                 model,
                 dl_vis,
                 num_sets=int(getattr(args, "ood_num_sets", 200)),
-                scheme=str(getattr(args, "ood_scheme", "permute_vals")),
+                scheme=str(getattr(args, "ood_scheme", "sample_from_stats")),
                 stats_map=stats_map if len(stats_map) > 0 else None,
                 vocab_event_names=vocab_event_names,
                 vocab_dirs_np=vocab_dirs_np,
@@ -2355,7 +2348,7 @@ def _run_pretrain_eval():
                     dl_vis,
                     out_dir=args.output_dir,
                     num_sets=int(getattr(args, "ood_num_sets", 200)),
-                    scheme=str(getattr(args, "ood_scheme", "permute_vals")),
+                    scheme=str(getattr(args, "ood_scheme", "sample_from_stats")),
                 )
             except Exception:
                 pass
