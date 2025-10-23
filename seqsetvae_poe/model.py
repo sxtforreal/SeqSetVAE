@@ -1992,7 +1992,7 @@ def _build_setvae_from_state(state: Dict[str, torch.Tensor]) -> 'SetVAEOnlyPretr
     return model
 
 
-class StageASetVAETransformerClassifier(pl.LightningModule):
+class TransformerSetVAEClassifier(pl.LightningModule):
     """Transformer classifier over per-set SetVAE posterior features (Stage A baseline).
 
     Token features per set t:

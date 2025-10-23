@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Unified train entrypoint with --stage {A,B,C}.
+Unified training entrypoint with --branch {setvae, generative, discriminative}.
 
-- Stage A: SetVAE-only pretraining (internals from _setvae_PT)
-- Stage B: Dynamics + conditional PoE pretraining (internals from _poe_PT)
-- Stage C: Downstream classifier (internals from classifier)
+- setvae: SetVAE-only pretraining (formerly Stage A)
+- generative: PoE dynamics + GRU backbone (formerly Stage B → GRU under generative)
+- discriminative: downstream classifiers (transformer baseline over SetVAE, or PoE-based classifier; formerly Stage C)
 
-All other arguments are forwarded to the underlying stage logic.
+Backwards compatibility: optional --stage {A,B,C} is accepted and mapped to the new --branch.
 """
 from __future__ import annotations
 import argparse
@@ -29,7 +29,7 @@ from model import (
     MortalityClassifier,
     _load_state_dict,
     _build_poe_from_state,
-    StageASetVAETransformerClassifier,
+    TransformerSetVAEClassifier,
     _build_setvae_from_state,
 )  # type: ignore
 
@@ -101,8 +101,8 @@ def _remap_setvae_from_A_to_target(
     return remapped
 
 
-def _strip_stage_from_argv():
-    # remove --stage and its value from sys.argv to avoid unknown-arg errors downstream
+def _strip_flags_from_argv(flag_names: list[str]):
+    """Remove flags (and their values when provided as separate tokens) from sys.argv."""
     argv = sys.argv
     out = [argv[0]]
     skip = 0
@@ -110,30 +110,46 @@ def _strip_stage_from_argv():
         if skip:
             skip -= 1
             continue
-        if tok == "--stage":
-            skip = 1  # skip its value
-            continue
-        if tok.startswith("--stage="):
+        matched = False
+        for name in flag_names:
+            if tok == name:
+                skip = 1  # skip its value
+                matched = True
+                break
+            if tok.startswith(name + "="):
+                matched = True
+                break
+        if matched:
             continue
         out.append(tok)
     sys.argv = out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Unified train with --stage {A,B,C}", add_help=False)
-    ap.add_argument("--stage", type=str, choices=["A", "B", "C"], required=True)
-    # parse only known stage and then strip
+    ap = argparse.ArgumentParser(description="Train with --branch {setvae,generative,discriminative}", add_help=False)
+    ap.add_argument("--branch", type=str, choices=["setvae", "generative", "discriminative"], required=False)
+    # Backward compatibility: accept --stage {A,B,C}
+    ap.add_argument("--stage", type=str, choices=["A", "B", "C"], required=False)
     args, _ = ap.parse_known_args()
-    _strip_stage_from_argv()
-    if args.stage == "A":
-        return _run_stage_a()
-    if args.stage == "B":
-        return _run_stage_b()
-    return _run_stage_c()
+
+    branch = args.branch
+    if branch is None and args.stage is not None:
+        branch = {"A": "setvae", "B": "generative", "C": "discriminative"}[args.stage]
+        _strip_flags_from_argv(["--stage"])  # drop legacy flag before parsing branch-specific args
+    if branch is None:
+        raise SystemExit("Please provide --branch {setvae,generative,discriminative} (or legacy --stage {A,B,C}).")
+
+    # Drop --branch itself before deeper parsing
+    _strip_flags_from_argv(["--branch"])
+    if branch == "setvae":
+        return _run_setvae()
+    if branch == "generative":
+        return _run_generative()
+    return _run_discriminative()
 
 
-def _run_stage_a():
-    parser = argparse.ArgumentParser(description="Stage A - SetVAE pretraining")
+def _run_setvae():
+    parser = argparse.ArgumentParser(description="setvae - SetVAE pretraining")
     # Data & loader
     parser.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
     parser.add_argument("--params_map_path", type=str, default=getattr(cfg, "params_map_path", ""))
@@ -251,7 +267,7 @@ def _run_stage_a():
             print(f"Failed to initialize from init_ckpt: {e}")
 
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "Stage_A")
+    project_dir = os.path.join(out_root, "setvae")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
@@ -278,8 +294,8 @@ def _run_stage_a():
     trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
 
-def _run_stage_b():
-    parser = argparse.ArgumentParser(description="Stage B - PoE+GRU pretraining (merged B1/B2)")
+def _run_generative():
+    parser = argparse.ArgumentParser(description="generative - PoE+GRU pretraining (merged B1/B2)")
     # Data & loader
     parser.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
     parser.add_argument("--params_map_path", type=str, default=getattr(cfg, "params_map_path", ""))
@@ -521,8 +537,7 @@ def _run_stage_b():
                 print(f"Failed to initialize from init_ckpt: {e}")
 
     out_root = args.output_dir if args.output_dir else "./output"
-    stage_name = "gru"
-    project_dir = os.path.join(out_root, stage_name)
+    project_dir = os.path.join(out_root, "generative", "gru")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
@@ -538,7 +553,7 @@ def _run_stage_b():
         save_top_k=1,
         monitor="val_loss",
         mode="min",
-        filename="poe_GRU_PT",
+        filename="gru_PT",
     )
     # When joint classification is enabled, also track classification metrics robust to imbalance
     callbacks = [LearningRateMonitor(logging_interval="step"), val_loss_ckpt]
@@ -590,8 +605,8 @@ def _run_stage_b():
     trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
 
-def _run_stage_c():
-    parser = argparse.ArgumentParser(description="Stage C - Mortality classifier on PoE features")
+def _run_discriminative():
+    parser = argparse.ArgumentParser(description="discriminative - Mortality classifier (transformer over SetVAE or PoE-based)")
     parser.add_argument("--mode", type=str, choices=["poe", "transformer"], default="poe")
     parser.add_argument("--checkpoint", required=False, type=str, help="PoE checkpoint (.ckpt) when --mode=poe")
     parser.add_argument("--stageA_ckpt", required=False, type=str, help="Stage A SetVAE checkpoint (.ckpt) when --mode=transformer")
@@ -651,7 +666,7 @@ def _run_stage_c():
             pos_weight=(None if getattr(dm, "use_weighted_sampler", False) else getattr(dm, "pos_weight", None)),
         )
     else:
-        model = StageASetVAETransformerClassifier(
+        model = TransformerSetVAEClassifier(
             setvae_model=setvae,
             latent_dim=int(getattr(setvae, "latent_dim", getattr(cfg, "latent_dim", 128))),
             mu_proj_dim=64,
@@ -667,7 +682,11 @@ def _run_stage_c():
         )
 
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "Stage_C" if args.mode == "poe" else "Stage_C_transformer")
+    # Discriminative branch outputs
+    if args.mode == "poe":
+        project_dir = os.path.join(out_root, "discriminative", "poe")
+    else:
+        project_dir = os.path.join(out_root, "discriminative", "transformer")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")

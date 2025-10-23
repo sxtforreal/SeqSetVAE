@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Unified eval entrypoint with --stage {A,B,C}.
- - A,B: run pretraining evaluation and optional named recon printing (formerly in _eval_PT)
- - C: evaluate frozen-backbone classifier on test split
+Unified eval entrypoint with --stage {A,B,C} (legacy) or new branches.
+- Pretraining eval (formerly A/B): collapse + reconstruction metrics
+- Discriminative eval (formerly C): classifier metrics on test split
 """
 from __future__ import annotations
 import argparse
@@ -1440,10 +1440,10 @@ def _run_var_scale_audit(model: torch.nn.Module, args):
     else:
         print("[INFO] matplotlib not available; skipping scatter plot")
 
-def _run_stage_ab():
+def _run_pretrain_eval():
     ap = argparse.ArgumentParser(
         add_help=False,
-        description="Evaluate SetVAE/PoE pretraining: collapse + reconstruction (Stage A/B)",
+        description="Evaluate setvae/poe pretraining: collapse + reconstruction (formerly Stage A/B)",
     )
     ap.add_argument("--checkpoint", required=True, type=str, help="Path to pretraining checkpoint (.ckpt)")
     ap.add_argument("--ckpt_type", type=str, choices=["auto", "setvae", "poe"], default="auto")
@@ -1800,7 +1800,7 @@ def _inject_ckpt_type_from_stage():
     sys.argv = new_argv
 
 
-def _run_stage_c():
+def _run_discriminative_eval():
     import argparse as _ap
     ap = _ap.ArgumentParser(description="Stage C evaluation (classifier on PoE features)")
     ap.add_argument("--classifier_ckpt", required=True, type=str, help="Path to trained MortalityClassifier checkpoint (.ckpt)")
@@ -1834,7 +1834,7 @@ def _run_stage_c():
         map_location="cpu",
     )
     out_root = args.output_dir if args.output_dir else "./output"
-    project_dir = os.path.join(out_root, "Stage_C_eval")
+    project_dir = os.path.join(out_root, "discriminative_eval")
     os.makedirs(project_dir, exist_ok=True)
     try:
         logger = TensorBoardLogger(save_dir=project_dir, name="", sub_dir="logs")
@@ -1851,9 +1851,9 @@ def main():
     p.add_argument("--stage", type=str, choices=["A", "B", "C"], required=False)
     s_args, _ = p.parse_known_args()
     if s_args.stage == "C":
-        return _run_stage_c()
+        return _run_discriminative_eval()
     _inject_ckpt_type_from_stage()
-    return _run_stage_ab()
+    return _run_pretrain_eval()
 
 
 if __name__ == "__main__":
