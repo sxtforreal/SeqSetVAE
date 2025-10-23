@@ -155,7 +155,8 @@ def _run_setvae():
     parser.add_argument("--init_ckpt", type=str, default=None)
     parser.add_argument("--log_every_n_steps", type=int, default=getattr(cfg, "log_every_n_steps", 50))
     parser.add_argument("--limit_val_batches", type=float, default=getattr(cfg, "limit_val_batches", 1.0))
-    parser.add_argument("--val_check_interval", type=float, default=getattr(cfg, "val_check_interval", 0.1))
+    # Validate once mid-epoch by default (0.5) for GRU pretraining
+    parser.add_argument("--val_check_interval", type=float, default=0.5)
     # InfoVAE / Flows
     parser.add_argument("--use_flows", action="store_true", default=False)
     parser.add_argument("--num_flows", type=int, default=0)
@@ -612,6 +613,8 @@ def _run_discriminative():
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--no_weighted_sampler", action="store_true", help="Disable class-balanced sampler (default enabled)")
+    # Validate once mid-epoch for transformer/classifier training as well
+    parser.add_argument("--val_check_interval", type=float, default=0.5)
     # Transformer hyperparams (baseline)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
@@ -701,6 +704,7 @@ def _run_discriminative():
         logger=logger,
         callbacks=callbacks,
         log_every_n_steps=50,
+        val_check_interval=args.val_check_interval,
     )
     trainer.fit(model, train_dataloaders=dm.train_dataloader(), val_dataloaders=dm.val_dataloader())
     print("\nEvaluating best checkpoint on test split...")
