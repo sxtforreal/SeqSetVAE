@@ -67,8 +67,8 @@ def _detect_setvae_prefix(keys: list[str]) -> str:
     return best[0] if best[1] > 0 else ""
 
 
-def _remap_setvae_from_A_to_target(
-    state_stageA: dict,
+def _remap_setvae_to_target(
+    setvae_state: dict,
     target_model_state: dict,
     drop_flows: bool = True,
 ) -> dict:
@@ -76,7 +76,7 @@ def _remap_setvae_from_A_to_target(
 
     Returns a dict containing only remapped SetVAE weights compatible with the target model.
     """
-    src_prefix = _detect_setvae_prefix(list(state_stageA.keys()))
+    src_prefix = _detect_setvae_prefix(list(setvae_state.keys()))
     # Determine destination prefix from model state
     dst_prefix = "set_encoder."
     if not any(k.startswith(dst_prefix) for k in target_model_state.keys()):
@@ -90,7 +90,7 @@ def _remap_setvae_from_A_to_target(
         return {}
 
     remapped = {}
-    for k, v in state_stageA.items():
+    for k, v in setvae_state.items():
         if not k.startswith(src_prefix):
             continue
         if drop_flows and ".flows." in k:
@@ -127,18 +127,9 @@ def _strip_flags_from_argv(flag_names: list[str]):
 
 def main():
     ap = argparse.ArgumentParser(description="Train with --branch {setvae,generative,discriminative}", add_help=False)
-    ap.add_argument("--branch", type=str, choices=["setvae", "generative", "discriminative"], required=False)
-    # Backward compatibility: accept --stage {A,B,C}
-    ap.add_argument("--stage", type=str, choices=["A", "B", "C"], required=False)
+    ap.add_argument("--branch", type=str, choices=["setvae", "generative", "discriminative"], required=True)
     args, _ = ap.parse_known_args()
-
     branch = args.branch
-    if branch is None and args.stage is not None:
-        branch = {"A": "setvae", "B": "generative", "C": "discriminative"}[args.stage]
-        _strip_flags_from_argv(["--stage"])  # drop legacy flag before parsing branch-specific args
-    if branch is None:
-        raise SystemExit("Please provide --branch {setvae,generative,discriminative} (or legacy --stage {A,B,C}).")
-
     # Drop --branch itself before deeper parsing
     _strip_flags_from_argv(["--branch"])
     if branch == "setvae":
@@ -309,7 +300,7 @@ def _run_generative():
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--init_ckpt", type=str, default=None)
-    parser.add_argument("--stageA_ckpt", type=str, default=None, help="Path to Stage A SetVAE checkpoint for merging into B1 init")
+    parser.add_argument("--setvae_ckpt", type=str, default=None, help="Path to SetVAE checkpoint for initializing encoder (optional)")
     parser.add_argument("--log_every_n_steps", type=int, default=getattr(cfg, "log_every_n_steps", 50))
     parser.add_argument("--limit_val_batches", type=float, default=getattr(cfg, "limit_val_batches", 1.0))
     parser.add_argument("--val_check_interval", type=float, default=getattr(cfg, "val_check_interval", 0.1))
@@ -453,7 +444,7 @@ def _run_generative():
         pos_weight=pos_weight,
     )
 
-    # Default behavior: if --stageA_ckpt provided, merge its SetVAE weights into initializer (or model state)
+    # If --setvae_ckpt provided, merge其 SetVAE 权重到初始化（或模型状态）
     fused_loaded = False
     base_state: dict | None = None
     if args.init_ckpt is not None and os.path.isfile(args.init_ckpt):
@@ -461,13 +452,13 @@ def _run_generative():
     elif args.init_ckpt:
         print(f"[WARN] init_ckpt not found: {args.init_ckpt}")
 
-    if args.stageA_ckpt is not None and os.path.isfile(args.stageA_ckpt):
+    if args.setvae_ckpt is not None and os.path.isfile(args.setvae_ckpt):
         try:
-            state_A = _load_state_dict_flex(args.stageA_ckpt)
+            state_A = _load_state_dict_flex(args.setvae_ckpt)
             target_model_state = model.state_dict()
-            setvae_from_A = _remap_setvae_from_A_to_target(state_A, target_model_state, drop_flows=True)
+            setvae_from_A = _remap_setvae_to_target(state_A, target_model_state, drop_flows=True)
 
-            # --- Compatibility advisory: detect Stage A reduced_dim vs current Stage B ---
+            # --- Compatibility advisory: detect SetVAE reduced_dim vs current generative config ---
             try:
                 # Infer source SetVAE prefix in Stage A state
                 src_prefix = _detect_setvae_prefix(list(state_A.keys()))
@@ -487,7 +478,7 @@ def _run_generative():
                 # Warn if mismatch; this impacts which SetVAE layers can be loaded by shape
                 if (has_rd_A and (rd_B is None or rd_A != rd_B)) or ((not has_rd_A) and (rd_B is not None)):
                     msg = (
-                        f"[WARN] Stage A SetVAE dim_reducer mismatch: "
+                        f"[WARN] SetVAE dim_reducer mismatch: "
                         f"A {'has' if has_rd_A else 'no'} reducer{f' ({rd_A})' if rd_A is not None else ''}, "
                         f"B configured reduced_dim={'none' if rd_B is None else rd_B}.\n"
                         f"       Some SetVAE layers (e.g., dim_reducer/embed/out) may not load due to shape differences.\n"
@@ -516,13 +507,13 @@ def _run_generative():
 
             incompatible = model.load_state_dict(fused, strict=False)
             print(
-                f"Initialized with fused StageA->B1: "
+                f"Initialized with fused SetVAE->generative: "
                 f"missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)}, "
                 f"A_setvae_applied={len(setvae_from_A)}"
             )
             fused_loaded = True
         except Exception as e:
-            print(f"[WARN] Failed to merge Stage A SetVAE into B1 init: {e}")
+            print(f"[WARN] Failed to merge SetVAE into generative init: {e}")
 
     if not fused_loaded:
         # Fallback to original behavior: load init_ckpt directly if present
@@ -609,7 +600,7 @@ def _run_discriminative():
     parser = argparse.ArgumentParser(description="discriminative - Mortality classifier (transformer over SetVAE or PoE-based)")
     parser.add_argument("--mode", type=str, choices=["poe", "transformer"], default="poe")
     parser.add_argument("--checkpoint", required=False, type=str, help="PoE checkpoint (.ckpt) when --mode=poe")
-    parser.add_argument("--stageA_ckpt", required=False, type=str, help="Stage A SetVAE checkpoint (.ckpt) when --mode=transformer")
+    parser.add_argument("--setvae_ckpt", required=False, type=str, help="SetVAE checkpoint (.ckpt) required when --mode=transformer")
     parser.add_argument("--label_csv", required=True, type=str)
     parser.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
     parser.add_argument("--batch_size", type=int, default=4)
@@ -621,7 +612,7 @@ def _run_discriminative():
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--no_weighted_sampler", action="store_true", help="Disable class-balanced sampler (default enabled)")
-    # Transformer hyperparams (StageA baseline)
+    # Transformer hyperparams (baseline)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=2)
@@ -634,9 +625,9 @@ def _run_discriminative():
         state = _load_state_dict(args.checkpoint)
         poe = _build_poe_from_state(state)
     else:
-        if not args.stageA_ckpt:
-            raise ValueError("--stageA_ckpt is required when --mode=transformer")
-        setvae_state = _load_state_dict(args.stageA_ckpt)
+        if not args.setvae_ckpt:
+            raise ValueError("--setvae_ckpt is required when --mode=transformer")
+        setvae_state = _load_state_dict(args.setvae_ckpt)
         setvae = _build_setvae_from_state(setvae_state)
 
     # Data

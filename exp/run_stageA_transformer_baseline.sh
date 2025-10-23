@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: bash exp/run_stageA_transformer_baseline.sh \
+# Usage: bash exp/run_transformer_baseline.sh \
 #   /path/to/setvae.ckpt \
 #   /path/to/data_dir \
 #   /path/to/labels.csv \
@@ -24,7 +24,7 @@ fi
 python -u seqsetvae_poe/train.py \
   --branch discriminative \
   --mode transformer \
-  --stageA_ckpt "${STAGEA_CKPT}" \
+  --setvae_ckpt "${STAGEA_CKPT}" \
   --data_dir "${DATA_DIR}" \
   --label_csv "${LABELS}" \
   --batch_size 64 \
