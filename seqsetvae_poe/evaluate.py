@@ -2143,7 +2143,7 @@ def _run_pretrain_eval():
     ap.add_argument(
         "--plot_per_set_mask_curves",
         action="store_true",
-        default=False,
+        default=True,
         help="Plot consistency curves for randomly sampled sets under progressive masking",
     )
     ap.add_argument(
