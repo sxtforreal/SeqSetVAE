@@ -1654,6 +1654,8 @@ class MortalityClassifier(pl.LightningModule):
         dropout: float = 0.2,
         lr: float = 1e-3,
         pos_weight: Optional[float] = None,
+        unfreeze_after_epochs: int = 0,
+        unfreeze_scope: str = "none",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["poe_model"])  # do not serialize big backbone in hparams
@@ -1686,6 +1688,13 @@ class MortalityClassifier(pl.LightningModule):
         self.pos_weight = (
             None if pos_weight is None else torch.tensor([pos_weight], dtype=torch.float32)
         )
+        # Partial unfreeze controls
+        self.unfreeze_after_epochs = int(max(0, unfreeze_after_epochs))
+        self.unfreeze_scope = str(unfreeze_scope)
+        assert self.unfreeze_scope in {"none", "light", "full"}, "unfreeze_scope must be one of {'none','light','full'}"
+        self._has_unfrozen: bool = False
+        # Whether to enable gradients through feature encoder
+        self._feature_grad_enabled: bool = False
         self._val_logits: List[float] = []
         self._val_labels: List[int] = []
         self._test_logits: List[float] = []
@@ -1701,20 +1710,24 @@ class MortalityClassifier(pl.LightningModule):
             self._roc_auc_score = None
             self._average_precision_score = None
 
-    @torch.no_grad()
     def _extract_features_single(self, sets: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.parameters()).device
         S = len(sets)
         if S == 0:
             return torch.zeros(0, 1, device=device), torch.zeros(0, dtype=torch.bool, device=device)
 
+        # Encode per-set features (optionally with grads)
         mu_qx_list: List[torch.Tensor] = []
         logvar_qx_list: List[torch.Tensor] = []
         enc_aggs: List[torch.Tensor] = []
         set_times: List[torch.Tensor] = []
         for s in sets:
             var, val = s["var"], s["val"]
-            z_list_enc, enc_tokens = self.poe.set_encoder.encode_from_var_val(var, val)
+            if self._feature_grad_enabled:
+                z_list_enc, enc_tokens = self.poe.set_encoder.encode_from_var_val(var, val)
+            else:
+                with torch.no_grad():
+                    z_list_enc, enc_tokens = self.poe.set_encoder.encode_from_var_val(var, val)
             _z, mu_qx, logvar_qx = z_list_enc[-1]
             mu_qx_list.append(mu_qx.squeeze(1))
             logvar_qx_list.append(logvar_qx.squeeze(1))
@@ -1732,60 +1745,93 @@ class MortalityClassifier(pl.LightningModule):
             minutes = minutes.unsqueeze(-1)
         minutes = minutes.squeeze(-1)
 
-        time_emb = self.poe._relative_time_bucket_embedding(minutes)
-        B = 1
-        h = torch.zeros(B, self.latent_dim, device=device)
+        with torch.no_grad():
+            time_emb = self.poe._relative_time_bucket_embedding(minutes)
+            B = 1
+            h = torch.zeros(B, self.latent_dim, device=device)
 
         feat_rows: List[torch.Tensor] = []
         for t in range(S):
-            prior_params = self.poe.prior_head(h)
-            mu_p_t, logvar_p_t = prior_params.chunk(2, dim=-1)
+            with torch.no_grad():
+                prior_params = self.poe.prior_head(h)
+                mu_p_t, logvar_p_t = prior_params.chunk(2, dim=-1)
 
-            mu_qx_t = mu_qx[:, t, :]
-            logvar_qx_t = logvar_qx[:, t, :]
-            var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
-            d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)
-            delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)
-            dt = minutes[:, t : t + 1] - (minutes[:, t - 1 : t] if t > 0 else minutes[:, t : t + 1])
-            log_dt1p = torch.log1p(dt.clamp(min=0.0))
-            gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
-            beta_t = self.poe.poe_beta_min + (self.poe.poe_beta_max - self.poe.poe_beta_min) * torch.sigmoid(self.poe.obs_gate(gate_inp))
+                mu_qx_t = mu_qx[:, t, :]
+                logvar_qx_t = logvar_qx[:, t, :]
+                var_sum = (logvar_p_t.exp() + logvar_qx_t.exp()).clamp(min=1e-8)
+                d2 = ((mu_qx_t - mu_p_t) ** 2 / var_sum).mean(dim=-1, keepdim=True)
+                delta_H = (logvar_p_t - logvar_qx_t).mean(dim=-1, keepdim=True)
+                dt = minutes[:, t : t + 1] - (minutes[:, t - 1 : t] if t > 0 else minutes[:, t : t + 1])
+                log_dt1p = torch.log1p(dt.clamp(min=0.0))
+                gate_inp = torch.cat([d2, delta_H, log_dt1p], dim=-1)
+                beta_t = self.poe.poe_beta_min + (self.poe.poe_beta_max - self.poe.poe_beta_min) * torch.sigmoid(self.poe.obs_gate(gate_inp))
 
-            set_agg_t = set_aggs[:, t, :]
-            like_inp = torch.cat([set_agg_t, mu_p_t, logvar_p_t], dim=-1)
-            like_out = self.poe.like_head(like_inp)
-            log_prec_like_t, h_like_t = like_out.chunk(2, dim=-1)
-            prec_like_t = F.softplus(log_prec_like_t) + 1e-4
-            Lambda_p_t = torch.exp(-logvar_p_t)
-            prec_like_t = prec_like_t * beta_t
-            h_like_t = h_like_t * beta_t
-            Lambda_post_t = Lambda_p_t + prec_like_t
-            h_post_t = Lambda_p_t * mu_p_t + h_like_t
-            mu_post_t = h_post_t / (Lambda_post_t + 1e-8)
-            logvar_post_t = -torch.log(Lambda_post_t + 1e-8)
+                set_agg_t = set_aggs[:, t, :]
+                like_inp = torch.cat([set_agg_t, mu_p_t, logvar_p_t], dim=-1)
+                like_out = self.poe.like_head(like_inp)
+                log_prec_like_t, h_like_t = like_out.chunk(2, dim=-1)
+                prec_like_t = F.softplus(log_prec_like_t) + 1e-4
+                Lambda_p_t = torch.exp(-logvar_p_t)
+                prec_like_t = prec_like_t * beta_t
+                h_like_t = h_like_t * beta_t
+                Lambda_post_t = Lambda_p_t + prec_like_t
+                h_post_t = Lambda_p_t * mu_p_t + h_like_t
+                mu_post_t = h_post_t / (Lambda_post_t + 1e-8)
+                logvar_post_t = -torch.log(Lambda_post_t + 1e-8)
+                # advance dynamics state
+                h = self.poe.gru_cell(mu_post_t + time_emb[:, t, :], h)
 
+            # Downstream projections (trainable)
             var_q = logvar_post_t.exp()
             var_p = logvar_p_t.exp()
             kld = 0.5 * (logvar_p_t - logvar_post_t + (var_q / (var_p + 1e-8)) + ((mu_p_t - mu_post_t) ** 2) / (var_p + 1e-8) - 1.0)
             kl_scalar = kld.sum(dim=-1, keepdim=True)
-
             mu_feat = self.mu_proj(mu_post_t)
-            # Simplified scalar features: KL_scalar and log1p(Δt)
-            scalar_feat = torch.cat([
-                kl_scalar,
-                log_dt1p,
-            ], dim=-1)
+            scalar_feat = torch.cat([kl_scalar, log_dt1p], dim=-1)
             scalar_feat = self.scalar_proj(scalar_feat)
             feat_t = torch.cat([mu_feat, scalar_feat], dim=-1).squeeze(0)
             feat_rows.append(feat_t)
-
-            h = self.poe.gru_cell(mu_post_t + time_emb[:, t, :], h)
 
         X = torch.stack(feat_rows, dim=0)
         mask = torch.ones(S, dtype=torch.bool, device=device)
         return X, mask
 
-    @torch.no_grad()
+    def on_train_epoch_end(self) -> None:
+        # One-time unfreeze after specified epochs
+        if self._has_unfrozen:
+            return
+        if self.unfreeze_after_epochs <= 0:
+            return
+        epoch_index = int(getattr(self, 'current_epoch', -1)) + 1
+        if epoch_index < self.unfreeze_after_epochs:
+            return
+        try:
+            enc = getattr(self.poe, 'set_encoder', None)
+            if enc is None:
+                return
+            if self.unfreeze_scope == 'light':
+                modules = []
+                if getattr(enc, 'dim_reducer', None) is not None:
+                    modules.append(enc.dim_reducer)
+                if getattr(enc, 'embed', None) is not None:
+                    modules.append(enc.embed)
+                for m in modules:
+                    for p in m.parameters():
+                        p.requires_grad = True
+            elif self.unfreeze_scope == 'full':
+                for p in enc.parameters():
+                    p.requires_grad = True
+            # Enable gradient through encoder features
+            if self.unfreeze_scope in {'light', 'full'}:
+                self._feature_grad_enabled = True
+            self._has_unfrozen = True
+            try:
+                print(f"[MortalityClassifier] Unfroze '{self.unfreeze_scope}' scope of set_encoder at epoch {epoch_index}.")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _build_batch_features(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         var, val = batch["var"], batch["val"]
         minute, set_id = batch["minute"], batch["set_id"]
@@ -1917,7 +1963,8 @@ class MortalityClassifier(pl.LightningModule):
         self._test_labels.clear()
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
+        # Include all params so later-unfrozen weights start updating without reconfiguring optimizers
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
         return opt
 
 
@@ -2015,6 +2062,8 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         dropout: float = 0.2,
         lr: float = 1e-3,
         pos_weight: Optional[float] = None,
+        unfreeze_after_epochs: int = 0,
+        unfreeze_scope: str = "none",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["setvae_model"])  # don't serialize big backbone in hparams
@@ -2057,6 +2106,12 @@ class TransformerSetVAEClassifier(pl.LightningModule):
 
         self.lr = float(lr)
         self.pos_weight = None if pos_weight is None else torch.tensor([pos_weight], dtype=torch.float32)
+        # Partial unfreeze controls
+        self.unfreeze_after_epochs = int(max(0, unfreeze_after_epochs))
+        self.unfreeze_scope = str(unfreeze_scope)
+        assert self.unfreeze_scope in {"none", "light", "full"}
+        self._has_unfrozen: bool = False
+        self._feature_grad_enabled: bool = False
 
         # Metrics (optional, guarded if unavailable)
         try:
@@ -2111,7 +2166,6 @@ class TransformerSetVAEClassifier(pl.LightningModule):
             all_sets.append(patient_sets)
         return all_sets
 
-    @torch.no_grad()
     def _extract_features_single(self, sets: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.parameters()).device
         S = len(sets)
@@ -2122,7 +2176,12 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         logvar_list: List[torch.Tensor] = []
         set_times: List[torch.Tensor] = []
         for s in sets:
-            z_list, _ = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+            # Optionally enable grads through SetVAE encoder after unfreeze
+            if self._feature_grad_enabled:
+                z_list, _ = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+            else:
+                with torch.no_grad():
+                    z_list, _ = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
             _z, mu, logvar = z_list[-1]
             mu_list.append(mu.squeeze(1))          # [1,D]
             logvar_list.append(logvar.squeeze(1))  # [1,D]
@@ -2158,7 +2217,6 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         mask = torch.ones(S, dtype=torch.bool, device=device)
         return X, mask
 
-    @torch.no_grad()
     def _build_batch_features(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         var, val = batch["var"], batch["val"]
         minute, set_id = batch["minute"], batch["set_id"]
@@ -2270,6 +2328,42 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         self._test_logits.clear()
         self._test_labels.clear()
 
+    def on_train_epoch_end(self) -> None:
+        # Unfreeze once after specified number of epochs
+        if self._has_unfrozen:
+            return
+        if self.unfreeze_after_epochs <= 0:
+            return
+        epoch_index = int(getattr(self, 'current_epoch', -1)) + 1
+        if epoch_index < self.unfreeze_after_epochs:
+            return
+        try:
+            enc = getattr(self.setvae, 'set_encoder', None)
+            if enc is None:
+                return
+            if self.unfreeze_scope == 'light':
+                modules = []
+                if getattr(enc, 'dim_reducer', None) is not None:
+                    modules.append(enc.dim_reducer)
+                if getattr(enc, 'embed', None) is not None:
+                    modules.append(enc.embed)
+                for m in modules:
+                    for p in m.parameters():
+                        p.requires_grad = True
+            elif self.unfreeze_scope == 'full':
+                for p in enc.parameters():
+                    p.requires_grad = True
+            if self.unfreeze_scope in {'light', 'full'}:
+                self._feature_grad_enabled = True
+            self._has_unfrozen = True
+            try:
+                print(f"[TransformerSetVAEClassifier] Unfroze '{self.unfreeze_scope}' scope of set_encoder at epoch {epoch_index}.")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
+        # Include all params so later-unfrozen weights start updating without reconfiguring the optimizer
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
         return opt
