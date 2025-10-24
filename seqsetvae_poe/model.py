@@ -1654,6 +1654,8 @@ class MortalityClassifier(pl.LightningModule):
         dropout: float = 0.2,
         lr: float = 1e-3,
         pos_weight: Optional[float] = None,
+        unfreeze_after_epochs: int = 0,
+        unfreeze_scope: str = "none",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["poe_model"])  # do not serialize big backbone in hparams
@@ -1686,6 +1688,13 @@ class MortalityClassifier(pl.LightningModule):
         self.pos_weight = (
             None if pos_weight is None else torch.tensor([pos_weight], dtype=torch.float32)
         )
+        # Partial unfreeze controls
+        self.unfreeze_after_epochs = int(max(0, unfreeze_after_epochs))
+        self.unfreeze_scope = str(unfreeze_scope)
+        assert self.unfreeze_scope in {"none", "light", "full"}, "unfreeze_scope must be one of {'none','light','full'}"
+        self._has_unfrozen: bool = False
+        # Whether to enable gradients through feature encoder
+        self._feature_grad_enabled: bool = False
         self._val_logits: List[float] = []
         self._val_labels: List[int] = []
         self._test_logits: List[float] = []
@@ -1707,32 +1716,36 @@ class MortalityClassifier(pl.LightningModule):
         if S == 0:
             return torch.zeros(0, 1, device=device), torch.zeros(0, dtype=torch.bool, device=device)
 
-        # Freeze PoE feature extraction and dynamics; keep classifier projections trainable
-        with torch.no_grad():
-            mu_qx_list: List[torch.Tensor] = []
-            logvar_qx_list: List[torch.Tensor] = []
-            enc_aggs: List[torch.Tensor] = []
-            set_times: List[torch.Tensor] = []
-            for s in sets:
-                var, val = s["var"], s["val"]
+        # Encode per-set features (optionally with grads)
+        mu_qx_list: List[torch.Tensor] = []
+        logvar_qx_list: List[torch.Tensor] = []
+        enc_aggs: List[torch.Tensor] = []
+        set_times: List[torch.Tensor] = []
+        for s in sets:
+            var, val = s["var"], s["val"]
+            if self._feature_grad_enabled:
                 z_list_enc, enc_tokens = self.poe.set_encoder.encode_from_var_val(var, val)
-                _z, mu_qx, logvar_qx = z_list_enc[-1]
-                mu_qx_list.append(mu_qx.squeeze(1))
-                logvar_qx_list.append(logvar_qx.squeeze(1))
-                if enc_tokens is not None and enc_tokens.numel() > 0:
-                    enc_aggs.append(enc_tokens.mean(dim=1))
-                else:
-                    enc_aggs.append(mu_qx)
-                set_times.append(s["set_time"])  # [1]
+            else:
+                with torch.no_grad():
+                    z_list_enc, enc_tokens = self.poe.set_encoder.encode_from_var_val(var, val)
+            _z, mu_qx, logvar_qx = z_list_enc[-1]
+            mu_qx_list.append(mu_qx.squeeze(1))
+            logvar_qx_list.append(logvar_qx.squeeze(1))
+            if enc_tokens is not None and enc_tokens.numel() > 0:
+                enc_aggs.append(enc_tokens.mean(dim=1))
+            else:
+                enc_aggs.append(mu_qx)
+            set_times.append(s["set_time"])  # [1]
 
-            mu_qx = torch.stack(mu_qx_list, dim=1).to(device)
-            logvar_qx = torch.stack(logvar_qx_list, dim=1).to(device)
-            set_aggs = torch.stack(enc_aggs, dim=1).to(device)
-            minutes = torch.stack(set_times, dim=1).float().to(device)
-            if minutes.dim() == 2:
-                minutes = minutes.unsqueeze(-1)
-            minutes = minutes.squeeze(-1)
+        mu_qx = torch.stack(mu_qx_list, dim=1).to(device)
+        logvar_qx = torch.stack(logvar_qx_list, dim=1).to(device)
+        set_aggs = torch.stack(enc_aggs, dim=1).to(device)
+        minutes = torch.stack(set_times, dim=1).float().to(device)
+        if minutes.dim() == 2:
+            minutes = minutes.unsqueeze(-1)
+        minutes = minutes.squeeze(-1)
 
+        with torch.no_grad():
             time_emb = self.poe._relative_time_bucket_embedding(minutes)
             B = 1
             h = torch.zeros(B, self.latent_dim, device=device)
@@ -1782,6 +1795,42 @@ class MortalityClassifier(pl.LightningModule):
         X = torch.stack(feat_rows, dim=0)
         mask = torch.ones(S, dtype=torch.bool, device=device)
         return X, mask
+
+    def on_train_epoch_end(self) -> None:
+        # One-time unfreeze after specified epochs
+        if self._has_unfrozen:
+            return
+        if self.unfreeze_after_epochs <= 0:
+            return
+        epoch_index = int(getattr(self, 'current_epoch', -1)) + 1
+        if epoch_index < self.unfreeze_after_epochs:
+            return
+        try:
+            enc = getattr(self.poe, 'set_encoder', None)
+            if enc is None:
+                return
+            if self.unfreeze_scope == 'light':
+                modules = []
+                if getattr(enc, 'dim_reducer', None) is not None:
+                    modules.append(enc.dim_reducer)
+                if getattr(enc, 'embed', None) is not None:
+                    modules.append(enc.embed)
+                for m in modules:
+                    for p in m.parameters():
+                        p.requires_grad = True
+            elif self.unfreeze_scope == 'full':
+                for p in enc.parameters():
+                    p.requires_grad = True
+            # Enable gradient through encoder features
+            if self.unfreeze_scope in {'light', 'full'}:
+                self._feature_grad_enabled = True
+            self._has_unfrozen = True
+            try:
+                print(f"[MortalityClassifier] Unfroze '{self.unfreeze_scope}' scope of set_encoder at epoch {epoch_index}.")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _build_batch_features(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         var, val = batch["var"], batch["val"]
@@ -1914,7 +1963,8 @@ class MortalityClassifier(pl.LightningModule):
         self._test_labels.clear()
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
+        # Include all params so later-unfrozen weights start updating without reconfiguring optimizers
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
         return opt
 
 

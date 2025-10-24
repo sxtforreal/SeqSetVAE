@@ -617,6 +617,15 @@ def _run_discriminative():
     parser.add_argument("--no_weighted_sampler", action="store_true", help="Disable class-balanced sampler (default enabled)")
     # Validate once mid-epoch for transformer/classifier training as well
     parser.add_argument("--val_check_interval", type=float, default=0.5)
+    # Optional partial unfreeze of pretrained encoders
+    parser.add_argument("--unfreeze_after_epochs", type=int, default=1, help="Epoch index (1-based) after which to unfreeze pretrained encoder; 0 to keep frozen")
+    parser.add_argument(
+        "--unfreeze_scope",
+        type=str,
+        choices=["none", "light", "full"],
+        default="light",
+        help="What to unfreeze: none=keep frozen; light=dim_reducer+embed; full=entire set encoder",
+    )
     # Transformer hyperparams (baseline)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
@@ -660,6 +669,8 @@ def _run_discriminative():
             lr=args.lr,
             # Avoid double-balancing: if using WeightedRandomSampler, drop BCE pos_weight
             pos_weight=(None if getattr(dm, "use_weighted_sampler", False) else getattr(dm, "pos_weight", None)),
+            unfreeze_after_epochs=max(0, int(args.unfreeze_after_epochs)),
+            unfreeze_scope=str(args.unfreeze_scope),
         )
     else:
         model = TransformerSetVAEClassifier(
@@ -675,6 +686,8 @@ def _run_discriminative():
             lr=args.lr,
             # Avoid double-balancing: if using WeightedRandomSampler, drop BCE pos_weight
             pos_weight=(None if getattr(dm, "use_weighted_sampler", False) else getattr(dm, "pos_weight", None)),
+            unfreeze_after_epochs=max(0, int(args.unfreeze_after_epochs)),
+            unfreeze_scope=str(args.unfreeze_scope),
         )
 
     out_root = args.output_dir if args.output_dir else "./output"
