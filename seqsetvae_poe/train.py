@@ -575,7 +575,9 @@ def _run_generative():
                 ),
             ]
         )
-        early = EarlyStopping(monitor="val_auprc", mode="max", patience=8)
+        # Early stop on validation classification loss which is always logged
+        # (AUPRC may not be available during early validation phases)
+        early = EarlyStopping(monitor="val_cls", mode="min", patience=8)
     else:
         early = EarlyStopping(monitor="val_loss", mode="min", patience=8)
     callbacks.append(early)
