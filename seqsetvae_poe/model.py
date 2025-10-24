@@ -2062,6 +2062,8 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         dropout: float = 0.2,
         lr: float = 1e-3,
         pos_weight: Optional[float] = None,
+        unfreeze_after_epochs: int = 0,
+        unfreeze_scope: str = "none",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["setvae_model"])  # don't serialize big backbone in hparams
@@ -2104,6 +2106,12 @@ class TransformerSetVAEClassifier(pl.LightningModule):
 
         self.lr = float(lr)
         self.pos_weight = None if pos_weight is None else torch.tensor([pos_weight], dtype=torch.float32)
+        # Partial unfreeze controls
+        self.unfreeze_after_epochs = int(max(0, unfreeze_after_epochs))
+        self.unfreeze_scope = str(unfreeze_scope)
+        assert self.unfreeze_scope in {"none", "light", "full"}
+        self._has_unfrozen: bool = False
+        self._feature_grad_enabled: bool = False
 
         # Metrics (optional, guarded if unavailable)
         try:
@@ -2168,9 +2176,12 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         logvar_list: List[torch.Tensor] = []
         set_times: List[torch.Tensor] = []
         for s in sets:
-            # Freeze SetVAE encoder features but allow our projection layers to learn
-            with torch.no_grad():
+            # Optionally enable grads through SetVAE encoder after unfreeze
+            if self._feature_grad_enabled:
                 z_list, _ = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+            else:
+                with torch.no_grad():
+                    z_list, _ = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
             _z, mu, logvar = z_list[-1]
             mu_list.append(mu.squeeze(1))          # [1,D]
             logvar_list.append(logvar.squeeze(1))  # [1,D]
@@ -2317,6 +2328,42 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         self._test_logits.clear()
         self._test_labels.clear()
 
+    def on_train_epoch_end(self) -> None:
+        # Unfreeze once after specified number of epochs
+        if self._has_unfrozen:
+            return
+        if self.unfreeze_after_epochs <= 0:
+            return
+        epoch_index = int(getattr(self, 'current_epoch', -1)) + 1
+        if epoch_index < self.unfreeze_after_epochs:
+            return
+        try:
+            enc = getattr(self.setvae, 'set_encoder', None)
+            if enc is None:
+                return
+            if self.unfreeze_scope == 'light':
+                modules = []
+                if getattr(enc, 'dim_reducer', None) is not None:
+                    modules.append(enc.dim_reducer)
+                if getattr(enc, 'embed', None) is not None:
+                    modules.append(enc.embed)
+                for m in modules:
+                    for p in m.parameters():
+                        p.requires_grad = True
+            elif self.unfreeze_scope == 'full':
+                for p in enc.parameters():
+                    p.requires_grad = True
+            if self.unfreeze_scope in {'light', 'full'}:
+                self._feature_grad_enabled = True
+            self._has_unfrozen = True
+            try:
+                print(f"[TransformerSetVAEClassifier] Unfroze '{self.unfreeze_scope}' scope of set_encoder at epoch {epoch_index}.")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
+        # Include all params so later-unfrozen weights start updating without reconfiguring the optimizer
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
         return opt
