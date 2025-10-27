@@ -1550,7 +1550,6 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             if not hasattr(self, "val_auprc_metric"):
                 self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
                 self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
-            self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
             self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
             # Clear buffers
             if hasattr(self, "_val_logits"):
@@ -1973,7 +1972,6 @@ class MortalityClassifier(pl.LightningModule):
             self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
             self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
         self.log("val_best_thr", best_thr, prog_bar=True, on_epoch=True)
-        self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
         self.log("val_sensitivity", sens, prog_bar=False, on_epoch=True)
         self.log("val_specificity", spec, prog_bar=False, on_epoch=True)
         # store for test-time thresholding
@@ -2342,7 +2340,6 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         if not hasattr(self, "val_auprc_metric"):
             self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
             self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
-        self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
         self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
         self._best_thr = float(best_thr)
         self._val_logits.clear()

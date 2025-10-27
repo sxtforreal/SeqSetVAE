@@ -566,13 +566,7 @@ def _run_generative():
                     mode="max",
                     filename="poe_cls_auroc",
                 ),
-                ModelCheckpoint(
-                    dirpath=ckpt_dir,
-                    save_top_k=1,
-                    monitor="val_best_acc",
-                    mode="max",
-                    filename="poe_cls_acc",
-                ),
+                # Removed best-accuracy-based checkpoint; rely on AUPRC/AUROC only
             ]
         )
         # Early stop on validation classification loss which is always logged
@@ -709,7 +703,7 @@ def _run_discriminative():
     callbacks = [
         ModelCheckpoint(dirpath=ckpt_dir, save_top_k=1, monitor="val_auprc", mode="max", filename="mortality_cls"),
         ModelCheckpoint(dirpath=ckpt_dir, save_top_k=1, monitor="val_auroc", mode="max", filename="mortality_cls_auroc"),
-        ModelCheckpoint(dirpath=ckpt_dir, save_top_k=1, monitor="val_best_acc", mode="max", filename="mortality_cls_acc"),
+        # Removed best-accuracy-based checkpoint; rely on AUPRC/AUROC only
         EarlyStopping(monitor="val_auprc", mode="max", patience=8),
         LearningRateMonitor(logging_interval="step"),
     ]
