@@ -1527,30 +1527,15 @@ class SetVAEOnlyPretrain(pl.LightningModule):
                     y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
                     auroc = float(self._roc_auc_score(y_true, y_prob)) if getattr(self, "_roc_auc_score", None) is not None else float("nan")
                     auprc = float(self._average_precision_score(y_true, y_prob)) if getattr(self, "_average_precision_score", None) is not None else float("nan")
-                    # Best threshold by accuracy for reference
-                    best_thr = 0.5
-                    best_acc = 0.0
-                    try:
-                        qs = np.linspace(0.05, 0.95, 19)
-                        cand = np.unique(np.quantile(y_prob, qs))
-                        for t in cand:
-                            y_hat = (y_prob >= t).astype(int)
-                            acc = float((y_hat == y_true).mean())
-                            if acc > best_acc:
-                                best_acc = acc
-                                best_thr = float(t)
-                    except Exception:
-                        pass
                 else:
-                    auroc, auprc, best_acc, best_thr = float("nan"), float("nan"), float("nan"), 0.5
+                    auroc, auprc = float("nan"), float("nan")
             except Exception:
-                auroc, auprc, best_acc, best_thr = float("nan"), float("nan"), float("nan"), 0.5
+                auroc, auprc = float("nan"), float("nan")
             # Log for callbacks (EarlyStopping/ModelCheckpoint)
             # Avoid overwriting TorchMetrics-based values if present
             if not hasattr(self, "val_auprc_metric"):
                 self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
                 self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
-            self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
             # Clear buffers
             if hasattr(self, "_val_logits"):
                 self._val_logits.clear()
@@ -1744,7 +1729,6 @@ class MortalityClassifier(pl.LightningModule):
         self._val_labels: List[int] = []
         self._test_logits: List[float] = []
         self._test_labels: List[int] = []
-        self._best_thr: float = 0.5
 
         # Optional metrics
         try:
@@ -1945,37 +1929,22 @@ class MortalityClassifier(pl.LightningModule):
             y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
             auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
             auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
-            best_thr = 0.5
-            best_acc = 0.0
-            sens = float("nan")
-            spec = float("nan")
-            try:
-                qs = np.linspace(0.05, 0.95, 19)
-                cand = np.unique(np.quantile(y_prob, qs))
-                for t in cand:
-                    y_hat = (y_prob >= t).astype(int)
-                    tp = int(((y_hat == 1) & (y_true == 1)).sum())
-                    tn = int(((y_hat == 0) & (y_true == 0)).sum())
-                    fp = int(((y_hat == 1) & (y_true == 0)).sum())
-                    fn = int(((y_hat == 0) & (y_true == 1)).sum())
-                    acc = (tp + tn) / max(1, len(y_true))
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_thr = float(t)
-                        sens = tp / max(1, tp + fn)
-                        spec = tn / max(1, tn + fp)
-            except Exception:
-                pass
+            # Fixed threshold 0.5; compute sensitivity/specificity for reference only
+            thr = 0.5
+            y_hat = (y_prob >= thr).astype(int)
+            tp = int(((y_hat == 1) & (y_true == 1)).sum())
+            tn = int(((y_hat == 0) & (y_true == 0)).sum())
+            fp = int(((y_hat == 1) & (y_true == 0)).sum())
+            fn = int(((y_hat == 0) & (y_true == 1)).sum())
+            sens = tp / max(1, tp + fn)
+            spec = tn / max(1, tn + fp)
         except Exception:
-            auroc, auprc, best_thr, best_acc, sens, spec = float("nan"), float("nan"), 0.5, float("nan"), float("nan"), float("nan")
+            auroc, auprc, sens, spec = float("nan"), float("nan"), float("nan"), float("nan")
         if not hasattr(self, "val_auprc_metric"):
             self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
             self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
-        self.log("val_best_thr", best_thr, prog_bar=True, on_epoch=True)
         self.log("val_sensitivity", sens, prog_bar=False, on_epoch=True)
         self.log("val_specificity", spec, prog_bar=False, on_epoch=True)
-        # store for test-time thresholding
-        self._best_thr = float(best_thr)
         self._val_logits.clear()
         self._val_labels.clear()
 
@@ -1996,7 +1965,7 @@ class MortalityClassifier(pl.LightningModule):
             y_prob = torch.sigmoid(torch.tensor(self._test_logits)).numpy()
             auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
             auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
-            thr = float(getattr(self, "_best_thr", 0.5))
+            thr = 0.5
             y_hat = (y_prob >= thr).astype(int)
             acc = float((y_hat == y_true).mean()) if len(y_true) > 0 else float("nan")
         except Exception:
@@ -2171,7 +2140,6 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         self._val_labels: List[int] = []
         self._test_logits: List[float] = []
         self._test_labels: List[int] = []
-        self._best_thr: float = 0.5
 
     def _relative_time_bucket_embedding(self, minutes: torch.Tensor) -> torch.Tensor:
         B, S = minutes.shape
@@ -2321,27 +2289,11 @@ class TransformerSetVAEClassifier(pl.LightningModule):
             y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
             auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
             auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
-            # derive best acc and threshold
-            best_thr = 0.5
-            best_acc = 0.0
-            try:
-                qs = np.linspace(0.05, 0.95, 19)
-                cand = np.unique(np.quantile(y_prob, qs))
-                for t in cand:
-                    y_hat = (y_prob >= t).astype(int)
-                    acc = float((y_hat == y_true).mean())
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_thr = float(t)
-            except Exception:
-                pass
         except Exception:
-            auroc, auprc, best_thr, best_acc = float("nan"), float("nan"), 0.5, float("nan")
+            auroc, auprc = float("nan"), float("nan")
         if not hasattr(self, "val_auprc_metric"):
             self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
             self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
-        self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
-        self._best_thr = float(best_thr)
         self._val_logits.clear()
         self._val_labels.clear()
 
@@ -2362,7 +2314,7 @@ class TransformerSetVAEClassifier(pl.LightningModule):
             y_prob = torch.sigmoid(torch.tensor(self._test_logits)).numpy()
             auroc = float(self._roc_auc_score(y_true, y_prob)) if self._roc_auc_score is not None else float("nan")
             auprc = float(self._average_precision_score(y_true, y_prob)) if self._average_precision_score is not None else float("nan")
-            thr = float(getattr(self, "_best_thr", 0.5))
+            thr = 0.5
             y_hat = (y_prob >= thr).astype(int)
             acc = float((y_hat == y_true).mean()) if len(y_true) > 0 else float("nan")
         except Exception:
