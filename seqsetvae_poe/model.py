@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Tuple
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import numpy as np
 import config as cfg  # type: ignore
+from torchmetrics.classification import AUROC, AveragePrecision
 
 from modules import SetVAEModule, AttentiveBottleneckLayer, elbo_loss as base_elbo, recon_loss as chamfer_recon
 
@@ -251,6 +252,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
                 if pos_weight is not None
                 else nn.BCEWithLogitsLoss()
             )
+            # TorchMetrics for robust epoch-wise AUROC/AUPRC logging (no sklearn dependency)
+            self.val_auprc_metric = AveragePrecision(task="binary")
+            self.val_auroc_metric = AUROC(task="binary")
             # Buffers for epoch-level classification metrics
             self._val_logits: list[float] = []
             self._val_labels: list[int] = []
@@ -665,8 +669,11 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             y = batch["y"].to(logits.dtype)
             cls_loss = self._bce_cls(logits, y)
             total = total + self.cls_loss_weight * cls_loss
-            # accumulate for epoch-level metrics
+            # Update TorchMetrics and keep legacy buffers
             try:
+                probs = torch.sigmoid(logits)
+                self.val_auprc_metric.update(probs, y)
+                self.val_auroc_metric.update(probs, y)
                 self._val_logits.extend(logits.detach().cpu().tolist())
                 self._val_labels.extend(y.detach().cpu().tolist())
             except Exception:
@@ -678,6 +685,9 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             log_dict["val_next_change"] = next_c
         if self.enable_cls:
             log_dict["val_cls"] = cls_loss
+            # Log TorchMetrics objects with on_epoch=True so callbacks can monitor
+            self.log("val_auprc", self.val_auprc_metric, on_epoch=True, prog_bar=True)
+            self.log("val_auroc", self.val_auroc_metric, on_epoch=True, prog_bar=True)
         self.log_dict(log_dict, prog_bar=True, on_epoch=True)
         return total
 
@@ -1502,8 +1512,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             except Exception:
                 auroc, auprc, best_acc, best_thr = float("nan"), float("nan"), float("nan"), 0.5
             # Log for callbacks (EarlyStopping/ModelCheckpoint)
-            self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
-            self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
+            # Avoid overwriting TorchMetrics-based values if present
+            if not hasattr(self, "val_auprc_metric"):
+                self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
+                self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
             self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
             self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
             # Clear buffers
@@ -1923,8 +1935,9 @@ class MortalityClassifier(pl.LightningModule):
                 pass
         except Exception:
             auroc, auprc, best_thr, best_acc, sens, spec = float("nan"), float("nan"), 0.5, float("nan"), float("nan"), float("nan")
-        self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
-        self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
+        if not hasattr(self, "val_auprc_metric"):
+            self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
+            self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
         self.log("val_best_thr", best_thr, prog_bar=True, on_epoch=True)
         self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
         self.log("val_sensitivity", sens, prog_bar=False, on_epoch=True)
@@ -2292,8 +2305,9 @@ class TransformerSetVAEClassifier(pl.LightningModule):
                 pass
         except Exception:
             auroc, auprc, best_thr, best_acc = float("nan"), float("nan"), 0.5, float("nan")
-        self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
-        self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
+        if not hasattr(self, "val_auprc_metric"):
+            self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
+            self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
         self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
         self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
         self._best_thr = float(best_thr)
