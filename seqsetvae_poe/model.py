@@ -1502,10 +1502,10 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             except Exception:
                 auroc, auprc, best_acc, best_thr = float("nan"), float("nan"), float("nan"), 0.5
             # Log for callbacks (EarlyStopping/ModelCheckpoint)
-            self.log("val_auroc", auroc, prog_bar=True)
-            self.log("val_auprc", auprc, prog_bar=True)
-            self.log("val_best_acc", best_acc, prog_bar=False)
-            self.log("val_best_thr", best_thr, prog_bar=False)
+            self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
+            self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
+            self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
+            self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
             # Clear buffers
             if hasattr(self, "_val_logits"):
                 self._val_logits.clear()
@@ -1923,12 +1923,12 @@ class MortalityClassifier(pl.LightningModule):
                 pass
         except Exception:
             auroc, auprc, best_thr, best_acc, sens, spec = float("nan"), float("nan"), 0.5, float("nan"), float("nan"), float("nan")
-        self.log("val_auroc", auroc, prog_bar=True)
-        self.log("val_auprc", auprc, prog_bar=True)
-        self.log("val_best_thr", best_thr, prog_bar=True)
-        self.log("val_best_acc", best_acc, prog_bar=False)
-        self.log("val_sensitivity", sens, prog_bar=False)
-        self.log("val_specificity", spec, prog_bar=False)
+        self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
+        self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
+        self.log("val_best_thr", best_thr, prog_bar=True, on_epoch=True)
+        self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
+        self.log("val_sensitivity", sens, prog_bar=False, on_epoch=True)
+        self.log("val_specificity", spec, prog_bar=False, on_epoch=True)
         # store for test-time thresholding
         self._best_thr = float(best_thr)
         self._val_logits.clear()
@@ -2292,10 +2292,10 @@ class TransformerSetVAEClassifier(pl.LightningModule):
                 pass
         except Exception:
             auroc, auprc, best_thr, best_acc = float("nan"), float("nan"), 0.5, float("nan")
-        self.log("val_auroc", auroc, prog_bar=True)
-        self.log("val_auprc", auprc, prog_bar=True)
-        self.log("val_best_acc", best_acc, prog_bar=False)
-        self.log("val_best_thr", best_thr, prog_bar=False)
+        self.log("val_auroc", auroc, prog_bar=True, on_epoch=True)
+        self.log("val_auprc", auprc, prog_bar=True, on_epoch=True)
+        self.log("val_best_acc", best_acc, prog_bar=False, on_epoch=True)
+        self.log("val_best_thr", best_thr, prog_bar=False, on_epoch=True)
         self._best_thr = float(best_thr)
         self._val_logits.clear()
         self._val_labels.clear()
