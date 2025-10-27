@@ -2070,6 +2070,7 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         mu_proj_dim: int = 64,
         prec_proj_dim: int = 32,
         scalar_proj_dim: int = 16,
+        enc_proj_dim: int = 64,
         d_model: int = 128,
         nhead: int = 4,
         num_layers: int = 2,
@@ -2092,8 +2093,10 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         self.prec_proj = nn.Sequential(nn.Linear(latent_dim, prec_proj_dim), nn.GELU())
         self.scalar_in_dim = 2  # [KL_scalar, log1p(dt)]
         self.scalar_proj = nn.Sequential(nn.Linear(self.scalar_in_dim, 32), nn.GELU(), nn.Linear(32, scalar_proj_dim))
+        # Aggregated encoder token features (mean over tokens)
+        self.enc_proj = nn.Sequential(nn.Linear(latent_dim, enc_proj_dim), nn.GELU())
 
-        feat_dim = mu_proj_dim + prec_proj_dim + scalar_proj_dim
+        feat_dim = mu_proj_dim + prec_proj_dim + scalar_proj_dim + enc_proj_dim
         self.input_proj = nn.Sequential(nn.Linear(feat_dim, d_model), nn.GELU(), nn.Dropout(dropout))
 
         # Transformer encoder
@@ -2187,21 +2190,28 @@ class TransformerSetVAEClassifier(pl.LightningModule):
 
         mu_list: List[torch.Tensor] = []
         logvar_list: List[torch.Tensor] = []
+        enc_aggs: List[torch.Tensor] = []
         set_times: List[torch.Tensor] = []
         for s in sets:
             # Optionally enable grads through SetVAE encoder after unfreeze
             if self._feature_grad_enabled:
-                z_list, _ = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+                z_list, enc_tokens = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D], [1,N,D]
             else:
                 with torch.no_grad():
-                    z_list, _ = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D]
+                    z_list, enc_tokens = self.setvae.set_encoder.encode_from_var_val(s["var"], s["val"])  # [1,1,D], [1,N,D]
             _z, mu, logvar = z_list[-1]
             mu_list.append(mu.squeeze(1))          # [1,D]
             logvar_list.append(logvar.squeeze(1))  # [1,D]
+            if enc_tokens is not None and enc_tokens.numel() > 0:
+                enc_aggs.append(enc_tokens.mean(dim=1))  # [1,D]
+            else:
+                # Fallback to mu if encoder tokens unavailable
+                enc_aggs.append(mu)
             set_times.append(s["set_time"])       # [1]
 
-        mu_qx = torch.stack(mu_list, dim=1).to(device)        # [1,S,D]
-        logvar_qx = torch.stack(logvar_list, dim=1).to(device)  # [1,S,D]
+        mu_qx = torch.stack(mu_list, dim=1).to(device)        # [1, S, D]
+        logvar_qx = torch.stack(logvar_list, dim=1).to(device)  # [1, S, D]
+        enc_aggs_t = torch.stack(enc_aggs, dim=1).to(device)    # [1, S, D]
         minutes = torch.stack(set_times, dim=1).float().to(device)  # [1,S]
         if minutes.dim() == 2:
             minutes = minutes
@@ -2212,6 +2222,7 @@ class TransformerSetVAEClassifier(pl.LightningModule):
         for t in range(S):
             mu_t = mu_qx[:, t, :]
             logvar_t = logvar_qx[:, t, :]
+            enc_t = enc_aggs_t[:, t, :]
             # KL(q_x || N(0,I)) scalar
             kl_dim = 0.5 * (logvar_t.exp() + mu_t.pow(2) - 1.0 - logvar_t)
             kl_scalar = kl_dim.sum(dim=-1, keepdim=True)  # [1,1]
@@ -2222,7 +2233,8 @@ class TransformerSetVAEClassifier(pl.LightningModule):
             mu_feat = self.mu_proj(mu_t)                   # [1, mu_proj_dim]
             prec_feat = self.prec_proj(-logvar_t)          # [1, prec_proj_dim]
             scalar_feat = self.scalar_proj(torch.cat([kl_scalar, log_dt1p], dim=-1))  # [1, scalar_proj_dim]
-            base = torch.cat([mu_feat, prec_feat, scalar_feat], dim=-1)  # [1, feat_dim]
+            enc_feat = self.enc_proj(enc_t)                 # [1, enc_proj_dim]
+            base = torch.cat([mu_feat, prec_feat, scalar_feat, enc_feat], dim=-1)  # [1, feat_dim]
             token = self.input_proj(base) + time_emb[:, t, :]            # [1, d_model]
             feat_rows.append(token.squeeze(0))
 

@@ -357,6 +357,9 @@ def _run_generative():
     parser.add_argument("--cls_dropout", type=float, default=0.2)
     parser.add_argument("--label_csv", type=str, default=None, help="Label CSV (required when --enable_cls)")
     parser.add_argument("--no_weighted_sampler", action="store_true", help="Disable class-balanced sampling when --enable_cls")
+    parser.add_argument("--freeze_encoder", action="store_true", default=True, help="Freeze SetVAE encoder during training (recommended baseline)")
+    parser.add_argument("--cls_lr", type=float, default=2e-4, help="Learning rate for classifier head and transformer")
+    parser.add_argument("--enc_lr", type=float, default=1e-5, help="Learning rate for (optionally) unfrozen encoder")
 
     args = parser.parse_args()
 
@@ -660,11 +663,11 @@ def _run_discriminative():
             gru_hidden=128,
             gru_layers=2,
             dropout=args.dropout,
-            lr=args.lr,
+            lr=args.cls_lr,
             # Avoid double-balancing: if using WeightedRandomSampler, drop BCE pos_weight
             pos_weight=(None if getattr(dm, "use_weighted_sampler", False) else getattr(dm, "pos_weight", None)),
-            unfreeze_after_epochs=max(0, int(args.unfreeze_after_epochs)),
-            unfreeze_scope=str(args.unfreeze_scope),
+            unfreeze_after_epochs=(0 if args.freeze_encoder else max(0, int(args.unfreeze_after_epochs))),
+            unfreeze_scope=("none" if args.freeze_encoder else str(args.unfreeze_scope)),
         )
     else:
         model = TransformerSetVAEClassifier(
@@ -677,11 +680,11 @@ def _run_discriminative():
             nhead=int(args.nhead),
             num_layers=int(args.num_layers),
             dropout=args.dropout,
-            lr=args.lr,
+            lr=args.cls_lr,
             # Avoid double-balancing: if using WeightedRandomSampler, drop BCE pos_weight
             pos_weight=(None if getattr(dm, "use_weighted_sampler", False) else getattr(dm, "pos_weight", None)),
-            unfreeze_after_epochs=max(0, int(args.unfreeze_after_epochs)),
-            unfreeze_scope=str(args.unfreeze_scope),
+            unfreeze_after_epochs=(0 if args.freeze_encoder else max(0, int(args.unfreeze_after_epochs))),
+            unfreeze_scope=("none" if args.freeze_encoder else str(args.unfreeze_scope)),
         )
 
     out_root = args.output_dir if args.output_dir else "./output"
