@@ -255,6 +255,8 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             # TorchMetrics for robust epoch-wise AUROC/AUPRC logging (no sklearn dependency)
             self.val_auprc_metric = AveragePrecision(task="binary")
             self.val_auroc_metric = AUROC(task="binary")
+            # Track how many samples updated metrics this epoch to guard empty-compute
+            self._val_cls_update_count = 0
             # Buffers for epoch-level classification metrics
             self._val_logits: list[float] = []
             self._val_labels: list[int] = []
@@ -382,8 +384,16 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
         S = len(sets)
         device = self.device
         if S == 0:
+            # No sets -> return well-typed zeros for all outputs; no pooled feature
             z = torch.zeros(1, 0, self.latent_dim, device=device)
-            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            return (
+                torch.tensor(0.0, device=device),  # recon_total
+                torch.tensor(0.0, device=device),  # kl_total
+                torch.tensor(0.0, device=device),  # next_change_loss
+                torch.zeros(self.latent_dim, device=device),  # kl_dim_mean
+                torch.tensor(0.0, device=device),  # var_dev_mean
+                None,  # pooled
+            )
 
         z_mu_list, z_logvar_list, pos_list = [], [], []
         z_mu_post_list, z_logvar_post_list = [], []
@@ -669,14 +679,21 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             y = batch["y"].to(logits.dtype)
             cls_loss = self._bce_cls(logits, y)
             total = total + self.cls_loss_weight * cls_loss
-            # Update TorchMetrics and keep legacy buffers
+            # Always record raw logits/labels for robust fallback metrics
             try:
-                probs = torch.sigmoid(logits)
-                self.val_auprc_metric.update(probs, y)
-                self.val_auroc_metric.update(probs, y)
                 self._val_logits.extend(logits.detach().cpu().tolist())
                 self._val_labels.extend(y.detach().cpu().tolist())
             except Exception:
+                pass
+            # Update TorchMetrics with strict dtypes/shapes; guard failures
+            try:
+                probs = torch.sigmoid(logits.detach())  # [B]
+                targets = (y >= 0.5).to(torch.int)      # [B] binary
+                self.val_auprc_metric.update(probs, targets)
+                self.val_auroc_metric.update(probs, targets)
+                self._val_cls_update_count += int(targets.numel())
+            except Exception:
+                # Leave metrics empty; on_epoch logging will be guarded below
                 pass
         else:
             cls_loss = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
@@ -685,11 +702,28 @@ class PoESeqSetVAEPretrain(pl.LightningModule):
             log_dict["val_next_change"] = next_c
         if self.enable_cls:
             log_dict["val_cls"] = cls_loss
-            # Log TorchMetrics objects with on_epoch=True so callbacks can monitor
-            self.log("val_auprc", self.val_auprc_metric, on_epoch=True, prog_bar=True)
-            self.log("val_auroc", self.val_auroc_metric, on_epoch=True, prog_bar=True)
+            # Only log Metric objects if they received any updates this epoch.
+            # This avoids torchmetrics.compute() raising on empty state when val loop yields no samples or updates.
+            if getattr(self, "_val_cls_update_count", 0) > 0:
+                self.log("val_auprc", self.val_auprc_metric, on_epoch=True, prog_bar=True)
+                self.log("val_auroc", self.val_auroc_metric, on_epoch=True, prog_bar=True)
         self.log_dict(log_dict, prog_bar=True, on_epoch=True)
         return total
+
+    def on_validation_epoch_start(self):
+        # Reset per-epoch counters/buffers for classification metrics
+        if getattr(self, "enable_cls", False):
+            self._val_cls_update_count = 0
+            if hasattr(self, "_val_logits"):
+                try:
+                    self._val_logits.clear()
+                except Exception:
+                    self._val_logits = []
+            if hasattr(self, "_val_labels"):
+                try:
+                    self._val_labels.clear()
+                except Exception:
+                    self._val_labels = []
 
     def configure_optimizers(self):
         opt = AdamW(self.parameters(), lr=self.lr)
