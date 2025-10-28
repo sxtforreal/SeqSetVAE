@@ -196,6 +196,12 @@ def _run_setvae():
     parser.add_argument("--levels", type=int, default=getattr(cfg, "levels", 2))
     parser.add_argument("--heads", type=int, default=getattr(cfg, "heads", 2))
     parser.add_argument("--m", type=int, default=getattr(cfg, "m", 16))
+    # Probabilistic head & schema (optional; defaults treat all features as continuous and disable head)
+    parser.add_argument("--enable_prob_head", action="store_true", default=False)
+    parser.add_argument("--num_features", type=int, default=0)
+    parser.add_argument("--feature_types", type=int, nargs='*', default=None, help="Per-feature type codes: 0=cont,1=bin,2=cat")
+    parser.add_argument("--categorical_feat_ids", type=int, nargs='*', default=None)
+    parser.add_argument("--categorical_cardinalities", type=int, nargs='*', default=None)
     args = parser.parse_args()
 
     dm = DataModule(
@@ -242,6 +248,11 @@ def _run_setvae():
         kl_over_weight=float(args.kl_over_weight),
         var_stability_weight=float(args.var_stability_weight),
         per_dim_free_bits=float(args.per_dim_free_bits),
+        enable_prob_head=bool(args.enable_prob_head),
+        num_features=(int(args.num_features) if args.num_features is not None else 0),
+        feature_types=(list(args.feature_types) if args.feature_types is not None else None),
+        categorical_feat_ids=(list(args.categorical_feat_ids) if args.categorical_feat_ids is not None else None),
+        categorical_cardinalities=(list(args.categorical_cardinalities) if args.categorical_cardinalities is not None else None),
     )
 
     if args.init_ckpt is not None and os.path.isfile(args.init_ckpt):

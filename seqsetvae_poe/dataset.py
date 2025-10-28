@@ -54,6 +54,8 @@ def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Di
     set_id = torch.zeros(B, max_len, 1, dtype=torch.long)
     age = torch.zeros(B, max_len, 1, dtype=torch.float32)
     carry_mask = torch.zeros(B, max_len, 1, dtype=torch.float32)
+    # New: feature id per token (from 'variable' column)
+    feat_id = torch.zeros(B, max_len, 1, dtype=torch.long)
     padding_mask = torch.ones(B, max_len, dtype=torch.bool)
 
     for b, (df, _) in enumerate(batch):
@@ -74,6 +76,19 @@ def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Di
             age[b, :n] = torch.from_numpy(df["age"].to_numpy(dtype=np.float32)).view(-1, 1)
         if "is_carry" in df.columns:
             carry_mask[b, :n] = torch.from_numpy(df["is_carry"].to_numpy(dtype=np.float32)).view(-1, 1)
+        # Extract feature id from 'variable' column when available
+        if "variable" in df.columns:
+            try:
+                var_col = df["variable"]
+                if pd.api.types.is_integer_dtype(var_col):
+                    ids = var_col.to_numpy(dtype=np.int64, copy=False)
+                else:
+                    # Use categorical codes for non-integer identifiers
+                    ids = var_col.astype("category").cat.codes.to_numpy(dtype=np.int64)
+                feat_id[b, :n] = torch.from_numpy(ids).view(-1, 1)
+            except Exception:
+                # Leave zeros if extraction fails
+                pass
         padding_mask[b, :n] = False
 
     return {
@@ -84,6 +99,7 @@ def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Di
         "age": age,
         "carry_mask": carry_mask,
         "padding_mask": padding_mask,
+        "feat_id": feat_id,
     }
 
 
