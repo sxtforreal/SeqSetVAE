@@ -1654,6 +1654,63 @@ def _build_poe_from_state(state: Dict[str, torch.Tensor]) -> 'PoESeqSetVAEPretra
     return model
 
 
+def _build_setvae_from_state(state: Dict[str, torch.Tensor]) -> 'SetVAEOnlyPretrain':
+    """Construct a SetVAE backbone from a Stage A checkpoint state_dict.
+
+    Notes:
+    - Uses cfg defaults to instantiate the module shape; strict=False loading will
+      populate matching weights and ignore shape-mismatched layers gracefully.
+    - The returned module is set to eval() and all parameters are frozen.
+    """
+    model = SetVAEOnlyPretrain(
+        input_dim=getattr(cfg, "input_dim", 768),
+        reduced_dim=getattr(cfg, "reduced_dim", getattr(cfg, "input_dim", 768)),
+        latent_dim=getattr(cfg, "latent_dim", 256),
+        levels=getattr(cfg, "levels", 2),
+        heads=getattr(cfg, "heads", 2),
+        m=getattr(cfg, "m", 16),
+        beta=getattr(cfg, "beta", 0.1),
+        lr=getattr(cfg, "lr", 3e-4),
+        ff_dim=getattr(cfg, "ff_dim", 512),
+        transformer_heads=getattr(cfg, "transformer_heads", 8),
+        transformer_layers=getattr(cfg, "transformer_layers", 4),
+        transformer_dropout=getattr(cfg, "transformer_dropout", 0.15),
+        warmup_beta=getattr(cfg, "warmup_beta", True),
+        max_beta=getattr(cfg, "max_beta", 0.2),
+        beta_warmup_steps=getattr(cfg, "beta_warmup_steps", 8000),
+        free_bits=getattr(cfg, "free_bits", 0.05),
+        use_kl_capacity=getattr(cfg, "use_kl_capacity", True),
+        capacity_per_dim_end=getattr(cfg, "capacity_per_dim_end", 0.03),
+        capacity_warmup_steps=getattr(cfg, "capacity_warmup_steps", 20000),
+        use_sinkhorn=getattr(cfg, "use_sinkhorn", True),
+        sinkhorn_eps=getattr(cfg, "sinkhorn_eps", 0.1),
+        sinkhorn_iters=getattr(cfg, "sinkhorn_iters", 100),
+        recon_alpha=getattr(cfg, "recon_alpha", 1.0),
+        recon_beta=getattr(cfg, "recon_beta", 4.0),
+        recon_gamma=getattr(cfg, "recon_gamma", 3.0),
+        recon_scale_calib=getattr(cfg, "recon_scale_calib", 1.0),
+        recon_beta_var=getattr(cfg, "recon_beta_var", 0.0),
+        kl_fairness_weight=getattr(cfg, "kl_fairness_weight", 0.1),
+        kl_spread_tol=getattr(cfg, "kl_spread_tol", 1.0),
+        kl_over_weight=getattr(cfg, "kl_over_weight", 1.0),
+        var_stability_weight=getattr(cfg, "var_stability_weight", 0.01),
+        per_dim_free_bits=getattr(cfg, "per_dim_free_bits", 0.002),
+        use_flows=getattr(cfg, "use_flows", False),
+        num_flows=getattr(cfg, "num_flows", 0),
+        mmd_weight=getattr(cfg, "mmd_weight", 0.0),
+        mmd_scales=getattr(cfg, "mmd_scales", [1.0, 2.0, 4.0, 8.0]),
+    )
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    try:
+        print(f"Loaded SetVAE weights: missing={len(missing)}, unexpected={len(unexpected)}")
+    except Exception:
+        pass
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
 class AdditiveAttention(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
@@ -2375,4 +2432,215 @@ class TransformerSetVAEClassifier(pl.LightningModule):
     def configure_optimizers(self):
         # Include all params so later-unfrozen weights start updating without reconfiguring the optimizer
         opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        return opt
+
+
+class SetVAESequenceClassifier(pl.LightningModule):
+    """Sequence classifier that consumes Stage A SetVAE per-set posteriors (no dynamics).
+
+    It extracts per-set q_x(z|x) = N(μ, σ²) from the frozen SetVAE encoder, forms
+    features from μ and simple scalars (KL to N(0,I), log1p(Δt)), then applies a GRU
+    with attention and a binary head.
+    """
+
+    def __init__(
+        self,
+        setvae_model: 'SetVAEOnlyPretrain',
+        latent_dim: int,
+        mu_proj_dim: int = 64,
+        scalar_proj_dim: int = 16,
+        gru_hidden: int = 128,
+        gru_layers: int = 2,
+        dropout: float = 0.2,
+        lr: float = 1e-3,
+        pos_weight: Optional[float] = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["setvae_model"])  # avoid serializing large backbone
+        self.setvae = setvae_model.eval()
+        for p in self.setvae.parameters():
+            p.requires_grad = False
+        self.latent_dim = latent_dim
+        self.mu_proj = nn.Sequential(nn.Linear(latent_dim, mu_proj_dim), nn.GELU())
+        # Scalars: [KL(q||N(0,I)), log1p(Δt)]
+        self.scalar_in_dim = 2
+        self.scalar_proj = nn.Sequential(
+            nn.Linear(self.scalar_in_dim, 32), nn.GELU(), nn.Linear(32, scalar_proj_dim)
+        )
+        feat_dim = mu_proj_dim + scalar_proj_dim
+        self.gru = nn.GRU(
+            input_size=feat_dim,
+            hidden_size=gru_hidden,
+            num_layers=gru_layers,
+            batch_first=True,
+            dropout=dropout if gru_layers > 1 else 0.0,
+        )
+        self.attn = AdditiveAttention(gru_hidden)
+        self.head = nn.Sequential(
+            nn.Linear(gru_hidden, gru_hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(gru_hidden // 2, 1),
+        )
+        self.lr = lr
+        self.pos_weight = (
+            None if pos_weight is None else torch.tensor([pos_weight], dtype=torch.float32)
+        )
+        self._val_logits: List[float] = []
+        self._val_labels: List[int] = []
+        self._test_logits: List[float] = []
+        self._test_labels: List[float] = []
+
+    @torch.no_grad()
+    def _extract_features_single(self, sets: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = next(self.parameters()).device
+        S = len(sets)
+        if S == 0:
+            return torch.zeros(0, 1, device=device), torch.zeros(0, dtype=torch.bool, device=device)
+
+        mu_list: List[torch.Tensor] = []
+        logvar_list: List[torch.Tensor] = []
+        set_times: List[torch.Tensor] = []
+        for s in sets:
+            var, val = s["var"], s["val"]
+            z_list_enc, _ = self.setvae.set_encoder.encode_from_var_val(var, val)
+            _z, mu_qx, logvar_qx = z_list_enc[-1]
+            mu_list.append(mu_qx.squeeze(1))
+            logvar_list.append(logvar_qx.squeeze(1))
+            set_times.append(s["set_time"])  # [1]
+
+        mu = torch.stack(mu_list, dim=1).to(device)       # [1,S,D]
+        logvar = torch.stack(logvar_list, dim=1).to(device)  # [1,S,D]
+        minutes = torch.stack(set_times, dim=1).float().to(device)  # [1,S]
+        if minutes.dim() == 2:
+            minutes = minutes.unsqueeze(-1)
+        minutes = minutes.squeeze(-1)  # [1,S]
+
+        feat_rows: List[torch.Tensor] = []
+        for t in range(S):
+            mu_t = mu[:, t, :]
+            logvar_t = logvar[:, t, :]
+            var_t = logvar_t.exp()
+            # KL(q||N(0,I)) per-step scalar
+            kld = 0.5 * (mu_t.pow(2) + var_t - logvar_t - 1.0)
+            kl_scalar = kld.sum(dim=-1, keepdim=True)  # [1,1]
+
+            dt = minutes[:, t : t + 1] - (minutes[:, t - 1 : t] if t > 0 else minutes[:, t : t + 1])
+            log_dt1p = torch.log1p(dt.clamp(min=0.0))
+
+            mu_feat = self.mu_proj(mu_t)
+            scalar_feat = torch.cat([kl_scalar, log_dt1p], dim=-1)
+            scalar_feat = self.scalar_proj(scalar_feat)
+            feat_t = torch.cat([mu_feat, scalar_feat], dim=-1).squeeze(0)
+            feat_rows.append(feat_t)
+
+        X = torch.stack(feat_rows, dim=0)  # [S,F]
+        mask = torch.ones(S, dtype=torch.bool, device=device)
+        return X, mask
+
+    @torch.no_grad()
+    def _build_batch_features(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        var, val = batch["var"], batch["val"]
+        minute, set_id = batch["minute"], batch["set_id"]
+        padding_mask = batch.get("padding_mask", None)
+        carry_mask = batch.get("carry_mask", None)
+        B = var.size(0)
+        # use SetVAE's own set splitter
+        all_sets = self.setvae._split_sets(var, val, minute, set_id, padding_mask, carry_mask)
+        feats: List[torch.Tensor] = []
+        masks: List[torch.Tensor] = []
+        for sets in all_sets:
+            X_i, m_i = self._extract_features_single(sets)
+            feats.append(X_i)
+            masks.append(m_i)
+        maxS = max((x.shape[0] for x in feats), default=0)
+        feat_dim = (
+            feats[0].shape[1]
+            if len(feats) > 0 and feats[0].ndim == 2 and feats[0].shape[0] > 0
+            else (self.mu_proj[0].out_features + self.scalar_proj[-1].out_features)
+        )
+        X_pad = torch.zeros(B, maxS, feat_dim, device=var.device)
+        M = torch.zeros(B, maxS, dtype=torch.bool, device=var.device)
+        for b in range(B):
+            s_len = feats[b].shape[0]
+            if s_len > 0:
+                X_pad[b, :s_len, :] = feats[b]
+                M[b, :s_len] = masks[b]
+        y = batch["y"].to(var.device) if "y" in batch else torch.zeros(B, device=var.device)
+        return X_pad, M, y
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        X, M, _ = self._build_batch_features(batch)
+        lengths = M.sum(dim=1).long().clamp(min=1)
+        packed = pack_padded_sequence(X, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        packed_out, _ = self.gru(packed)
+        H, _ = pad_packed_sequence(packed_out, batch_first=True)
+        S_out = H.size(1)
+        M_out = torch.arange(S_out, device=H.device).unsqueeze(0) < lengths.unsqueeze(1)
+        z = self.attn(H, M_out)
+        logit = self.head(z).squeeze(-1)
+        return logit
+
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        logits = self.forward(batch)
+        y = batch["y"].to(logits.dtype)
+        if self.pos_weight is not None:
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=self.pos_weight.to(logits.device))
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, y)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        logits = self.forward(batch)
+        y = batch["y"].to(logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
+        self._val_logits.extend(logits.detach().cpu().tolist())
+        self._val_labels.extend(y.detach().cpu().tolist())
+        return loss
+
+    def on_validation_epoch_end(self) -> None:
+        if len(self._val_labels) == 0:
+            return
+        try:
+            y_true = np.array(self._val_labels, dtype=np.int32)
+            y_prob = torch.sigmoid(torch.tensor(self._val_logits)).numpy()
+            from sklearn.metrics import roc_auc_score as _auc, average_precision_score as _ap
+            auroc = float(_auc(y_true, y_prob))
+            auprc = float(_ap(y_true, y_prob))
+        except Exception:
+            auroc, auprc = float("nan"), float("nan")
+        self.log("val_auroc", auroc, prog_bar=True)
+        self.log("val_auprc", auprc, prog_bar=True)
+        self._val_logits.clear()
+        self._val_labels.clear()
+
+    def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        logits = self.forward(batch)
+        y = batch.get("y", torch.zeros_like(logits)).to(logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        self.log("test_loss", loss, prog_bar=True)
+        self._test_logits.extend(logits.detach().cpu().tolist())
+        self._test_labels.extend(y.detach().cpu().tolist())
+        return loss
+
+    def on_test_epoch_end(self) -> None:
+        if len(self._test_labels) == 0:
+            return
+        try:
+            y_true = np.array(self._test_labels, dtype=np.int32)
+            y_prob = torch.sigmoid(torch.tensor(self._test_logits)).numpy()
+            from sklearn.metrics import roc_auc_score as _auc, average_precision_score as _ap
+            auroc = float(_auc(y_true, y_prob))
+            auprc = float(_ap(y_true, y_prob))
+        except Exception:
+            auroc, auprc = float("nan"), float("nan")
+        self.log("test_auroc", auroc, prog_bar=True)
+        self.log("test_auprc", auprc, prog_bar=True)
+        self._test_logits.clear()
+        self._test_labels.clear()
+
+    def configure_optimizers(self):
+        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
         return opt
