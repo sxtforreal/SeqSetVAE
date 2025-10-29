@@ -141,7 +141,7 @@ def main():
     ap.add_argument("--out_dir", type=str, required=True, help="Directory to write schema.csv")
     ap.add_argument("--include_valid", action="store_true", default=False)
     ap.add_argument("--include_test", action="store_true", default=False)
-    ap.add_argument("--max_files", type=int, default=200, help="Max parquet files to scan")
+    ap.add_argument("--max_files", type=int, default=0, help="Max parquet files to scan (<=0 means all)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
