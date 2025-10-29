@@ -13,7 +13,8 @@ feature identifiers from the 'variable' column and inspects their 'value' distri
 
 Heuristics for type inference (can be overridden later by manual edits):
 - If all observed values are in {0,1} -> 'bin'
-- Else if value looks discrete with small support (<=10 unique values) and values are integers in [0, K-1] -> 'cat' with K=unique_count
+- Else if values appear discrete with small support (<=20 unique integer values) and are contiguous integers
+  (contiguous range allowed to start from any integer, not necessarily 0) -> 'cat' with K=unique_count
 - Else -> 'cont'
 
 Usage:
@@ -52,7 +53,7 @@ def _list_parquets(root: str, include_valid: bool, include_test: bool, max_files
     return files
 
 
-def _infer_type(values: np.ndarray) -> Tuple[str, int]:
+def _infer_type(values: np.ndarray, max_cat_unique: int = 20) -> Tuple[str, int]:
     # values: 1-D numeric array (float) possibly with NaNs
     v = values[np.isfinite(values)]
     if v.size == 0:
@@ -61,11 +62,11 @@ def _infer_type(values: np.ndarray) -> Tuple[str, int]:
     uniq = np.unique(v)
     if uniq.size <= 2 and set(np.round(uniq).astype(int).tolist()).issubset({0, 1}):
         return "bin", 2
-    # Small-integer categorical
+    # Small-integer categorical (allow non-zero start; require contiguity within integer range)
     uniq_int = np.unique(np.round(v).astype(int))
-    if uniq_int.size <= 10 and np.allclose(uniq_int, np.unique(uniq_int)):
-        # check if values are non-negative and contiguous from 0
-        if uniq_int.min() >= 0 and (uniq_int.max() + 1 == uniq_int.size):
+    if uniq_int.size <= max_cat_unique:
+        # contiguous integers even if starting from non-zero (or negative)
+        if int(uniq_int.max()) - int(uniq_int.min()) + 1 == int(uniq_int.size):
             return "cat", int(uniq_int.size)
     return "cont", 0
 
