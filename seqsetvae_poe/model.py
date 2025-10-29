@@ -1077,6 +1077,16 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         max_beta_ceiling: float = 2.0,
         capacity_per_dim_max: float = 0.20,
         active_ratio_warn_threshold: float = 0.5,
+        # --- New: schema & probabilistic head controls ---
+        enable_prob_head: bool = True,
+        num_features: int | None = None,
+        feature_types: Optional[List[int]] = None,  # 0=cont,1=bin,2=cat
+        categorical_feat_ids: Optional[List[int]] = None,
+        categorical_cardinalities: Optional[List[int]] = None,
+        id_embed_dim: int = 64,
+        state_embed_dim: int = 64,
+        token_mlp_hidden: int = 128,
+        prob_head_hidden: int = 256,
     ):
         super().__init__()
         self.set_encoder = SetVAEModule(
@@ -1160,7 +1170,94 @@ class SetVAEOnlyPretrain(pl.LightningModule):
 
         # Manual LR scheduler stepping to guarantee order: optimizer.step() -> scheduler.step()
         self._manual_scheduler = None
-        self.save_hyperparameters()
+        # Save hparams, but ignore potentially long lists for compactness
+        self.save_hyperparameters(
+            ignore=[
+                "feature_types",
+                "categorical_feat_ids",
+                "categorical_cardinalities",
+            ]
+        )
+
+        # ---------------- New components: schema-driven tokenizer + probabilistic head ---------------- #
+        self.enable_prob_head = bool(enable_prob_head)
+        # Schema defaults: if not provided, treat all features as continuous
+        F = int(num_features) if num_features is not None else 0
+        if feature_types is None and F > 0:
+            feature_types = [0 for _ in range(F)]
+        if feature_types is None:
+            # No schema: disable prob head gracefully
+            self.enable_prob_head = False
+            F = 0
+            self.feature_types = None
+        else:
+            assert all(t in (0, 1, 2) for t in feature_types), "feature_types must be 0/1/2"
+            self.feature_types = torch.tensor(feature_types, dtype=torch.long)
+            F = int(len(feature_types))
+        self.num_features = F
+
+        # Feature ID embedding (always defined if F>0)
+        if self.num_features > 0:
+            self.id_embedding = nn.Embedding(self.num_features, id_embed_dim)
+            # Continuous value embedder: map scalar -> state_embed_dim
+            self.cont_value_embed = nn.Sequential(
+                nn.Linear(1, state_embed_dim),
+                nn.GELU(),
+                nn.Linear(state_embed_dim, state_embed_dim),
+            )
+            # Binary state embeddings: index = feat_id * 2 + state(0/1)
+            self.bin_state_embed = nn.Embedding(self.num_features * 2, state_embed_dim)
+            # Categorical state embeddings: flattened across features with per-feature offsets
+            cat_ids = categorical_feat_ids or []
+            cat_cards = categorical_cardinalities or []
+            if len(cat_ids) != len(cat_cards):
+                # mismatched inputs; disable categorical specific embeddings but keep rest
+                cat_ids, cat_cards = [], []
+            # Build offsets for global feature id -> base index in flattened categorical table
+            cat_offsets = torch.full((self.num_features,), fill_value=-1, dtype=torch.long)
+            cat_card_vec = torch.zeros(self.num_features, dtype=torch.long)
+            running = 0
+            for fid, card in zip(cat_ids, cat_cards):
+                if fid < 0 or fid >= self.num_features:
+                    continue
+                cat_offsets[fid] = running
+                cat_card_vec[fid] = int(card)
+                running += int(card)
+            self.register_buffer("cat_offsets", cat_offsets, persistent=False)
+            self.register_buffer("cat_cardinalities", cat_card_vec, persistent=False)
+            self.total_cat_states = int(running)
+            if self.total_cat_states > 0:
+                self.cat_state_embed = nn.Embedding(self.total_cat_states, state_embed_dim)
+            else:
+                self.cat_state_embed = None
+            # Token composer: concat [id_emb, value/state_emb] -> reduced_dim
+            self.token_mlp = nn.Sequential(
+                nn.Linear(id_embed_dim + state_embed_dim, token_mlp_hidden),
+                nn.GELU(),
+                nn.Linear(token_mlp_hidden, reduced_dim),
+            )
+            # Fallback id projection when feat_id unavailable: project normalized var -> id space
+            self.id_fallback_proj = nn.Linear(reduced_dim, id_embed_dim)
+            # Probabilistic head
+            if self.enable_prob_head:
+                self.prob_shared = nn.Sequential(
+                    nn.Linear(latent_dim, prob_head_hidden),
+                    nn.GELU(),
+                    nn.Linear(prob_head_hidden, prob_head_hidden),
+                    nn.GELU(),
+                )
+                self.prob_cont_mu = nn.Linear(prob_head_hidden, self.num_features)
+                self.prob_cont_logvar = nn.Linear(prob_head_hidden, self.num_features)
+                self.prob_bin_logit = nn.Linear(prob_head_hidden, self.num_features)
+                self.prob_cat_logits = (
+                    nn.Linear(prob_head_hidden, self.total_cat_states) if self.total_cat_states > 0 else None
+                )
+            else:
+                self.prob_shared = None
+                self.prob_cont_mu = None
+                self.prob_cont_logvar = None
+                self.prob_bin_logit = None
+                self.prob_cat_logits = None
 
     # --- helpers ---
     def _beta(self):
@@ -1178,7 +1275,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             return cap_end
         return cap_end * (float(self._step) / float(max(1, self.capacity_warmup_steps)))
 
-    def _split_sets(self, var, val, minutes, set_id, padding_mask=None, carry_mask=None):
+    def _split_sets(self, var, val, minutes, set_id, padding_mask=None, carry_mask=None, feat_id=None):
         B = var.size(0)
         all_sets = []
         for b in range(B):
@@ -1187,11 +1284,14 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             t = minutes[b]
             s = set_id[b]
             c = carry_mask[b] if carry_mask is not None else None
+            f = feat_id[b] if feat_id is not None else None
             if padding_mask is not None:
                 mask = ~padding_mask[b]
                 v, x, t, s = v[mask], x[mask], t[mask], s[mask]
                 if c is not None:
                     c = c[mask]
+                if f is not None:
+                    f = f[mask]
             if s.dim() > 1:
                 s = s.squeeze(-1)
             uniq, counts = torch.unique_consecutive(s.long(), return_counts=True)
@@ -1203,6 +1303,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
                     "val": x[idx].unsqueeze(0),
                     "minute": t[idx].unsqueeze(0),
                     "carry": (c[idx].unsqueeze(0) if c is not None else torch.zeros(1, len(idx), 1, device=v.device)),
+                    "feat_id": (f[idx].unsqueeze(0) if f is not None else None),
                 })
             all_sets.append(patient_sets)
         return all_sets
@@ -1216,6 +1317,74 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         reduced_normalized = reduced / (norms + 1e-8)
         target_x = reduced_normalized * s["val"]
         return reduced_normalized, target_x
+
+    def _build_token_inputs(self, v_norm: torch.Tensor, s: dict) -> torch.Tensor:
+        """Schema-driven token embedding from feature id and value/state.
+
+        v_norm: [1,N,R] normalized direction vectors (used as fallback for id embedding)
+        s: dict containing keys 'val' [1,N,1], optional 'feat_id' [1,N,1] with global indices
+        Returns: token inputs [1,N,R] compatible with encoder's expected reduced_dim
+        """
+        if self.num_features <= 0:
+            # Fallback to original representation
+            return v_norm * s["val"]
+
+        feat_id = s.get("feat_id", None)
+        if feat_id is None or feat_id is False:
+            # Build id embedding from direction via projection
+            id_emb = self.id_fallback_proj(v_norm)
+            val_emb = self.cont_value_embed(s["val"])  # treat as continuous
+            tok = torch.cat([id_emb, val_emb], dim=-1)
+            x = self.token_mlp(tok)
+            return x
+
+        # Use provided feature ids
+        fid = feat_id.long().clamp(min=0, max=max(0, self.num_features - 1))  # [1,N,1]
+        id_emb = self.id_embedding(fid.squeeze(-1))  # [1,N,Eid]
+        # Determine type per token: default to continuous
+        if self.feature_types is None:
+            tcode = torch.zeros_like(fid)
+        else:
+            tcode = self.feature_types.to(fid.device)[fid.squeeze(-1)].view(1, -1, 1)
+        # Build value/state embedding based on type
+        cont_mask = (tcode == 0)
+        bin_mask = (tcode == 1)
+        cat_mask = (tcode == 2)
+
+        # state embedding has its own dimensionality independent of id embedding
+        state_emb = torch.zeros(fid.size(0), fid.size(1), self.cont_value_embed[0].out_features, device=id_emb.device, dtype=id_emb.dtype)
+        # Continuous: embed scalar value
+        if cont_mask.any():
+            tok_mask = cont_mask.squeeze(0).squeeze(-1)  # [N]
+            val_cont = s["val"].squeeze(0).squeeze(-1)[tok_mask].view(-1, 1)
+            emb_cont = self.cont_value_embed(val_cont)  # [K, E_state]
+            state_emb[0, tok_mask, :] = emb_cont
+        # Binary: use 0/1 state from value>0.5
+        if bin_mask.any():
+            tok_mask = bin_mask.squeeze(0).squeeze(-1)  # [N]
+            bin_state = (s["val"].squeeze(0).squeeze(-1)[tok_mask] > 0.5).long()  # [K]
+            bin_fid = fid.squeeze(0).squeeze(-1)[tok_mask]  # [K]
+            flat_idx = bin_fid * 2 + bin_state
+            emb_bin = self.bin_state_embed(flat_idx)  # [K, E_state]
+            state_emb[0, tok_mask, :] = emb_bin
+        # Categorical: value carries integer class index
+        if cat_mask.any() and self.cat_state_embed is not None:
+            tok_mask = cat_mask.squeeze(0).squeeze(-1)  # [N]
+            cat_classes = s["val"].squeeze(0).squeeze(-1)[tok_mask].long().clamp(min=0)
+            cat_fid = fid.squeeze(0).squeeze(-1)[tok_mask]
+            # Map (fid, class) -> global index via offsets
+            offsets = self.cat_offsets.to(cat_fid.device)[cat_fid]
+            # clamp class within card
+            if hasattr(self, "cat_cardinalities") and self.cat_cardinalities is not None:
+                max_class = (self.cat_cardinalities.to(cat_fid.device)[cat_fid] - 1).clamp(min=0)
+                cat_classes = torch.minimum(cat_classes, max_class)
+            flat_idx = offsets + cat_classes
+            emb_cat = self.cat_state_embed(flat_idx)  # [K, E_state]
+            state_emb[0, tok_mask, :] = emb_cat
+
+        tok = torch.cat([id_emb, state_emb], dim=-1)
+        x = self.token_mlp(tok)
+        return x
 
     def _apply_value_dropout(self, val: torch.Tensor, carry: torch.Tensor):
         if not self.training:
@@ -1275,16 +1444,37 @@ class SetVAEOnlyPretrain(pl.LightningModule):
         val_in = self._apply_value_dropout(val_in, carry)
         # token masking (Set-MAE)
         self._apply_set_mae_inplace(val_in, carry, original_val)
-        # additive value noise
+        # additive value noise (continuous features only)
         if self.training and self.val_noise_std > 0:
-            val_in = val_in + self.val_noise_std * torch.randn_like(val_in)
+            fid_all = s.get("feat_id", None)
+            if fid_all is not None and self.feature_types is not None and self.num_features > 0:
+                fid_flat = fid_all.long().squeeze(0).squeeze(-1)
+                tcode_flat = self.feature_types.to(fid_flat.device)[fid_flat]
+                cont_mask = (tcode_flat == 0).view(1, -1, 1)
+                noise = self.val_noise_std * torch.randn_like(val_in)
+                val_in = torch.where(cont_mask, val_in + noise, val_in)
+            else:
+                val_in = val_in + self.val_noise_std * torch.randn_like(val_in)
         # directional jitter on variable vectors
         if self.training and self.dir_noise_std > 0:
             v_noisy = v_norm + self.dir_noise_std * torch.randn_like(v_norm)
             v_noisy = v_noisy / (torch.norm(v_noisy, p=2, dim=-1, keepdim=True) + 1e-8)
         else:
             v_noisy = v_norm
-        x_input = v_noisy * val_in
+        # Build token inputs using schema-driven embeddings
+        # Preserve discrete states when tokens are masked by using original values for embedding
+        val_for_embed = val_in
+        if s.get("feat_id", None) is not None and self.feature_types is not None and self.num_features > 0:
+            fid_flat = s["feat_id"].long().squeeze(0).squeeze(-1)
+            tcode_flat = self.feature_types.to(fid_flat.device)[fid_flat]
+            discrete_mask = (tcode_flat != 0).view(1, -1, 1)
+            val_for_embed = torch.where(discrete_mask, original_val, val_in)
+        # Apply small noise at the token level while preserving discrete identity
+        x_input_clean = self._build_token_inputs(v_noisy, {**s, "val": val_for_embed})
+        if self.training and self.dir_noise_std > 0:
+            x_input = x_input_clean + self.dir_noise_std * torch.randn_like(x_input_clean)
+        else:
+            x_input = x_input_clean
 
         # encode/decode
         z_list, _ = self.set_encoder.encode(x_input)
@@ -1304,6 +1494,71 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             sinkhorn_eps=self.sinkhorn_eps,
             sinkhorn_iters=self.sinkhorn_iters,
         )
+        # Likelihood loss from probabilistic head (only for observed features in this set)
+        like_loss = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        like_cont = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        like_bin = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        like_cat = torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
+        if self.enable_prob_head and self.num_features > 0 and s.get("feat_id", None) is not None:
+            z_last = z_list[-1][0].squeeze(1)  # [1,D]
+            h = self.prob_shared(z_last)
+            cont_mu = self.prob_cont_mu(h)  # [1,F]
+            cont_logvar = self.prob_cont_logvar(h)
+            bin_logit = self.prob_bin_logit(h)
+            cat_logits = self.prob_cat_logits(h) if self.prob_cat_logits is not None else None
+
+            fid = s["feat_id"].long().squeeze(0).squeeze(-1)  # [N]
+            values = s["val"].squeeze(0).squeeze(-1)  # [N]
+            types = (self.feature_types.to(fid.device)[fid]) if self.feature_types is not None else torch.zeros_like(fid)
+
+            # Continuous NLL
+            mask_cont = (types == 0)
+            if mask_cont.any():
+                idx = fid[mask_cont]
+                y = values[mask_cont]
+                mu = cont_mu[0, idx]
+                logvar = cont_logvar[0, idx].clamp(min=-8.0, max=8.0)
+                nll = 0.5 * (math.log(2 * math.pi) + logvar + ((y - mu) ** 2) / logvar.exp().clamp_min(1e-6))
+                like_cont = nll.mean()
+
+            # Binary BCE
+            mask_bin = (types == 1)
+            if mask_bin.any():
+                idx = fid[mask_bin]
+                yb = (values[mask_bin] > 0.5).float()
+                logit = bin_logit[0, idx]
+                like_bin = F.binary_cross_entropy_with_logits(logit, yb, reduction="mean")
+
+            # Categorical CE
+            mask_cat = (types == 2) & (self.total_cat_states > 0)
+            if mask_cat.any() and cat_logits is not None:
+                idx_f = fid[mask_cat]
+                yk = values[mask_cat].long().clamp(min=0)
+                # clamp within cardinality per feature
+                if hasattr(self, "cat_cardinalities") and self.cat_cardinalities is not None:
+                    maxk = (self.cat_cardinalities.to(idx_f.device)[idx_f] - 1).clamp(min=0)
+                    yk = torch.minimum(yk, maxk)
+                offs = self.cat_offsets.to(idx_f.device)[idx_f]
+                flat = offs + yk
+                logits_sel = cat_logits[0, flat]
+                # Gather per-feature softmax denominators by splitting per feature is heavy; approximate with NLL on selected logit vs logsumexp over that feature's slice
+                # Compute per-token cross-entropy using feature-specific slices
+                loss_terms: List[torch.Tensor] = []
+                for jj in range(idx_f.numel()):
+                    f = int(idx_f[jj].item())
+                    off = int(self.cat_offsets[f].item())
+                    card = int(self.cat_cardinalities[f].item()) if hasattr(self, "cat_cardinalities") else 0
+                    if off < 0 or card <= 0:
+                        continue
+                    sl = slice(off, off + card)
+                    logits_f = cat_logits[0, sl]
+                    y_f = int(yk[jj].item())
+                    loss_terms.append(F.cross_entropy(logits_f.unsqueeze(0), torch.tensor([y_f], device=logits_f.device)))
+                if len(loss_terms) > 0:
+                    like_cat = torch.stack(loss_terms).mean()
+
+            like_loss = like_cont + like_bin + like_cat
+
         # Last-layer raw KL to N(0,I) (no extra regularizers)
         _z_last, mu_last, logvar_last = z_list[-1]
         per_dim_kl_last = 0.5 * (logvar_last.exp() + mu_last.pow(2) - 1.0 - logvar_last)  # [1,1,D]
@@ -1322,37 +1577,46 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             pass
         z_flat = z_last.squeeze(1)  # [1,D]
         # Return per-dim KL for fairness aggregation and var deviation
-        return r_loss, kl_last, z_flat, per_dim_kl_last.squeeze(0).squeeze(0), var_dev_last
+        return r_loss, kl_last, z_flat, per_dim_kl_last.squeeze(0).squeeze(0), var_dev_last, like_loss, like_cont, like_bin, like_cat
 
     def forward(self, batch):
         var, val, minutes, set_id = batch["var"], batch["val"], batch["minute"], batch["set_id"]
         padding_mask = batch.get("padding_mask", None)
         carry_mask = batch.get("carry_mask", None)
-        all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
-        total_recon, total_kl, count = 0.0, 0.0, 0
+        feat_id = batch.get("feat_id", None)
+        all_sets = self._split_sets(var, val, minutes, set_id, padding_mask, carry_mask, feat_id)
+        total_recon, total_kl, total_like, count = 0.0, 0.0, 0.0, 0
         zs = []
         kl_dim_sum = None
         var_dev_sum = 0.0
+        like_cont_sum = 0.0
+        like_bin_sum = 0.0
+        like_cat_sum = 0.0
         for sets in all_sets:
             for s in sets:
-                recon, kl, z_flat, kl_dim_vec, var_dev = self._forward_single(s)
+                recon, kl, z_flat, kl_dim_vec, var_dev, like_loss, lc, lb, lk = self._forward_single(s)
                 total_recon += recon
                 total_kl += kl
+                total_like += like_loss
                 zs.append(z_flat)
                 if kl_dim_sum is None:
                     kl_dim_sum = kl_dim_vec
                 else:
                     kl_dim_sum = kl_dim_sum + kl_dim_vec
                 var_dev_sum = var_dev_sum + var_dev
+                like_cont_sum = like_cont_sum + lc
+                like_bin_sum = like_bin_sum + lb
+                like_cat_sum = like_cat_sum + lk
                 count += 1
         if count == 0:
             device = var.device
             zero = torch.tensor(0.0, device=device)
-            return zero, zero, torch.zeros(0, self.latent_dim, device=device), torch.zeros(self.latent_dim, device=device), torch.tensor(0.0, device=device)
+            return zero, zero, torch.zeros(0, self.latent_dim, device=device), torch.zeros(self.latent_dim, device=device), torch.tensor(0.0, device=device), zero, zero, zero, zero
         z_samples = torch.cat(zs, dim=0) if len(zs) > 0 else torch.zeros(0, self.latent_dim, device=var.device)
         kl_dim_mean = kl_dim_sum / float(max(1, count)) if kl_dim_sum is not None else torch.zeros(self.latent_dim, device=var.device)
         var_dev_mean = var_dev_sum / float(max(1, count))
-        return total_recon / count, total_kl / count, z_samples, kl_dim_mean, var_dev_mean
+        like_mean = total_like / count if count > 0 else torch.tensor(0.0, device=var.device)
+        return total_recon / count, total_kl / count, z_samples, kl_dim_mean, var_dev_mean, like_mean, like_cont_sum / count, like_bin_sum / count, like_cat_sum / count
 
     # --- InfoVAE / MMD ---
     @staticmethod
@@ -1388,7 +1652,7 @@ class SetVAEOnlyPretrain(pl.LightningModule):
 
     # training hooks
     def training_step(self, batch, batch_idx):
-        recon, kl, z_samples, kl_dim, var_dev = self.forward(batch)
+        recon, kl, z_samples, kl_dim, var_dev, like, lc, lb, lk = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         # Lower-bound capacity objective: penalize only when below capacity
@@ -1411,13 +1675,27 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
         # Variance stability penalty
         var_pen = self.var_stability_weight * var_dev
-        total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen
-        self.log_dict({"train_loss": total, "train_recon": recon, "train_kl_last": kl, "train_kl_obj_lb": kl_objective, "train_beta": beta, "train_capacity": cap, "train_mmd": mmd, "train_kl_fair": fairness, "train_var_pen": var_pen}, prog_bar=True)
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen + like
+        self.log_dict({
+            "train_loss": total,
+            "train_recon": recon,
+            "train_likelihood": like,
+            "train_like_cont": lc,
+            "train_like_bin": lb,
+            "train_like_cat": lk,
+            "train_kl_last": kl,
+            "train_kl_obj_lb": kl_objective,
+            "train_beta": beta,
+            "train_capacity": cap,
+            "train_mmd": mmd,
+            "train_kl_fair": fairness,
+            "train_var_pen": var_pen,
+        }, prog_bar=True)
         self._step += 1
         return total
 
     def validation_step(self, batch, batch_idx):
-        recon, kl, z_samples, kl_dim, var_dev = self.forward(batch)
+        recon, kl, z_samples, kl_dim, var_dev, like, lc, lb, lk = self.forward(batch)
         beta = self._beta()
         cap = torch.tensor(self._capacity(), device=kl.device, dtype=kl.dtype)
         kl_objective = F.relu(cap - kl)
@@ -1437,8 +1715,22 @@ class SetVAEOnlyPretrain(pl.LightningModule):
             l2_over = (over ** 2).sum()
             fairness = self.kl_fairness_weight * (kl_to_uniform + self.kl_over_weight * l2_over)
         var_pen = self.var_stability_weight * var_dev
-        total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen
-        self.log_dict({"val_loss": total, "val_recon": recon, "val_kl_last": kl, "val_kl_obj_lb": kl_objective, "val_beta": beta, "val_capacity": cap, "val_mmd": mmd, "val_kl_fair": fairness, "val_var_pen": var_pen}, prog_bar=True, on_epoch=True)
+        total = recon + beta * kl_objective + (self.mmd_weight * mmd) + fairness + var_pen + like
+        self.log_dict({
+            "val_loss": total,
+            "val_recon": recon,
+            "val_likelihood": like,
+            "val_like_cont": lc,
+            "val_like_bin": lb,
+            "val_like_cat": lk,
+            "val_kl_last": kl,
+            "val_kl_obj_lb": kl_objective,
+            "val_beta": beta,
+            "val_capacity": cap,
+            "val_mmd": mmd,
+            "val_kl_fair": fairness,
+            "val_var_pen": var_pen,
+        }, prog_bar=True, on_epoch=True)
         # accumulate kl for epoch-level auto-tune
         self._val_kl_sum += float(kl.detach().cpu().item())
         self._val_kl_count += 1

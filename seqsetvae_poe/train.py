@@ -196,6 +196,8 @@ def _run_setvae():
     parser.add_argument("--levels", type=int, default=getattr(cfg, "levels", 2))
     parser.add_argument("--heads", type=int, default=getattr(cfg, "heads", 2))
     parser.add_argument("--m", type=int, default=getattr(cfg, "m", 16))
+    # Schema: single entry point. Provide a directory containing schema.csv, or a direct path to schema.csv
+    parser.add_argument("--schema_dir", type=str, default=None, help="Directory containing schema.csv (or pass schema.csv file path)")
     args = parser.parse_args()
 
     dm = DataModule(
@@ -207,7 +209,66 @@ def _run_setvae():
         smoke=args.smoke,
         smoke_batch_size=10,
         apply_A=False,
+        schema_dir=args.schema_dir,
     )
+
+    # Load schema from CSV if provided
+    schema_kwargs = {}
+    if args.schema_dir:
+        import os as _os
+        import pandas as _pd
+        schema_path = args.schema_dir
+        if _os.path.isdir(schema_path):
+            schema_path = _os.path.join(schema_path, "schema.csv")
+        if not _os.path.isfile(schema_path):
+            raise FileNotFoundError(f"Schema CSV not found: {schema_path}")
+        sdf = _pd.read_csv(schema_path)
+        if "feature_id" not in sdf.columns or "type" not in sdf.columns:
+            raise ValueError("schema.csv must contain columns: feature_id,type [and optional: cardinality,name]")
+        # Normalize types to codes 0/1/2
+        def _type_to_code(x):
+            if isinstance(x, str):
+                s = x.strip().lower()
+                if s in {"cont", "continuous", "real"}: return 0
+                if s in {"bin", "binary", "bern", "bernoulli"}: return 1
+                if s in {"cat", "categorical", "multi"}: return 2
+                # digits-as-string
+                if s.isdigit(): return int(s)
+                raise ValueError(f"Unknown type string: {x}")
+            try:
+                iv = int(x)
+                if iv in (0,1,2):
+                    return iv
+            except Exception:
+                pass
+            raise ValueError(f"Unrecognized type value: {x}")
+        sdf = sdf.copy()
+        sdf["feature_id"] = sdf["feature_id"].astype(int)
+        sdf["type_code"] = sdf["type"].apply(_type_to_code).astype(int)
+        max_id = int(sdf["feature_id"].max())
+        num_features = max_id + 1
+        feature_types = [0] * num_features
+        cat_ids = []
+        cat_cards = []
+        for _, row in sdf.iterrows():
+            fid = int(row["feature_id"]) 
+            tcode = int(row["type_code"]) 
+            if fid < 0 or fid >= num_features:
+                continue
+            feature_types[fid] = tcode
+            if tcode == 2:
+                card = int(row.get("cardinality", 0) or 0)
+                if card <= 0:
+                    raise ValueError(f"Categorical feature {fid} missing positive 'cardinality' in schema.csv")
+                cat_ids.append(fid)
+                cat_cards.append(card)
+        schema_kwargs = dict(
+            enable_prob_head=True,
+            num_features=num_features,
+            feature_types=feature_types,
+            categorical_feat_ids=cat_ids,
+            categorical_cardinalities=cat_cards,
+        )
 
     model = SetVAEOnlyPretrain(
         input_dim=args.input_dim,
@@ -242,6 +303,7 @@ def _run_setvae():
         kl_over_weight=float(args.kl_over_weight),
         var_stability_weight=float(args.var_stability_weight),
         per_dim_free_bits=float(args.per_dim_free_bits),
+        **schema_kwargs,
     )
 
     if args.init_ckpt is not None and os.path.isfile(args.init_ckpt):

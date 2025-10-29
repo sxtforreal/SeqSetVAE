@@ -44,7 +44,11 @@ def _detect_vcols(df: pd.DataFrame) -> List[str]:
     return vcols
 
 
-def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Dict[str, Any]:
+def _collate_lvcf(
+    batch: List[Tuple[pd.DataFrame, str]],
+    vcols: List[str],
+    name_to_id: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     B = len(batch)
     embed_dim = len(vcols)
     max_len = max(len(df) for df, _ in batch)
@@ -54,6 +58,8 @@ def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Di
     set_id = torch.zeros(B, max_len, 1, dtype=torch.long)
     age = torch.zeros(B, max_len, 1, dtype=torch.float32)
     carry_mask = torch.zeros(B, max_len, 1, dtype=torch.float32)
+    # New: feature id per token (from 'feature_id' column, or mapped from 'variable')
+    feat_id = torch.zeros(B, max_len, 1, dtype=torch.long)
     padding_mask = torch.ones(B, max_len, dtype=torch.bool)
 
     for b, (df, _) in enumerate(batch):
@@ -74,6 +80,31 @@ def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Di
             age[b, :n] = torch.from_numpy(df["age"].to_numpy(dtype=np.float32)).view(-1, 1)
         if "is_carry" in df.columns:
             carry_mask[b, :n] = torch.from_numpy(df["is_carry"].to_numpy(dtype=np.float32)).view(-1, 1)
+        # Extract feature id preference order: feature_id -> mapped variable name -> raw variable
+        try:
+            if "feature_id" in df.columns:
+                ids = df["feature_id"].to_numpy(dtype=np.int64, copy=False)
+                feat_id[b, :n] = torch.from_numpy(ids).view(-1, 1)
+            elif "variable" in df.columns:
+                var_col = df["variable"]
+                if name_to_id is not None and not pd.api.types.is_integer_dtype(var_col):
+                    # Map string variable names to global ids
+                    mapped = var_col.map(name_to_id)
+                    if mapped.isnull().any():
+                        # Fallback to categorical codes for unknowns
+                        codes = var_col.astype("category").cat.codes.to_numpy(dtype=np.int64)
+                        ids = codes
+                    else:
+                        ids = mapped.to_numpy(dtype=np.int64)
+                elif pd.api.types.is_integer_dtype(var_col):
+                    ids = var_col.to_numpy(dtype=np.int64, copy=False)
+                else:
+                    # Fallback: per-file categorical codes (not globally stable)
+                    ids = var_col.astype("category").cat.codes.to_numpy(dtype=np.int64)
+                feat_id[b, :n] = torch.from_numpy(ids).view(-1, 1)
+        except Exception:
+            # Leave zeros if extraction fails
+            pass
         padding_mask[b, :n] = False
 
     return {
@@ -84,6 +115,7 @@ def _collate_lvcf(batch: List[Tuple[pd.DataFrame, str]], vcols: List[str]) -> Di
         "age": age,
         "carry_mask": carry_mask,
         "padding_mask": padding_mask,
+        "feat_id": feat_id,
     }
 
 
@@ -180,6 +212,7 @@ class DataModule(pl.LightningDataModule):
         smoke_batch_size: int = 10,
         seed: Optional[int] = None,
         apply_A: bool = False,
+        schema_dir: Optional[str] = None,
     ):
         super().__init__()
         self.saved_dir = saved_dir
@@ -192,9 +225,11 @@ class DataModule(pl.LightningDataModule):
         self.smoke_batch_size = smoke_batch_size
         self.seed = seed
         self.apply_A = apply_A
+        self.schema_dir = schema_dir
 
         self.vcols: Optional[List[str]] = None
         self._rng = random.Random(seed)
+        self._name_to_id: Optional[Dict[str, int]] = None
 
     def setup(self, stage=None):
         # Instantiate datasets
@@ -205,6 +240,21 @@ class DataModule(pl.LightningDataModule):
         # Detect embedding columns from the first available file
         sample_df, _ = self.train[0]
         self.vcols = _detect_vcols(sample_df)
+
+        # Optional: load schema mapping (name -> feature_id)
+        self._name_to_id = None
+        if isinstance(self.schema_dir, str) and self.schema_dir:
+            import pandas as _pd
+            schema_path = self.schema_dir
+            if os.path.isdir(schema_path):
+                schema_path = os.path.join(schema_path, "schema.csv")
+            if os.path.isfile(schema_path):
+                try:
+                    sdf = _pd.read_csv(schema_path)
+                    if "name" in sdf.columns and "feature_id" in sdf.columns:
+                        self._name_to_id = {str(n): int(i) for n, i in zip(sdf["name"].astype(str), sdf["feature_id"].astype(int))}
+                except Exception:
+                    self._name_to_id = None
 
         # Optionally prepare smoke subset indices
         if self.smoke:
@@ -218,7 +268,7 @@ class DataModule(pl.LightningDataModule):
         vcols = self.vcols
         assert vcols is not None, "DataModule.setup() must be called before creating dataloaders"
         def _collate(b):
-            out = _collate_lvcf(b, vcols)
+            out = _collate_lvcf(b, vcols, self._name_to_id)
             if self.apply_A:
                 out = _compress_like_raw(out)
             return out
@@ -236,7 +286,7 @@ class DataModule(pl.LightningDataModule):
             subset = Subset(self.train, self._smoke_indices)
             # ensure one batch containing exactly smoke_batch_size samples
             def _collate(b):
-                out = _collate_lvcf(b, self.vcols)
+                out = _collate_lvcf(b, self.vcols, self._name_to_id)
                 if self.apply_A:
                     out = _compress_like_raw(out)
                 return out
