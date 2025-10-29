@@ -33,6 +33,13 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Any, List, Tuple
 
+# Optional progress bar
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # fallback if tqdm not available
+    def tqdm(x, **kwargs):  # type: ignore
+        return x
+
 
 def _list_parquets(root: str, include_valid: bool, include_test: bool, max_files: int) -> List[str]:
     parts = ["train"] + (["valid"] if include_valid else []) + (["test"] if include_test else [])
@@ -74,7 +81,8 @@ def build_schema(data_dir: str, include_valid: bool, include_test: bool, max_fil
     stats: Dict[Any, List[float]] = {}
     is_name_like: bool | None = None
 
-    for path in files:
+    print(f"Scanning {len(files)} parquet files for schema...")
+    for path in tqdm(files, desc="Scanning", unit="file"):
         try:
             df = pd.read_parquet(path, engine="pyarrow")
         except Exception:
@@ -93,6 +101,7 @@ def build_schema(data_dir: str, include_valid: bool, include_test: bool, max_fil
                 if len(lst) < 1000:  # cap per-feature sample for memory
                     lst.append(float(val))
 
+    print("Assigning global feature ids and inferring types...")
     # Assign global ids deterministically (sorted by name for strings; by numeric order for ints)
     keys = list(stats.keys())
     if len(keys) == 0:
