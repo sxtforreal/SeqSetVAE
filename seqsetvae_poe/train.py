@@ -198,6 +198,12 @@ def _run_setvae():
     parser.add_argument("--m", type=int, default=getattr(cfg, "m", 16))
     # Schema: single entry point. Provide a directory containing schema.csv, or a direct path to schema.csv
     parser.add_argument("--schema_dir", type=str, default=None, help="Directory containing schema.csv (or pass schema.csv file path)")
+    # For compatibility with external runners: this flag is optional and not required when --schema_dir is provided
+    parser.add_argument(
+        "--enable_prob_head",
+        action="store_true",
+        help="Enable schema-driven probabilistic head (auto-enabled when --schema_dir is provided)",
+    )
     args = parser.parse_args()
 
     dm = DataModule(
@@ -263,6 +269,7 @@ def _run_setvae():
                 cat_ids.append(fid)
                 cat_cards.append(card)
         schema_kwargs = dict(
+            # Always enable when schema is provided; the explicit flag is accepted for compatibility
             enable_prob_head=True,
             num_features=num_features,
             feature_types=feature_types,
