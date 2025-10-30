@@ -12,7 +12,7 @@ import json
 import csv
 import math
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -86,6 +86,27 @@ def _load_state_dict_pretrain(path: str) -> Dict[str, torch.Tensor]:
     return state
 
 
+def _load_ckpt_bundle(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """Load a Lightning checkpoint and return (state_dict, hyper_parameters).
+
+    Falls back gracefully if hyperparameters are absent.
+    """
+    raw = torch.load(path, map_location="cpu")
+    if isinstance(raw, dict) and "state_dict" in raw:
+        state = raw["state_dict"]
+    else:
+        state = raw if isinstance(raw, dict) else {}
+    if any(k.startswith("model.") for k in state.keys()):
+        state = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
+    hparams: Dict[str, Any] = {}
+    if isinstance(raw, dict):
+        for key in ("hyper_parameters", "hparams"):
+            hp = raw.get(key, None)
+            if isinstance(hp, dict):
+                hparams = hp
+                break
+    return state, hparams
+
 def _detect_ckpt_type(state: Dict[str, torch.Tensor], prefer: str = "auto") -> str:
     if prefer in {"poe", "setvae"}:
         return prefer
@@ -148,7 +169,17 @@ def _build_model_pretrain(
     lr: float,
     dims: Dict[str, int],
     state: Optional[Dict[str, torch.Tensor]] = None,
+    hparams: Optional[Dict[str, Any]] = None,
 ) -> torch.nn.Module:
+    hp = hparams or {}
+    def _hp(name: str, default: Any) -> Any:
+        val = hp.get(name, default)
+        if isinstance(val, torch.Tensor):
+            try:
+                val = val.detach().cpu().tolist()
+            except Exception:
+                pass
+        return val
     if ckpt_type == "poe":
         model = PoESeqSetVAEPretrain(
             input_dim=int(dims.get("input_dim", getattr(cfg, "input_dim", 768))),
@@ -171,6 +202,10 @@ def _build_model_pretrain(
             set_mae_ratio=getattr(cfg, "set_mae_ratio", 0.0),
             enable_next_change=True,
             next_change_weight=0.3,
+            # Sinkhorn options (if present)
+            use_sinkhorn=bool(_hp("use_sinkhorn", getattr(cfg, "use_sinkhorn", False))),
+            sinkhorn_eps=float(_hp("sinkhorn_eps", getattr(cfg, "sinkhorn_eps", 0.1))),
+            sinkhorn_iters=int(_hp("sinkhorn_iters", getattr(cfg, "sinkhorn_iters", 100))),
         )
     else:
         num_flows = _detect_num_flows_in_state(state) if state is not None else 0
@@ -200,6 +235,20 @@ def _build_model_pretrain(
             eval_decoder_noise_std=0.0,
             use_flows=use_flows,
             num_flows=num_flows,
+            # Sinkhorn options (prefer from hparams if saved)
+            use_sinkhorn=bool(_hp("use_sinkhorn", getattr(cfg, "use_sinkhorn", True))),
+            sinkhorn_eps=float(_hp("sinkhorn_eps", getattr(cfg, "sinkhorn_eps", 0.1))),
+            sinkhorn_iters=int(_hp("sinkhorn_iters", getattr(cfg, "sinkhorn_iters", 100))),
+            # Probabilistic head (schema-driven)
+            enable_prob_head=bool(_hp("enable_prob_head", True)),
+            num_features=_hp("num_features", None),
+            feature_types=_hp("feature_types", None),
+            categorical_feat_ids=_hp("categorical_feat_ids", None),
+            categorical_cardinalities=_hp("categorical_cardinalities", None),
+            id_embed_dim=int(_hp("id_embed_dim", 64)),
+            state_embed_dim=int(_hp("state_embed_dim", 64)),
+            token_mlp_hidden=int(_hp("token_mlp_hidden", 128)),
+            prob_head_hidden=int(_hp("prob_head_hidden", 256)),
         )
     return model
 
@@ -290,9 +339,14 @@ def compute_kl_dim_stats_for_batch(
     padding_mask = batch.get("padding_mask", None)
     carry_mask = batch.get("carry_mask", None)
     if hasattr(model, "_split_sets"):
-        all_sets = model._split_sets(
-            var, val, minutes, set_id, padding_mask, carry_mask
-        )
+        try:
+            all_sets = model._split_sets(
+                var, val, minutes, set_id, padding_mask, carry_mask, batch.get("feat_id", None)
+            )
+        except TypeError:
+            all_sets = model._split_sets(
+                var, val, minutes, set_id, padding_mask, carry_mask
+            )
     else:
         all_sets = []
         B = var.size(0)
@@ -340,7 +394,13 @@ def compute_kl_dim_stats_for_batch(
                 reduced = s["var"]
             norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
             v_norm = reduced / (norms + 1e-8)
-            x_clean = v_norm * s["val"]
+            if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
+                try:
+                    x_clean = model._build_token_inputs(v_norm, s)
+                except Exception:
+                    x_clean = v_norm * s["val"]
+            else:
+                x_clean = v_norm * s["val"]
             z_list, _ = encoder.encode(x_clean)
             _z, mu, logvar = z_list[-1]
             kl_dim = 0.5 * (
@@ -416,9 +476,14 @@ def compute_posterior_moments_dataset(
         padding_mask = batch.get("padding_mask", None)
         carry_mask = batch.get("carry_mask", None)
         if hasattr(model, "_split_sets"):
-            all_sets = model._split_sets(
-                var, val, minutes, set_id, padding_mask, carry_mask
-            )
+            try:
+                all_sets = model._split_sets(
+                    var, val, minutes, set_id, padding_mask, carry_mask, batch.get("feat_id", None)
+                )
+            except TypeError:
+                all_sets = model._split_sets(
+                    var, val, minutes, set_id, padding_mask, carry_mask
+                )
         else:
             all_sets = []
             B = var.size(0)
@@ -461,7 +526,13 @@ def compute_posterior_moments_dataset(
                     reduced = s["var"]
                 norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
                 v_norm = reduced / (norms + 1e-8)
-                x_clean = v_norm * s["val"]
+                if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
+                    try:
+                        x_clean = model._build_token_inputs(v_norm, s)
+                    except Exception:
+                        x_clean = v_norm * s["val"]
+                else:
+                    x_clean = v_norm * s["val"]
                 z_list, _ = encoder.encode(x_clean)
                 _z, mu, logvar = z_list[-1]
                 mu_vec = mu.squeeze(0).squeeze(0)
@@ -510,6 +581,50 @@ def compute_posterior_moments_dataset(
         "mu_std": mu_std,
         "var_mean": var_mean,
         "var_std": var_std,
+    }
+
+
+@torch.no_grad()
+def compute_prob_head_dataset(
+    model: torch.nn.Module, dataloader, num_batches: Optional[int] = None
+) -> Dict[str, float]:
+    """Average per-batch likelihood terms from the probabilistic head.
+
+    Returns empty dict if model does not expose a probabilistic head.
+    """
+    if not hasattr(model, "enable_prob_head") or getattr(model, "prob_shared", None) is None:
+        return {}
+    device = next(model.parameters()).device
+    like_sum = 0.0
+    lc_sum = 0.0
+    lb_sum = 0.0
+    lk_sum = 0.0
+    seen = 0
+    for i, batch in enumerate(dataloader):
+        if num_batches is not None and i >= num_batches:
+            break
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+        try:
+            out = model.forward(batch)  # type: ignore[attr-defined]
+        except Exception:
+            continue
+        if isinstance(out, tuple) and len(out) >= 9:
+            like, lc, lb, lk = out[-4], out[-3], out[-2], out[-1]
+            like_sum += float(like.detach().cpu().item())
+            lc_sum += float(lc.detach().cpu().item())
+            lb_sum += float(lb.detach().cpu().item())
+            lk_sum += float(lk.detach().cpu().item())
+            seen += 1
+    if seen == 0:
+        return {}
+    return {
+        "n_batches": float(seen),
+        "like_mean": like_sum / seen,
+        "like_cont_mean": lc_sum / seen,
+        "like_bin_mean": lb_sum / seen,
+        "like_cat_mean": lk_sum / seen,
     }
 
 
@@ -596,7 +711,10 @@ def collect_mu_var_heatmaps(
     padding_mask = batch.get("padding_mask", None)
     carry_mask = batch.get("carry_mask", None)
     if hasattr(model, "_split_sets"):
-        pats = model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
+        try:
+            pats = model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask, batch.get("feat_id", None))
+        except TypeError:
+            pats = model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
     else:
         pats = [[{"var": var[0:1, :1, :], "val": val[0:1, :1, :]}]]
     if len(pats) == 0 or len(pats[0]) == 0:
@@ -616,7 +734,14 @@ def collect_mu_var_heatmaps(
             reduced = s["var"]
         norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
         v_norm = reduced / (norms + 1e-8)
-        x_clean = v_norm * s["val"]
+        # Prefer schema-driven tokenization if available on the model
+        if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
+            try:
+                x_clean = model._build_token_inputs(v_norm, s)
+            except Exception:
+                x_clean = v_norm * s["val"]
+        else:
+            x_clean = v_norm * s["val"]
         z_list, _ = encoder.encode(x_clean)
         _z, mu, logvar = z_list[-1]
         mu_list.append(_to_numpy(mu.squeeze(0).squeeze(0)))  # [D]
@@ -769,7 +894,10 @@ def collect_recon_events(
     padding_mask = batch.get("padding_mask", None)
     carry_mask = batch.get("carry_mask", None)
     if hasattr(model, "_split_sets"):
-        pats = model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
+        try:
+            pats = model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask, batch.get("feat_id", None))
+        except TypeError:
+            pats = model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)
     else:
         pats = [[{"var": var[0:1, :1, :], "val": val[0:1, :1, :], "set_time": torch.tensor([0.0], device=var.device)}]]
     if len(pats) == 0 or len(pats[0]) == 0:
@@ -797,8 +925,16 @@ def collect_recon_events(
             reduced = s["var"]
         norms = torch.norm(reduced, p=2, dim=-1, keepdim=True)
         v_norm = reduced / (norms + 1e-8)
+        # Build input tokens consistent with training if schema-driven pathway exists
+        if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
+            try:
+                x_input = model._build_token_inputs(v_norm, s)
+            except Exception:
+                x_input = v_norm * s["val"]
+        else:
+            x_input = v_norm * s["val"]
         x_target = v_norm * s["val"]
-        z_list, _ = encoder.encode(x_target)
+        z_list, _ = encoder.encode(x_input)
         recon = encoder.decode(
             z_list, target_n=x_target.size(1), use_mean=True, noise_std=0.0
         )
@@ -839,7 +975,10 @@ def _extract_sets_from_batch(
     padding_mask = batch.get("padding_mask", None)
     carry_mask = batch.get("carry_mask", None)
     if hasattr(model, "_split_sets"):
-        return model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)  # type: ignore
+        try:
+            return model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask, batch.get("feat_id", None))  # type: ignore
+        except TypeError:
+            return model._split_sets(var, val, minutes, set_id, padding_mask, carry_mask)  # type: ignore
     # Fallback best-effort split: consecutive identical set_id values define a set
     all_sets: List[List[Dict[str, torch.Tensor]]] = []
     B = var.size(0)
@@ -2068,10 +2207,12 @@ def _run_pretrain_eval():
     ap.add_argument("--checkpoint", required=True, type=str, help="Path to pretraining checkpoint (.ckpt)")
     ap.add_argument("--ckpt_type", type=str, choices=["auto", "setvae", "poe"], default="auto")
     ap.add_argument("--data_dir", type=str, default=getattr(cfg, "data_dir", ""))
+    ap.add_argument("--schema", type=str, default="", help="Path to schema.csv or directory (for probabilistic head feature_id mapping)")
     ap.add_argument("--split", type=str, choices=["valid", "test"], default="valid")
     ap.add_argument("--batch_size", type=int, default=getattr(cfg, "batch_size", 8))
     ap.add_argument("--num_workers", type=int, default=getattr(cfg, "num_workers", 0))
     ap.add_argument("--num_eval_batches", type=int, default=50, help="Number of batches to estimate KL stats")
+    ap.add_argument("--num_like_batches", type=int, default=50, help="#batches to estimate probabilistic head likelihood terms")
     ap.add_argument("--num_vis_samples", type=int, default=2, help="#samples for detailed recon/heatmaps")
     ap.add_argument(
         "--recon_from",
@@ -2180,7 +2321,7 @@ def _run_pretrain_eval():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    state = _load_state_dict_pretrain(args.checkpoint)
+    state, hparams = _load_ckpt_bundle(args.checkpoint)
     ckpt_type = _detect_ckpt_type(state, prefer=args.ckpt_type)
     # Infer dims from state, then allow CLI overrides to take precedence
     inferred = _infer_dims_from_state(state)
@@ -2196,6 +2337,7 @@ def _run_pretrain_eval():
         lr=getattr(cfg, "lr", 3e-4),
         dims=dims,
         state=state,
+        hparams=hparams,
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"Loaded weights: missing={len(missing)}, unexpected={len(unexpected)}")
@@ -2217,6 +2359,7 @@ def _run_pretrain_eval():
         pin_memory=False,
         smoke=False,
         apply_A=False,
+        schema_dir=(args.schema if isinstance(args.schema, str) and args.schema else None),
     )
     dm.setup()
     dl = dm.val_dataloader() if args.split == "valid" else dm.test_dataloader()
@@ -2267,6 +2410,7 @@ def _run_pretrain_eval():
         pin_memory=False,
         smoke=False,
         apply_A=False,
+        schema_dir=(args.schema if isinstance(args.schema, str) and args.schema else None),
     )
     dm_vis.setup()
     dl_vis = dm_vis.val_dataloader() if args.split == "valid" else dm_vis.test_dataloader()
@@ -2358,6 +2502,14 @@ def _run_pretrain_eval():
         "kl_total_vs_mag_mae": _corr("kl_total", "mag_mae"),
         "kl_total_vs_mag_rmse": _corr("kl_total", "mag_rmse"),
     }
+
+    # Optional: probabilistic head likelihood metrics
+    prob_head_metrics: Dict[str, float] = {}
+    if getattr(model, "prob_shared", None) is not None and getattr(model, "enable_prob_head", False):
+        try:
+            prob_head_metrics = compute_prob_head_dataset(model, dl, num_batches=getattr(args, "num_like_batches", 50))
+        except Exception:
+            prob_head_metrics = {}
 
     # Optional: mask consistency and OOD-scramble evaluations
     extra_evals: Dict[str, object] = {}
@@ -2475,6 +2627,11 @@ def _run_pretrain_eval():
         "active_threshold": args.active_threshold,
         "active_thresholds": args.active_thresholds,
         "latent_dim": int(getattr(model, "latent_dim", len(kl_dim))),
+        "prob_head": {
+            "enabled": bool(getattr(model, "enable_prob_head", False) and getattr(model, "prob_shared", None) is not None),
+            "num_features": int(getattr(model, "num_features", 0) or 0),
+            "likelihood": prob_head_metrics,
+        },
         "kl": {
             "mean_per_dim": kl_dim.tolist(),
             "total_kl": total_kl,
