@@ -2341,6 +2341,10 @@ def _run_pretrain_eval():
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"Loaded weights: missing={len(missing)}, unexpected={len(unexpected)}")
+    if len(missing) > 0:
+        print("Missing keys:", missing)
+    if len(unexpected) > 0:
+        print("Unexpected keys:", unexpected)
     model.eval()
 
     if args.device == "cuda":
