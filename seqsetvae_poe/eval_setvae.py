@@ -26,7 +26,6 @@ import argparse
 import json
 import logging
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -40,6 +39,8 @@ try:  # optional plotting dependency
     import matplotlib.pyplot as plt  # type: ignore
 except Exception:  # pragma: no cover - keep optional
     plt = None  # type: ignore
+
+from dataset import _collate_lvcf, _detect_vcols  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -272,83 +273,37 @@ def _to_device(batch: Mapping[str, torch.Tensor], device: torch.device) -> Dict[
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
-def load_val_sets(path: str) -> List[Dict[str, torch.Tensor]]:
-    """Load validation sets from a torch.save()-ed file or JSON."""
+def load_validation_batches(data_dir: str, schema: SchemaBundle, batch_size: int) -> List[Dict[str, torch.Tensor]]:
+    """Load validation batches from parquet files stored under <data_dir>/valid."""
 
-    ext = Path(path).suffix.lower()
-    if ext in {".pt", ".pth", ".bin"}:
-        data = torch.load(path, map_location="cpu")
-    elif ext == ".json":
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        raise ValueError(f"Unsupported val_sets format (expected .pt/.pth/.json): {path}")
+    valid_dir = Path(data_dir) / "valid"
+    if not valid_dir.is_dir():
+        raise FileNotFoundError(f"Validation directory not found: {valid_dir}")
 
-    if isinstance(data, dict) and all(torch.is_tensor(v) for v in data.values()):
-        return [data]  # single mega-batch
-    if isinstance(data, list):
-        # Expect list of dict batches
-        batches: List[Dict[str, torch.Tensor]] = []
-        for item in data:
-            if not isinstance(item, Mapping):
-                raise ValueError("Each batch entry must be a mapping")
-            tensor_batch = {k: torch.tensor(v) if not torch.is_tensor(v) else v for k, v in item.items()}
-            batches.append(tensor_batch)  # type: ignore[arg-type]
-        return batches
-    if isinstance(data, Mapping) and "batches" in data:
-        batches = data["batches"]
-        assert isinstance(batches, list)
-        out: List[Dict[str, torch.Tensor]] = []
-        for item in batches:
-            tensor_batch = {k: torch.tensor(v) if not torch.is_tensor(v) else v for k, v in item.items()}
-            out.append(tensor_batch)  # type: ignore[arg-type]
-        return out
-    raise ValueError("Unsupported val_sets payload structure")
+    files = sorted(valid_dir.glob("*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No parquet files found under {valid_dir}")
 
+    sample_df = pd.read_parquet(files[0], engine="pyarrow")
+    vcols = _detect_vcols(sample_df)
+    name_to_id = {f.name: f.feature_id for f in schema.features if f.name is not None}
+    name_to_id_or_none = name_to_id if name_to_id else None
 
-# ---------------------------------------------------------------------------
-# Mask scenarios
+    batches: List[Dict[str, torch.Tensor]] = []
+    current: List[Tuple[pd.DataFrame, str]] = []
 
+    for path in files:
+        df = pd.read_parquet(path, engine="pyarrow")
+        pid = path.stem
+        current.append((df, pid))
+        if len(current) >= batch_size:
+            batches.append(_collate_lvcf(current, vcols, name_to_id_or_none))
+            current = []
 
-def parse_mask_scenarios(spec: str) -> List[str]:
-    if spec.strip() == "":
-        return ["none"]
-    if os.path.isfile(spec):
-        with open(spec, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return [str(x) for x in data]
-        raise ValueError("Mask scenario file must contain a list")
-    return [part.strip() for part in spec.split(",") if part.strip()]
+    if current:
+        batches.append(_collate_lvcf(current, vcols, name_to_id_or_none))
 
-
-def apply_mask_scenario(batch: Mapping[str, torch.Tensor], scenario: str, seed: int) -> Mapping[str, torch.Tensor]:
-    if scenario == "none":
-        return batch
-    rng = torch.Generator(device=batch["val"].device)
-    rng.manual_seed(seed & 0xFFFFFFFF)
-    var = batch["var"].clone()
-    val = batch["val"].clone()
-    carry = batch.get("carry_mask", torch.zeros_like(val))
-    padding = batch.get("padding_mask", torch.zeros(var.size(0), var.size(1), dtype=torch.bool, device=var.device))
-
-    mask_live = (carry.squeeze(-1) < 0.5) & (~padding)
-
-    if scenario.startswith("mcAR_"):
-        try:
-            ratio = float(scenario.split("_", 1)[1])
-        except Exception as exc:  # pragma: no cover - defensive
-            raise ValueError(f"Invalid mcAR scenario: {scenario}") from exc
-        probs = torch.rand_like(val.squeeze(-1), generator=rng)
-        mask = (probs < ratio) & (~padding)
-        val = val.masked_fill(mask.unsqueeze(-1), 0.0)
-    elif scenario == "carry_only":
-        val = val.masked_fill(mask_live.unsqueeze(-1), 0.0)
-    else:
-        LOGGER.warning("Unknown mask scenario '%s'; returning batch unchanged", scenario)
-    out = dict(batch)
-    out["val"] = val
-    return out
+    return batches
 
 
 # ---------------------------------------------------------------------------
@@ -1109,12 +1064,12 @@ def compare_checkpoints(*args, **kwargs) -> Path:
 class EvalConfig:
     ckpt: str
     schema: str
-    val_sets: str
-    mask_scenarios: List[str]
+    data_dir: str
     seed: int
     n_z_samples: int
     save_dir: Path
     device: torch.device
+    batch_size: int
     info_top_k: int
     info_max_sets: int
     consistency_max_sets: int
@@ -1125,12 +1080,12 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
     return EvalConfig(
         ckpt=args.ckpt,
         schema=args.schema,
-        val_sets=args.val_sets,
-        mask_scenarios=parse_mask_scenarios(args.mask_scenarios),
+        data_dir=args.data_dir,
         seed=args.seed,
         n_z_samples=args.n_z_samples,
         save_dir=Path(args.save_dir),
         device=device,
+        batch_size=args.batch_size,
         info_top_k=args.info_top_k,
         info_max_sets=args.info_max_sets,
         consistency_max_sets=args.consistency_max_sets,
@@ -1149,8 +1104,8 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
         p.requires_grad_(False)
     model.to(cfg.device)
 
-    LOGGER.info("Loading validation sets: %s", cfg.val_sets)
-    batches = load_val_sets(cfg.val_sets)
+    LOGGER.info("Loading validation data from: %s", cfg.data_dir)
+    batches = load_validation_batches(cfg.data_dir, schema, cfg.batch_size)
 
     metrics: Dict[str, Any] = {}
 
@@ -1198,7 +1153,7 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
 
     placeholder_sections: Dict[str, Any] = {
         "set_reconstruction": {"status": "pending"},
-        "feature_inference": {scenario: {"status": "pending"} for scenario in cfg.mask_scenarios},
+        "feature_inference": {"default": {"status": "pending"}},
         "next_best_measurement": {"status": "pending"},
         "subsystem_weights": {"status": "pending"},
         "subsystem_sensitivity": {"status": "pending"},
@@ -1222,8 +1177,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Evaluate SeqSetVAE checkpoint")
     ap.add_argument("--ckpt", required=True, help="Path to trained SetVAE checkpoint")
     ap.add_argument("--schema", required=True, help="Schema file (CSV or JSON)")
-    ap.add_argument("--val_sets", required=True, help="Torch file with validation batches")
-    ap.add_argument("--mask_scenarios", default="none", help="Comma list or JSON file of mask scenarios")
+    ap.add_argument("--data_dir", required=True, help="Directory containing train/valid/test parquet splits")
+    ap.add_argument("--batch_size", type=int, default=4, help="Batch size for validation loader collation")
     ap.add_argument("--seed", type=int, default=17)
     ap.add_argument("--n_z_samples", type=int, default=1)
     ap.add_argument("--save_dir", default="./eval_outputs", help="Directory to write metrics & plots")
