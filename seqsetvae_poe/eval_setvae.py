@@ -1260,7 +1260,9 @@ def apply_mask_scenario(
     scenario: str,
     rng: random.Random,
 ) -> torch.Tensor:
-    carry = sample.tensors.get("carry") or sample.tensors.get("carry_mask")
+    carry = sample.tensors.get("carry")
+    if carry is None:
+        carry = sample.tensors.get("carry_mask")
     size = sample.size
     indices = torch.arange(size, dtype=torch.long)
     mask = torch.zeros(size, dtype=torch.bool)
