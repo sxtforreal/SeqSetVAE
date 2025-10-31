@@ -12,6 +12,7 @@ artifacts on disk.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -166,6 +167,204 @@ class MaskRegistry:
             np.save(out_dir / "mask_index.npy", stacked, allow_pickle=True)
 
 
+def _mask_indices_array(mask: Optional[torch.Tensor]) -> np.ndarray:
+    if mask is None:
+        return np.zeros((0,), dtype=np.int64)
+    mask_cpu = mask.to(torch.bool).cpu()
+    if mask_cpu.dim() == 3:
+        mask_cpu = mask_cpu.squeeze(0).squeeze(-1)
+    elif mask_cpu.dim() == 2:
+        mask_cpu = mask_cpu.squeeze(0)
+    return mask_cpu.nonzero(as_tuple=False).squeeze(-1).numpy().astype(np.int64)
+
+
+def _mask_signature(mask: Optional[torch.Tensor]) -> str:
+    idx = _mask_indices_array(mask)
+    if idx.size == 0:
+        return "none"
+    return hashlib.md5(idx.tobytes()).hexdigest()
+
+
+class MissingTokenHandler:
+    def __init__(self, model: torch.nn.Module):
+        self.model = model
+        self._logged = False
+
+    def apply(
+        self,
+        sample: SetSample,
+        sample_dict: Dict[str, torch.Tensor],
+        mask: Optional[torch.Tensor],
+        scenario: str,
+    ) -> Dict[str, torch.Tensor]:
+        if mask is None:
+            sample_dict.pop("missing_mask", None)
+            return sample_dict
+        device = sample_dict.get("val", torch.tensor(0.0)).device
+        mask_t = mask.to(device=device, dtype=torch.bool)
+        if mask_t.dim() == 1:
+            mask_t = mask_t.view(1, -1, 1)
+        elif mask_t.dim() == 2:
+            mask_t = mask_t.unsqueeze(-1)
+        sample_dict["missing_mask"] = mask_t
+        if not torch.any(mask_t):
+            return sample_dict
+        idx_bool = mask_t.squeeze(0).squeeze(-1)
+        val = sample_dict.get("val")
+        if torch.is_tensor(val):
+            val = val.clone()
+            if val.dim() == 3 and val.shape[1] == idx_bool.numel():
+                val[:, idx_bool, :] = 0.0
+            sample_dict["val"] = val
+        if not self._logged:
+            LOGGER.debug("apply_missing_embedding: use_missing_emb=True")
+            self._logged = True
+        LOGGER.debug(
+            "apply_missing_embedding uid=%s scenario=%s masked_tokens=%d",
+            sample.uid,
+            scenario,
+            int(idx_bool.sum().item()),
+        )
+        return sample_dict
+
+
+class ForwardCacheManager:
+    def __init__(self, base_dir: Path):
+        self.base_dir = _ensure_dir(base_dir)
+
+    def _scenario_dir(self, scenario: str) -> Path:
+        return _ensure_dir(self.base_dir / scenario)
+
+    def _file_path(self, scenario: str, uid: str) -> Path:
+        return self._scenario_dir(scenario) / f"{uid}.npz"
+
+    def load(self, scenario: str, uid: str, mask_sig: str) -> Optional[Dict[str, Any]]:
+        path = self._file_path(scenario, uid)
+        if not path.exists():
+            return None
+        try:
+            with np.load(path, allow_pickle=True) as data:
+                raw_sig = data.get("mask_sig", np.array("none"))
+                if isinstance(raw_sig, np.ndarray):
+                    stored_sig = str(raw_sig.item())
+                else:
+                    stored_sig = str(raw_sig)
+                if stored_sig != mask_sig:
+                    return None
+                payload: Dict[str, Any] = {
+                    "mu": torch.from_numpy(data["mu"]).float(),
+                    "logvar": torch.from_numpy(data["logvar"]).float(),
+                    "mask_indices": torch.from_numpy(data.get("mask_idx", np.zeros((0,), dtype=np.int64))).long(),
+                }
+                if "cont_mu" in data.files:
+                    payload["cont_mu"] = torch.from_numpy(data["cont_mu"]).float()
+                if "cont_logvar" in data.files:
+                    payload["cont_logvar"] = torch.from_numpy(data["cont_logvar"]).float()
+                if "bin_logit" in data.files:
+                    payload["bin_logit"] = torch.from_numpy(data["bin_logit"]).float()
+                if "cat_logits" in data.files:
+                    payload["cat_logits"] = torch.from_numpy(data["cat_logits"]).float()
+                return payload
+        except Exception as err:  # pragma: no cover - cache corruption fallback
+            LOGGER.warning("Failed to load forward cache %s: %s", path, err)
+        return None
+
+    def store(
+        self,
+        scenario: str,
+        uid: str,
+        mask_sig: str,
+        mask_idx: np.ndarray,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        head: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
+    ) -> None:
+        path = self._file_path(scenario, uid)
+        payload: Dict[str, Any] = {
+            "mask_sig": np.array(mask_sig),
+            "mask_idx": mask_idx.astype(np.int64),
+            "mu": mu.detach().cpu().numpy(),
+            "logvar": logvar.detach().cpu().numpy(),
+        }
+        if head is not None:
+            cont_mu, cont_logvar, bin_logit, cat_logits = head
+            payload["cont_mu"] = cont_mu.detach().cpu().numpy()
+            payload["cont_logvar"] = cont_logvar.detach().cpu().numpy()
+            payload["bin_logit"] = bin_logit.detach().cpu().numpy()
+            if cat_logits is not None:
+                payload["cat_logits"] = cat_logits.detach().cpu().numpy()
+        try:
+            np.savez_compressed(path, **payload)
+        except Exception as err:  # pragma: no cover
+            LOGGER.warning("Failed to write forward cache %s: %s", path, err)
+
+
+def patch_model_for_missing_embedding(model: torch.nn.Module) -> None:
+    if getattr(model, "_missing_patch_applied", False):
+        return
+    if not hasattr(model, "_build_token_inputs"):
+        return
+
+    original = model._build_token_inputs
+
+    def _patched_build_token_inputs(v_norm: torch.Tensor, s: dict) -> torch.Tensor:
+        missing_mask = s.get("missing_mask")
+        x = original(v_norm, s)
+        if missing_mask is None or not torch.is_tensor(missing_mask):
+            return x
+        mask_bool = missing_mask.to(dtype=torch.bool, device=x.device)
+        if mask_bool.dim() == 3:
+            mask_bool = mask_bool.squeeze(0).squeeze(-1)
+        elif mask_bool.dim() == 2:
+            mask_bool = mask_bool.squeeze(0)
+        if mask_bool.numel() != x.shape[1] or not torch.any(mask_bool):
+            return x
+        fid = s.get("feat_id")
+        if fid is None or not torch.is_tensor(fid):
+            return x
+        fid_flat = fid.long().to(x.device).squeeze(0).squeeze(-1)
+        if fid_flat.numel() != mask_bool.numel():
+            return x
+        mask_idx = mask_bool.nonzero(as_tuple=False).squeeze(-1)
+        if mask_idx.numel() == 0:
+            return x
+        if not hasattr(model, "id_embedding"):
+            return x
+        id_emb = model.id_embedding(fid_flat)
+        state_dim = model.cont_value_embed[0].out_features if hasattr(model, "cont_value_embed") else id_emb.shape[-1]
+        state_emb = torch.zeros(fid_flat.size(0), state_dim, device=x.device, dtype=id_emb.dtype)
+        feature_types = None
+        if getattr(model, "feature_types", None) is not None:
+            feature_types = model.feature_types.to(x.device)
+        for idx in mask_idx:
+            fid_val = int(fid_flat[idx].item())
+            tcode = int(feature_types[fid_val].item()) if feature_types is not None and 0 <= fid_val < feature_types.numel() else 0
+            if tcode == 0 and hasattr(model, "cont_value_embed"):
+                fill = model.cont_value_embed(torch.zeros(1, 1, device=x.device, dtype=id_emb.dtype)).squeeze(0)
+            elif tcode == 1 and hasattr(model, "bin_state_embed"):
+                base = fid_val * 2
+                emb0 = model.bin_state_embed.weight[base].to(x.device)
+                emb1 = model.bin_state_embed.weight[base + 1].to(x.device)
+                fill = (emb0 + emb1) / 2.0
+            elif tcode == 2 and getattr(model, "cat_state_embed", None) is not None and getattr(model, "cat_offsets", None) is not None:
+                offset = int(model.cat_offsets[fid_val].item()) if model.cat_offsets is not None else -1
+                card = int(model.cat_cardinalities[fid_val].item()) if getattr(model, "cat_cardinalities", None) is not None else 0
+                if offset >= 0 and card > 0:
+                    fill = model.cat_state_embed.weight[offset : offset + card].mean(dim=0).to(x.device)
+                else:
+                    fill = torch.zeros(state_dim, device=x.device, dtype=id_emb.dtype)
+            else:
+                fill = torch.zeros(state_dim, device=x.device, dtype=id_emb.dtype)
+            state_emb[idx] = fill
+        tok_missing = torch.cat([id_emb, state_emb], dim=-1)
+        replaced = model.token_mlp(tok_missing)
+        x = x.clone()
+        x[:, mask_idx, :] = replaced[mask_idx].unsqueeze(0).to(dtype=x.dtype)
+        return x
+
+    model._build_token_inputs = _patched_build_token_inputs  # type: ignore[assignment]
+    setattr(model, "_missing_patch_applied", True)
+
 @dataclass
 class EvalConfig:
     ckpt: str
@@ -193,6 +392,7 @@ class EvalConfig:
     mc_samples: int
     intra_samples: int
     active_topk: int
+    ig_min_steps: int
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +627,55 @@ def _encode_set_latent(model: torch.nn.Module, s: Mapping[str, torch.Tensor]) ->
         mu = z_list[-1][1].squeeze(1)
         logvar = z_list[-1][2].squeeze(1)
     return mu, logvar
+
+
+def _prepare_sample_for_scenario(
+    sample: SetSample,
+    device: torch.device,
+    scenario: str,
+    mask: Optional[torch.Tensor],
+    missing_handler: Optional[MissingTokenHandler],
+) -> Dict[str, torch.Tensor]:
+    cloned = _clone_set_to_device(sample, device)
+    if missing_handler is not None:
+        missing_handler.apply(sample, cloned, mask, scenario)
+    return cloned
+
+
+def _forward_with_cache(
+    model: torch.nn.Module,
+    sample: SetSample,
+    scenario: str,
+    mask: Optional[torch.Tensor],
+    missing_handler: Optional[MissingTokenHandler],
+    forward_cache: Optional[ForwardCacheManager],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]]:
+    prepared = _prepare_sample_for_scenario(sample, device, scenario, mask, missing_handler)
+    cache_sig_mask = prepared.get("missing_mask") if forward_cache is not None else None
+    cache_sig = _mask_signature(cache_sig_mask)
+    cached = None
+    if forward_cache is not None:
+        cached = forward_cache.load(scenario, sample.uid, cache_sig)
+    if cached is not None:
+        mu = cached["mu"].to(device)
+        logvar = cached["logvar"].to(device)
+        head: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = None
+        if all(key in cached for key in ("cont_mu", "cont_logvar", "bin_logit")):
+            cont_mu = cached["cont_mu"].to(device)
+            cont_logvar = cached["cont_logvar"].to(device)
+            bin_logit = cached["bin_logit"].to(device)
+            cat_logits_arr = cached.get("cat_logits")
+            cat_logits = cat_logits_arr.to(device) if cat_logits_arr is not None else None
+            head = (cont_mu, cont_logvar, bin_logit, cat_logits)
+        return mu, logvar, head
+
+    mu, logvar = _encode_set_latent(model, prepared)
+    head = _predict_head_outputs(model, mu)
+    if forward_cache is not None:
+        mask_idx = _mask_indices_array(prepared.get("missing_mask"))
+        forward_cache.store(scenario, sample.uid, cache_sig, mask_idx, mu, logvar, head)
+    return mu, logvar, head
 
 
 def build_data_cache(
@@ -771,38 +1020,37 @@ def apply_mask_scenario(
     sample: SetSample,
     scenario: str,
     rng: random.Random,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    feat_id = sample.tensors.get("feat_id")
+) -> torch.Tensor:
     carry = sample.tensors.get("carry") or sample.tensors.get("carry_mask")
     size = sample.size
     indices = torch.arange(size, dtype=torch.long)
+    mask = torch.zeros(size, dtype=torch.bool)
     if scenario == "none" or size == 0:
-        return indices, torch.tensor([], dtype=torch.long)
+        return mask
 
     if scenario.startswith("mar_"):
         rate = float(scenario.split("_")[1])
         candidate = indices
         k = max(0, min(size, int(math.ceil(rate * size))))
         if k <= 0:
-            return indices, torch.tensor([], dtype=torch.long)
-        mask_idx = torch.tensor(rng.sample(candidate.tolist(), k), dtype=torch.long)
-        keep = torch.tensor(sorted(set(candidate.tolist()) - set(mask_idx.tolist())), dtype=torch.long)
-        if keep.numel() == 0:
-            keep = mask_idx[:1]
-            mask_idx = mask_idx[1:]
-        return keep, mask_idx
+            return mask
+        picked = rng.sample(candidate.tolist(), k)
+        mask[picked] = True
+        if mask.all():
+            first = picked[0]
+            mask[first] = False
+        return mask
 
     if scenario == "carry_only" and carry is not None:
         carry_vec = (carry.squeeze(0).squeeze(-1) > 0.5).nonzero(as_tuple=False).squeeze(-1)
-        keep = carry_vec
-        mask_idx = torch.tensor(sorted(set(indices.tolist()) - set(keep.tolist())), dtype=torch.long)
-        if keep.numel() == 0:
-            keep = indices[:1]
-            mask_idx = indices[1:]
-        return keep, mask_idx
+        mask_indices = torch.tensor(sorted(set(range(size)) - set(carry_vec.tolist())), dtype=torch.long)
+        mask[mask_indices] = True
+        if mask.all():
+            mask[0] = False
+        return mask
 
     # fallback: no masking
-    return indices, torch.tensor([], dtype=torch.long)
+    return mask
 
 
 def compute_token_uncertainty(
@@ -1355,6 +1603,8 @@ def evaluate_conditional_inference(
     cache: DataCache,
     cfg: EvalConfig,
     samples: Optional[List[SetSample]] = None,
+    missing_handler: Optional[MissingTokenHandler] = None,
+    forward_cache: Optional[ForwardCacheManager] = None,
 ) -> Dict[str, Any]:
     scenarios = cfg.mask_scenarios or ["none"]
     base_dir = _ensure_dir(cfg.save_dir / "cond_infer")
@@ -1367,7 +1617,6 @@ def evaluate_conditional_inference(
 
     for scenario in scenarios:
         scen_dir = _ensure_dir(base_dir / scenario.replace(".", "_"))
-        rows = []
         cont_preds: List[float] = []
         cont_vars: List[float] = []
         cont_targets: List[float] = []
@@ -1379,76 +1628,62 @@ def evaluate_conditional_inference(
 
         selected = samples if samples is not None else select_random_sets(cache, cfg.sample_sets, cfg.seed + scenarios.index(scenario))
         for sample in selected:
-            keep_idx, mask_idx = apply_mask_scenario(sample, scenario, rng)
+            mask_tensor = apply_mask_scenario(sample, scenario, rng)
             values = sample.tensors.get("val")
             feat_id_full = sample.tensors.get("feat_id")
             if values is None or feat_id_full is None:
                 continue
 
-            if scenario == "none":
-                head_full = _get_head_outputs(model, sample, device)
-                if head_full is None:
-                    continue
-                cont_mu, cont_logvar, bin_logit, cat_logits_head = head_full
-                fid_full = feat_id_full.squeeze(0).squeeze(-1).cpu().numpy().astype(int)
-                val_full = values.squeeze(0).squeeze(-1).numpy()
-                for local, f in enumerate(fid_full):
-                    if f < 0 or f >= cache.feature_types.numel():
-                        continue
-                    tcode = int(cache.feature_types[f].item())
-                    if tcode == 0:
-                        cont_preds.append(float(cont_mu[0, f].item()))
-                        cont_vars.append(float(torch.exp(cont_logvar[0, f]).item()))
-                        cont_targets.append(float(val_full[local]))
-                    elif tcode == 1:
-                        prob = float(torch.sigmoid(bin_logit[0, f]).item())
-                        bin_probs.append(prob)
-                        bin_labels.append(1.0 if val_full[local] > 0.5 else 0.0)
-                    elif tcode == 2 and cat_logits_head is not None and cache.cat_offsets is not None:
-                        offset = int(cache.cat_offsets[f].item())
-                        card = int(cache.cat_cardinalities[f].item()) if cache.cat_cardinalities is not None else 0
-                        if offset >= 0 and card > 0:
-                            logits = cat_logits_head[0, offset : offset + card].detach().cpu().numpy().tolist()
-                            cat_logits.append(logits)
-                            cat_labels.append(int(max(0, min(card - 1, int(round(val_full[local]))))))
-                            cat_cards.append(card)
+            mask_for_forward = mask_tensor if torch.any(mask_tensor) else None
+            if scenario != "none" and mask_for_forward is None:
                 continue
+            if scenario != "none" and torch.any(mask_tensor):
+                registry.register(scenario, mask_tensor.nonzero(as_tuple=False).squeeze(-1).cpu().numpy())
 
-            if mask_idx.numel() == 0:
-                continue
-            registry.register(scenario, mask_idx.numpy())
-            observed = _clone_set_to_device(sample, device, keep_idx)
-            masked = _clone_set_to_device(sample, device, mask_idx)
-            with torch.no_grad():
-                mu_cond, logvar_cond = _encode_set_latent(model, observed)
-            head = _predict_head_outputs(model, mu_cond)
+            _, _, head = _forward_with_cache(
+                model,
+                sample,
+                scenario,
+                mask_for_forward,
+                missing_handler,
+                forward_cache,
+                device,
+            )
+            if head is None:
+                head = _get_head_outputs(model, sample, device)
             if head is None:
                 continue
             cont_mu, cont_logvar, bin_logit, cat_logits_head = head
-            fid = masked.get("feat_id")
-            if fid is None:
+
+            fid_full = feat_id_full.squeeze(0).squeeze(-1).cpu().numpy().astype(int)
+            val_full = values.squeeze(0).squeeze(-1).numpy()
+            if mask_for_forward is None:
+                token_indices = np.arange(fid_full.shape[0])
+            else:
+                token_indices = mask_tensor.nonzero(as_tuple=False).squeeze(-1).cpu().numpy()
+            if token_indices.size == 0:
                 continue
-            fid_np = fid.squeeze(0).squeeze(-1).cpu().numpy().astype(int)
-            val = values.squeeze(0).squeeze(-1).numpy()[mask_idx.numpy()]
-            for local, f in enumerate(fid_np):
+
+            for local_idx in token_indices:
+                f = fid_full[local_idx]
                 if f < 0 or f >= cache.feature_types.numel():
                     continue
                 tcode = int(cache.feature_types[f].item())
                 if tcode == 0:
                     cont_preds.append(float(cont_mu[0, f].item()))
                     cont_vars.append(float(torch.exp(cont_logvar[0, f]).item()))
-                    cont_targets.append(float(val[local]))
+                    cont_targets.append(float(val_full[local_idx]))
                 elif tcode == 1:
                     prob = float(torch.sigmoid(bin_logit[0, f]).item())
                     bin_probs.append(prob)
-                    bin_labels.append(1.0 if val[local] > 0.5 else 0.0)
+                    bin_labels.append(1.0 if val_full[local_idx] > 0.5 else 0.0)
                 elif tcode == 2 and cat_logits_head is not None and cache.cat_offsets is not None:
                     offset = int(cache.cat_offsets[f].item())
                     card = int(cache.cat_cardinalities[f].item()) if cache.cat_cardinalities is not None else 0
                     if offset >= 0 and card > 0:
                         logits = cat_logits_head[0, offset : offset + card].detach().cpu().numpy().tolist()
                         cat_logits.append(logits)
-                        cat_labels.append(int(max(0, min(card - 1, int(round(val[local]))))))
+                        cat_labels.append(int(max(0, min(card - 1, int(round(val_full[local_idx]))))))
                         cat_cards.append(card)
 
         metrics: Dict[str, Any] = {}
@@ -1483,6 +1718,8 @@ def evaluate_active_observation(
     cfg: EvalConfig,
     mc_samples: int = 16,
     samples: Optional[List[SetSample]] = None,
+    missing_handler: Optional[MissingTokenHandler] = None,
+    forward_cache: Optional[ForwardCacheManager] = None,
 ) -> Dict[str, Any]:
     base_dir = _ensure_dir(cfg.save_dir / "active_obs")
     proxy_path = base_dir / "proxy_rank.csv"
@@ -1498,11 +1735,20 @@ def evaluate_active_observation(
     selected_sets = samples if samples is not None else select_random_sets(cache, cfg.sample_sets, cfg.seed)
 
     for sample in selected_sets:
-        keep_idx, mask_idx = apply_mask_scenario(sample, "carry_only", mask_rng)
-        observed = _clone_set_to_device(sample, device, keep_idx)
-        with torch.no_grad():
-            mu_base, logvar_base = _encode_set_latent(model, observed)
-        head_base = _get_head_outputs(model, sample, device)
+        mask_tensor = apply_mask_scenario(sample, "carry_only", mask_rng)
+        mask_for_forward = mask_tensor if torch.any(mask_tensor) else None
+        mask_array = mask_tensor.numpy()
+        mu_base, logvar_base, head_base = _forward_with_cache(
+            model,
+            sample,
+            "carry_only",
+            mask_for_forward,
+            missing_handler,
+            forward_cache,
+            device,
+        )
+        if head_base is None:
+            head_base = _get_head_outputs(model, sample, device)
         if head_base is None:
             continue
         feat_id = sample.tensors.get("feat_id")
@@ -1512,12 +1758,15 @@ def evaluate_active_observation(
         fid = feat_id.squeeze(0).squeeze(-1).numpy().astype(int)
         val = values.squeeze(0).squeeze(-1).numpy()
         full_set = _clone_set_to_device(sample, device)
+        if mask_for_forward is not None and missing_handler is not None:
+            # ensure missing mask present for later updates
+            missing_handler.apply(sample, full_set, None, "carry_only")
 
         ranked = []
         for idx, f in enumerate(fid):
             if f < 0 or f >= feature_types.numel():
                 continue
-            if idx in keep_idx.tolist():
+            if not bool(mask_array[idx]):
                 continue
             score = compute_token_uncertainty(model, head_base, f, feature_types)
             ranked.append((idx, f, score))
@@ -1553,6 +1802,9 @@ def evaluate_active_observation(
                 augmented = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in full_set.items()}
                 augmented["val"] = augmented["val"].clone()
                 augmented["val"][:, idx : idx + 1, :] = torch.tensor(sampled_val, dtype=augmented["val"].dtype, device=device).view(1, 1, 1)
+                if "missing_mask" in augmented:
+                    augmented["missing_mask"] = augmented["missing_mask"].clone()
+                    augmented["missing_mask"][:, idx, :] = False
                 with torch.no_grad():
                     mu_aug, logvar_aug = _encode_set_latent(model, augmented)
                 mu_samples.append((mu_aug, logvar_aug))
@@ -1609,11 +1861,13 @@ def evaluate_ig_monotonicity(
     cfg: EvalConfig,
     topk: int,
     samples: Optional[List[SetSample]] = None,
+    missing_handler: Optional[MissingTokenHandler] = None,
 ) -> Dict[str, Any]:
     save_dir = _ensure_dir(cfg.save_dir / "ig_monotonic")
     curves_path = save_dir / "curves.csv"
     stats_path = save_dir / "stats.json"
     device = next(model.parameters()).device
+    LOGGER.debug("ig_monotonicity: ig_min_steps=%d", cfg.ig_min_steps)
 
     curves: List[List[float]] = []
     w2_values: List[List[float]] = []
@@ -1644,23 +1898,24 @@ def evaluate_ig_monotonicity(
         scores.sort(key=lambda x: x[1], reverse=True)
         steps = min(topk, len(scores))
 
-        keep_tokens = tokens.copy()
+        mask_state = torch.zeros(len(tokens), dtype=torch.bool, device=device)
         curve = [1.0]
         w2_curve = [0.0]
         for step in range(steps):
             remove_idx = scores[step][0]
-            if remove_idx in keep_tokens:
-                keep_tokens.remove(remove_idx)
-            if not keep_tokens:
+            mask_state[remove_idx] = True
+            if torch.all(mask_state):
                 break
-            subset = _clone_set_to_device(sample, device, torch.tensor(keep_tokens, dtype=torch.long))
+            subset_mask = mask_state.clone().detach().cpu()
+            subset = _prepare_sample_for_scenario(sample, device, "ig", subset_mask, missing_handler)
             with torch.no_grad():
                 mu_sub, logvar_sub = _encode_set_latent(model, subset)
             cos = F.cosine_similarity(mu_full.unsqueeze(0), mu_sub.unsqueeze(0), dim=-1).item()
             curve.append(float(max(min(cos, 1.0), -1.0)))
             w2 = torch.norm(mu_full - mu_sub).item() + float(torch.abs(torch.exp(logvar_full) - torch.exp(logvar_sub)).mean().item())
             w2_curve.append(w2)
-            if cfg.tier == "A":
+            removed_count = step + 1
+            if cfg.tier == "A" and removed_count >= max(1, cfg.ig_min_steps):
                 tau_partial, _ = _kendall_tau_b(list(range(len(curve))), curve)
                 if tau_partial is not None and not math.isnan(tau_partial) and tau_partial <= 0:
                     break
@@ -1705,6 +1960,7 @@ def evaluate_intra_set_consistency(
     cache: DataCache,
     cfg: EvalConfig,
     samples: Optional[List[SetSample]] = None,
+    missing_handler: Optional[MissingTokenHandler] = None,
 ) -> Dict[str, Any]:
     base_dir = _ensure_dir(cfg.save_dir / "intraconsistency")
     pit_path = base_dir / "pit.csv"
@@ -1736,9 +1992,9 @@ def evaluate_intra_set_consistency(
             rng_local.shuffle(indices)
             indices = indices[:token_cap]
         for idx in indices:
-            keep = torch.tensor([i for i in range(fid.shape[0]) if i != idx], dtype=torch.long)
-            masked = torch.tensor([idx], dtype=torch.long)
-            observed = _clone_set_to_device(sample, device, keep)
+            mask_tensor = torch.zeros(fid.shape[0], dtype=torch.bool)
+            mask_tensor[idx] = True
+            observed = _prepare_sample_for_scenario(sample, device, "loo", mask_tensor, missing_handler)
             with torch.no_grad():
                 mu_cond, logvar_cond = _encode_set_latent(model, observed)
             head = _predict_head_outputs(model, mu_cond)
@@ -2117,6 +2373,7 @@ def summarize_dashboard(results: Dict[str, Any], cfg: EvalConfig) -> None:
     flat: Dict[str, Any] = {}
     for key, value in results.items():
         _flatten_metrics(key, value, flat)
+    flat["criteria_ref"] = "summary/criteria.json"
     pd.DataFrame([flat]).to_csv(summary_dir / "eval_summary.csv", index=False)
     _write_json(summary_dir / "eval_summary.json", flat)
 
@@ -2146,6 +2403,12 @@ def summarize_dashboard(results: Dict[str, Any], cfg: EvalConfig) -> None:
             pass_fail[metric] = False
     _write_json(summary_dir / "pass_fail.json", pass_fail)
 
+    criteria_payload = {
+        metric: {"op": op, "threshold": threshold}
+        for metric, (op, threshold) in SUMMARY_THRESHOLDS.items()
+    }
+    _write_json(summary_dir / "criteria.json", criteria_payload)
+
 
 def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
     save_dir = Path(args.save_dir)
@@ -2164,7 +2427,7 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
         mask_scenarios = parse_mask_scenarios(args.mask_scenarios)
     else:
         defaults = ["none", "mar_0.2", "mar_0.5"]
-        if tier == "C":
+        if tier in {"B", "C"}:
             defaults.append("mar_0.8")
         mask_scenarios = defaults
 
@@ -2190,6 +2453,8 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
         active_topk = args.active_topk
     else:
         active_topk = {"A": 5, "B": 10, "C": 10}[tier]
+
+    ig_min_steps = args.ig_min_steps if args.ig_min_steps > 0 else 5
 
     return EvalConfig(
         ckpt=args.ckpt,
@@ -2217,6 +2482,7 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
         mc_samples=mc_samples,
         intra_samples=intra_samples,
         active_topk=active_topk,
+        ig_min_steps=ig_min_steps,
     )
 
 
@@ -2230,6 +2496,9 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
+    patch_model_for_missing_embedding(model)
+    missing_handler = MissingTokenHandler(model)
+    forward_cache = ForwardCacheManager(cfg.save_dir / "cache" / "forward")
 
     LOGGER.info("Loading validation data cache")
     batches = load_validation_batches(cfg.data_dir, schema, cfg.batch_size)
@@ -2273,11 +2542,18 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
     results["reconstruction"] = recon
 
     LOGGER.info("Evaluating conditional inference scenarios")
-    cond = evaluate_conditional_inference(model, cache, cfg, samples=cond_sets)
+    cond = evaluate_conditional_inference(
+        model,
+        cache,
+        cfg,
+        samples=cond_sets,
+        missing_handler=missing_handler,
+        forward_cache=forward_cache,
+    )
     results["conditional"] = cond
 
     LOGGER.info("Evaluating intra-set consistency")
-    intra = evaluate_intra_set_consistency(model, cache, cfg, samples=intra_sets)
+    intra = evaluate_intra_set_consistency(model, cache, cfg, samples=intra_sets, missing_handler=missing_handler)
     results["intra_consistency"] = intra
 
     # Core summary metrics for tier A
@@ -2309,7 +2585,15 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
 
     if not collapse_detected and cfg.eval_active:
         LOGGER.info("Evaluating active observation strategies")
-        active = evaluate_active_observation(model, cache, cfg, mc_samples=cfg.mc_samples, samples=active_sets)
+        active = evaluate_active_observation(
+            model,
+            cache,
+            cfg,
+            mc_samples=cfg.mc_samples,
+            samples=active_sets,
+            missing_handler=missing_handler,
+            forward_cache=forward_cache,
+        )
         results["active_observation"] = active
         results["ActiveObs_corr"] = active.get("correlation", {}).get("spearman")
     else:
@@ -2318,7 +2602,7 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
     if not collapse_detected and cfg.eval_ig:
         LOGGER.info("Evaluating information gain monotonicity")
         ig_topk = 8 if cfg.tier == "A" else cfg.topk_ig
-        ig = evaluate_ig_monotonicity(model, cache, cfg, topk=ig_topk, samples=ig_sets)
+        ig = evaluate_ig_monotonicity(model, cache, cfg, topk=ig_topk, samples=ig_sets, missing_handler=missing_handler)
         results["ig"] = ig
         results["IG_tau"] = ig.get("stats", {}).get("avg_kendall_tau")
         results["IG_AUCdecay"] = ig.get("stats", {}).get("avg_auc_decay")
@@ -2381,6 +2665,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--mc_samples", type=int, default=0)
     ap.add_argument("--intra_samples", type=int, default=0)
     ap.add_argument("--active_topk", type=int, default=10)
+    ap.add_argument("--ig_min_steps", type=int, default=5)
     ap.add_argument("--log_level", default="INFO")
     return ap.parse_args(argv)
 
