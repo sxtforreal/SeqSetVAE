@@ -57,6 +57,17 @@ def _setup_logging(level: str = "INFO") -> None:
 LOGGER = logging.getLogger("eval_setvae")
 
 
+def _ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Schema utilities
 
@@ -1143,20 +1154,27 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
 
     metrics: Dict[str, Any] = {}
 
-    # Section 1: posterior health
+    LOGGER.info("Starting evaluation: posterior_health")
+    posterior_dir = _ensure_dir(cfg.save_dir / "posterior_health")
     metrics["posterior_health"] = evaluate_posterior_health(
         model,
         batches,
         device=cfg.device,
         n_z_samples=cfg.n_z_samples,
-        save_dir=cfg.save_dir / "figures",
+        save_dir=posterior_dir,
         seed=cfg.seed,
     )
+    _write_json(posterior_dir / "metrics.json", metrics["posterior_health"])
+    LOGGER.info("Completed evaluation: posterior_health")
 
-    # Section 2: information distribution
+    LOGGER.info("Starting evaluation: latent_information_distribution")
+    info_dist_dir = _ensure_dir(cfg.save_dir / "latent_information_distribution")
     metrics["latent_information_distribution"] = evaluate_information_distribution(metrics["posterior_health"])
+    _write_json(info_dist_dir / "metrics.json", metrics["latent_information_distribution"])
+    LOGGER.info("Completed evaluation: latent_information_distribution")
 
-    # Section 3: information gain monotonicity
+    LOGGER.info("Starting evaluation: information_gain_monotonicity")
+    ig_dir = _ensure_dir(cfg.save_dir / "information_gain_monotonicity")
     metrics["information_gain_monotonicity"] = evaluate_information_gain_monotonicity(
         model,
         batches,
@@ -1164,28 +1182,36 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
         top_k=cfg.info_top_k,
         max_sets=cfg.info_max_sets,
     )
+    _write_json(ig_dir / "metrics.json", metrics["information_gain_monotonicity"])
+    LOGGER.info("Completed evaluation: information_gain_monotonicity")
 
-    # Section 4: intra-set self consistency
+    LOGGER.info("Starting evaluation: intraset_self_consistency")
+    consistency_dir = _ensure_dir(cfg.save_dir / "intraset_self_consistency")
     metrics["intraset_self_consistency"] = evaluate_intraset_self_consistency(
         model,
         batches,
         device=cfg.device,
         max_sets=cfg.consistency_max_sets,
     )
+    _write_json(consistency_dir / "metrics.json", metrics["intraset_self_consistency"])
+    LOGGER.info("Completed evaluation: intraset_self_consistency")
 
-    # Placeholder evaluations for sections 3-8
-    metrics["set_reconstruction"] = {"status": "pending"}
-    per_scenario_feature_metrics: Dict[str, Any] = {}
-    for scenario in cfg.mask_scenarios:
-        per_scenario_feature_metrics[scenario] = {"status": "pending"}
-    metrics["feature_inference"] = per_scenario_feature_metrics
-    metrics["next_best_measurement"] = {"status": "pending"}
-    metrics["subsystem_weights"] = {"status": "pending"}
-    metrics["subsystem_sensitivity"] = {"status": "pending"}
-    metrics["prior_vs_posterior"] = {"status": "pending"}
-    metrics["stress_tests"] = {"status": "pending"}
-    metrics["heads_ablation"] = {"status": "pending"}
-    metrics["model_selection"] = {"status": "pending"}
+    placeholder_sections: Dict[str, Any] = {
+        "set_reconstruction": {"status": "pending"},
+        "feature_inference": {scenario: {"status": "pending"} for scenario in cfg.mask_scenarios},
+        "next_best_measurement": {"status": "pending"},
+        "subsystem_weights": {"status": "pending"},
+        "subsystem_sensitivity": {"status": "pending"},
+        "prior_vs_posterior": {"status": "pending"},
+        "stress_tests": {"status": "pending"},
+        "heads_ablation": {"status": "pending"},
+        "model_selection": {"status": "pending"},
+    }
+
+    for name, value in placeholder_sections.items():
+        subdir = _ensure_dir(cfg.save_dir / name)
+        _write_json(subdir / "metrics.json", value)
+        metrics[name] = value
 
     summarize_dashboard(metrics, cfg.save_dir)
 
