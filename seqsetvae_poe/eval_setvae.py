@@ -38,6 +38,11 @@ try:
 except Exception:  # pragma: no cover - keep optional
     umap = None  # type: ignore
 
+try:
+    import scipy.stats as _scipy_stats  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    _scipy_stats = None  # type: ignore
+
 from dataset import _collate_lvcf, _detect_vcols  # type: ignore
 
 
@@ -778,6 +783,166 @@ def _safe_mean(values: Sequence[float]) -> float:
     if not arr:
         return float("nan")
     return float(sum(arr) / len(arr))
+
+
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    sorted_vals = values[order]
+    n = values.size
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and np.isclose(sorted_vals[j + 1], sorted_vals[i], rtol=1e-12, atol=1e-12):
+            j += 1
+        rank = 0.5 * (i + j) + 1.0
+        ranks[order[i : j + 1]] = rank
+        i = j + 1
+    return ranks
+
+
+def _ks_test_uniform(values: Sequence[float]) -> Tuple[float, float]:
+    arr = np.asarray(list(values), dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    if _scipy_stats is not None:
+        try:
+            stat, p = _scipy_stats.kstest(arr, "uniform")
+            return float(stat), float(p)
+        except Exception:  # pragma: no cover - fallback to manual implementation
+            pass
+
+    arr.sort()
+    n = arr.size
+    cdf = np.arange(1, n + 1, dtype=np.float64) / n
+    d_plus = np.max(cdf - arr)
+    d_minus = np.max(arr - (np.arange(0, n, dtype=np.float64) / n))
+    stat = float(max(d_plus, d_minus))
+    if stat <= 0 or n <= 0:
+        return stat, 1.0
+
+    z = stat * math.sqrt(n)
+    if z <= 1e-12:
+        return stat, 1.0
+
+    p_sum = 0.0
+    for k in range(1, 100):
+        term = (-1) ** (k - 1) * math.exp(-2.0 * (k ** 2) * (z ** 2))
+        p_sum += term
+        if abs(term) < 1e-12:
+            break
+    pval = max(0.0, min(1.0, 2.0 * p_sum))
+    return stat, float(pval)
+
+
+def _kl_diag_gaussian(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    if mu.shape != logvar.shape:
+        raise ValueError("mu and logvar must have the same shape")
+    return 0.5 * (torch.exp(logvar) + mu.pow(2) - 1.0 - logvar)
+
+
+def _sample_diag_gaussians(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    num_samples: int,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    if mu.shape != logvar.shape:
+        raise ValueError("mu and logvar must have the same shape")
+    std = torch.exp(0.5 * logvar)
+    shape = (num_samples,) + tuple(mu.shape)
+    eps = torch.randn(shape, dtype=mu.dtype, device=mu.device, generator=generator)
+    return mu.unsqueeze(0) + eps * std.unsqueeze(0)
+
+
+def _spearman_corr(x: Sequence[float], y: Sequence[float]) -> float:
+    if _scipy_stats is not None:
+        try:
+            corr, _ = _scipy_stats.spearmanr(x, y)
+            return float(corr)
+        except Exception:  # pragma: no cover - fallback
+            pass
+    x_arr = np.asarray(list(x), dtype=np.float64)
+    y_arr = np.asarray(list(y), dtype=np.float64)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if mask.sum() < 2:
+        return float("nan")
+    x_rank = _rankdata(x_arr[mask])
+    y_rank = _rankdata(y_arr[mask])
+    xr = x_rank - x_rank.mean()
+    yr = y_rank - y_rank.mean()
+    denom = math.sqrt(float(np.sum(xr ** 2) * np.sum(yr ** 2)))
+    if denom <= 0:
+        return float("nan")
+    return float(np.sum(xr * yr) / denom)
+
+
+def _kendall_tau_b(x: Sequence[float], y: Sequence[float]) -> Tuple[float, float]:
+    if _scipy_stats is not None:
+        try:
+            tau, p = _scipy_stats.kendalltau(x, y, variant="b")
+            return float(tau), float(p)
+        except Exception:  # pragma: no cover - fallback
+            pass
+
+    x_arr = np.asarray(list(x), dtype=np.float64)
+    y_arr = np.asarray(list(y), dtype=np.float64)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    x_arr = x_arr[mask]
+    y_arr = y_arr[mask]
+    n = x_arr.size
+    if n < 2:
+        return float("nan"), float("nan")
+
+    concordant = 0
+    discordant = 0
+    for i in range(n - 1):
+        dx = x_arr[i+1:] - x_arr[i]
+        dy = y_arr[i+1:] - y_arr[i]
+        prod = dx * dy
+        concordant += int(np.sum(prod > 0))
+        discordant += int(np.sum(prod < 0))
+
+    _, counts_x = np.unique(x_arr, return_counts=True)
+    _, counts_y = np.unique(y_arr, return_counts=True)
+    tie_x = counts_x[counts_x > 1]
+    tie_y = counts_y[counts_y > 1]
+    n0 = n * (n - 1) / 2.0
+    n1 = float(np.sum(tie_x * (tie_x - 1) / 2.0))
+    n2 = float(np.sum(tie_y * (tie_y - 1) / 2.0))
+
+    denom = math.sqrt(max((n0 - n1) * (n0 - n2), 0.0))
+    if denom == 0:
+        return float("nan"), float("nan")
+
+    s = concordant - discordant
+    tau = s / denom
+
+    # Normal approximation for p-value (tau-b)
+    sum_tx = float(np.sum(tie_x * (tie_x - 1) * (2 * tie_x + 5))) if tie_x.size else 0.0
+    sum_ty = float(np.sum(tie_y * (tie_y - 1) * (2 * tie_y + 5))) if tie_y.size else 0.0
+    var_s = (n * (n - 1) * (2 * n + 5) - sum_tx - sum_ty) / 18.0
+
+    if n > 2 and tie_x.size and tie_y.size:
+        sum_tx3 = float(np.sum(tie_x * (tie_x - 1) * (tie_x - 2)))
+        sum_ty3 = float(np.sum(tie_y * (tie_y - 1) * (tie_y - 2)))
+        var_s += (sum_tx3 * sum_ty3) / (9.0 * n * (n - 1) * (n - 2))
+        sum_tx2 = float(np.sum(tie_x * (tie_x - 1)))
+        sum_ty2 = float(np.sum(tie_y * (tie_y - 1)))
+        var_s += (sum_tx2 * sum_ty2) / (2.0 * n * (n - 1))
+
+    if var_s <= 0:
+        p = float("nan")
+    else:
+        z = s / math.sqrt(var_s)
+        p = math.erfc(abs(z) / math.sqrt(2.0))
+
+    return float(tau), float(p)
 
 
 def _auc_score(y_true: np.ndarray, y_score: np.ndarray) -> float:
