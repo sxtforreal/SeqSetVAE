@@ -29,11 +29,12 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 try:  # optional plotting dependency
     import matplotlib.pyplot as plt  # type: ignore
@@ -404,6 +405,231 @@ def _mmd_rbf(x: torch.Tensor, y: torch.Tensor, bandwidths: Sequence[float]) -> t
 
 
 # ---------------------------------------------------------------------------
+# Information gain & self-consistency helpers
+
+
+def _rankdata(values: Sequence[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    sorter = np.argsort(arr)
+    inv = np.empty_like(sorter)
+    inv[sorter] = np.arange(len(arr))
+    arr_sorted = arr[sorter]
+    unique_vals, idx_start, counts = np.unique(arr_sorted, return_counts=True, return_index=True)
+    ranks = np.zeros(len(arr), dtype=np.float64)
+    for start, count in zip(idx_start, counts):
+        rank = start + (count - 1) / 2.0
+        ranks[start:start + count] = rank
+    return ranks[inv]
+
+
+def _spearman_corr(x: Sequence[float], y: Sequence[float]) -> float:
+    if len(x) != len(y) or len(x) == 0:
+        return float("nan")
+    rx = _rankdata(x)
+    ry = _rankdata(y)
+    rx_mean = rx.mean()
+    ry_mean = ry.mean()
+    num = np.sum((rx - rx_mean) * (ry - ry_mean))
+    den = np.sqrt(np.sum((rx - rx_mean) ** 2) * np.sum((ry - ry_mean) ** 2))
+    if den == 0:
+        return float("nan")
+    return float(num / den)
+
+
+def _kendall_tau_b(x: Sequence[float], y: Sequence[float]) -> Tuple[float, float]:
+    n = len(x)
+    if n < 2:
+        return float("nan"), float("nan")
+    conc = 0
+    disc = 0
+    ties_x = 0
+    ties_y = 0
+    ties_xy = 0
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+                ties_xy += 1
+            elif abs(dx) < 1e-12:
+                ties_x += 1
+            elif abs(dy) < 1e-12:
+                ties_y += 1
+            elif dx * dy > 0:
+                conc += 1
+            elif dx * dy < 0:
+                disc += 1
+    denom = np.sqrt((conc + disc + ties_x) * (conc + disc + ties_y))
+    if denom == 0:
+        return float("nan"), float("nan")
+    tau = (conc - disc) / denom
+    # Normal approximation for p-value
+    s = conc - disc
+    var_s = (
+        (n * (n - 1) * (2 * n + 5)) / 18
+        + (ties_x * (ties_x - 1) * (2 * ties_x + 5)) / 18
+        + (ties_y * (ties_y - 1) * (2 * ties_y + 5)) / 18
+    )
+    if var_s <= 0:
+        p = float("nan")
+    else:
+        z = s / np.sqrt(var_s)
+        p = 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0))))
+    return float(tau), float(p)
+
+
+def _ks_test_uniform(samples: Sequence[float]) -> Tuple[float, float]:
+    arr = np.asarray(samples, dtype=np.float64)
+    n = arr.size
+    if n == 0:
+        return float("nan"), float("nan")
+    arr = np.sort(arr)
+    cdf = np.arange(1, n + 1, dtype=np.float64) / n
+    d_plus = np.max(cdf - arr)
+    d_minus = np.max(arr - (cdf - 1.0 / n))
+    d_stat = max(d_plus, d_minus)
+    # Approximate p-value using asymptotic formula
+    if n > 0:
+        lambda_val = (math.sqrt(n) + 0.12 + 0.11 / math.sqrt(n)) * d_stat
+        p = 2.0 * sum(((-1) ** (k - 1)) * math.exp(-2.0 * (lambda_val ** 2) * (k ** 2)) for k in range(1, 10))
+        p = max(0.0, min(1.0, p))
+    else:
+        p = float("nan")
+    return float(d_stat), float(p)
+
+
+def _expected_calibration_error(probs: Sequence[float], labels: Sequence[float], num_bins: int = 10) -> float:
+    if len(probs) == 0:
+        return float("nan")
+    probs_arr = np.asarray(probs, dtype=np.float64)
+    labels_arr = np.asarray(labels, dtype=np.float64)
+    bins = np.linspace(0.0, 1.0, num_bins + 1)
+    ece = 0.0
+    total = len(probs_arr)
+    for i in range(num_bins):
+        mask = (probs_arr >= bins[i]) & (probs_arr <= bins[i + 1] if i == num_bins - 1 else probs_arr < bins[i + 1])
+        count = mask.sum()
+        if count == 0:
+            continue
+        acc = labels_arr[mask].mean()
+        conf = probs_arr[mask].mean()
+        ece += (count / total) * abs(acc - conf)
+    return float(ece)
+
+
+def _clone_set_dict(s: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in s.items():
+        if torch.is_tensor(value):
+            out[key] = value.clone()
+        else:
+            out[key] = value
+    return out
+
+
+def _slice_set_by_indices(s: Mapping[str, Any], keep: Sequence[int]) -> Optional[Dict[str, Any]]:
+    if len(keep) == 0:
+        return None
+    out: Dict[str, Any] = {}
+    device = None
+    if torch.is_tensor(s.get("var", None)):
+        device = s["var"].device
+    idx_tensor = torch.tensor(keep, dtype=torch.long, device=device)
+    for key, value in s.items():
+        if value is None:
+            out[key] = None
+        elif torch.is_tensor(value) and value.dim() >= 2:
+            out[key] = value.index_select(1, idx_tensor).clone()
+        elif torch.is_tensor(value):
+            out[key] = value.clone()
+        else:
+            out[key] = value
+    return out
+
+
+def _encode_set_latent(model: torch.nn.Module, s: Mapping[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    v_norm, _ = model._compute_target(s)
+    if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
+        x_input = model._build_token_inputs(v_norm, s)
+    else:
+        x_input = v_norm * s["val"]
+    z_list, _ = model.set_encoder.encode(x_input)
+    mu = z_list[-1][1].squeeze(1)
+    logvar = z_list[-1][2].squeeze(1)
+    return mu, logvar
+
+
+def _predict_head_outputs(model: torch.nn.Module, z_mu: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+    if not getattr(model, "enable_prob_head", False):
+        return None
+    if getattr(model, "prob_shared", None) is None:
+        return None
+    h = model.prob_shared(z_mu)
+    cont_mu = model.prob_cont_mu(h)
+    cont_logvar = model.prob_cont_logvar(h)
+    bin_logit = model.prob_bin_logit(h)
+    cat_logits = model.prob_cat_logits(h) if getattr(model, "prob_cat_logits", None) is not None else None
+    return cont_mu, cont_logvar, bin_logit, cat_logits
+
+
+def _compute_uncertainty_scalar(model: torch.nn.Module, head_outputs: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]) -> float:
+    if head_outputs is None or getattr(model, "num_features", 0) <= 0:
+        return float("nan")
+    cont_mu, cont_logvar, bin_logit, cat_logits = head_outputs
+    feature_types = getattr(model, "feature_types", None)
+    if feature_types is None:
+        return float("nan")
+    scores: List[float] = []
+    cont_var = torch.exp(cont_logvar)
+    bin_prob = torch.sigmoid(bin_logit)
+    for fid in range(model.num_features):
+        tcode = int(feature_types[fid].item())
+        if tcode == 0:
+            scores.append(float(cont_var[0, fid].item()))
+        elif tcode == 1:
+            p = float(bin_prob[0, fid].item())
+            scores.append(p * (1.0 - p))
+        elif tcode == 2 and cat_logits is not None:
+            offset = int(model.cat_offsets[fid].item()) if hasattr(model, "cat_offsets") else -1
+            card = int(model.cat_cardinalities[fid].item()) if hasattr(model, "cat_cardinalities") else 0
+            if offset >= 0 and card > 0:
+                logits = cat_logits[0, offset : offset + card]
+                probs = torch.softmax(logits, dim=-1)
+                entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-12)))
+                scores.append(float(entropy.item()))
+    if not scores:
+        return float("nan")
+    return float(np.mean(scores))
+
+
+def _iterate_sets(model: torch.nn.Module, batches: Sequence[Mapping[str, torch.Tensor]], device: torch.device) -> Iterable[Dict[str, Any]]:
+    for batch in batches:
+        batch_dev = _to_device(batch, device)
+        try:
+            all_sets = model._split_sets(
+                batch_dev["var"],
+                batch_dev["val"],
+                batch_dev["minute"],
+                batch_dev["set_id"],
+                batch_dev.get("padding_mask"),
+                batch_dev.get("carry_mask"),
+                batch_dev.get("feat_id"),
+            )
+        except TypeError:
+            all_sets = model._split_sets(
+                batch_dev["var"],
+                batch_dev["val"],
+                batch_dev["minute"],
+                batch_dev["set_id"],
+                batch_dev.get("padding_mask"),
+                batch_dev.get("carry_mask"),
+            )
+        for patient_sets in all_sets:
+            for s in patient_sets:
+                yield s
+
+
+# ---------------------------------------------------------------------------
 # Evaluation functions (aligned with spec)
 
 
@@ -535,6 +761,279 @@ def evaluate_information_distribution(
     }
 
 
+def evaluate_information_gain_monotonicity(
+    model: torch.nn.Module,
+    batches: Sequence[Mapping[str, torch.Tensor]],
+    *,
+    device: torch.device,
+    top_k: int,
+    max_sets: int,
+) -> Dict[str, Any]:
+    if getattr(model, "feature_types", None) is None or getattr(model, "enable_prob_head", False) is False:
+        return {"status": "skipped", "reason": "probabilistic head or feature schema unavailable"}
+
+    curves: List[List[float]] = []
+    metrics_per_set: List[Dict[str, Any]] = []
+    processed = 0
+
+    for set_dict in _iterate_sets(model, batches, device):
+        feat = set_dict.get("feat_id")
+        if feat is None:
+            continue
+        num_tokens = int(feat.size(1))
+        if num_tokens < 2:
+            continue
+        with torch.no_grad():
+            mu_ref, _ = _encode_set_latent(model, set_dict)
+            head_ref = _predict_head_outputs(model, mu_ref)
+            base_unc = _compute_uncertainty_scalar(model, head_ref)
+        if not math.isfinite(base_unc):
+            continue
+
+        contributions: List[float] = []
+        keep_all = list(range(num_tokens))
+        with torch.no_grad():
+            for idx in range(num_tokens):
+                keep = [k for k in keep_all if k != idx]
+                reduced = _slice_set_by_indices(set_dict, keep)
+                if reduced is None:
+                    contributions.append(float("nan"))
+                    continue
+                mu_i, _ = _encode_set_latent(model, reduced)
+                head_i = _predict_head_outputs(model, mu_i)
+                unc_i = _compute_uncertainty_scalar(model, head_i)
+                if not math.isfinite(unc_i):
+                    contributions.append(float("nan"))
+                else:
+                    contributions.append(float(unc_i - base_unc))
+
+        valid_indices = [i for i, c in enumerate(contributions) if math.isfinite(c)]
+        if not valid_indices:
+            continue
+        ranking = sorted(valid_indices, key=lambda i: contributions[i], reverse=True)
+        steps = min(top_k, len(ranking))
+
+        s_curve: List[float] = [1.0]
+        current_keep = list(range(num_tokens))
+        with torch.no_grad():
+            for step in range(steps):
+                remove_idx = ranking[step]
+                if remove_idx not in current_keep:
+                    continue
+                current_keep.remove(remove_idx)
+                reduced = _slice_set_by_indices(set_dict, current_keep)
+                if reduced is None:
+                    break
+                mu_k, _ = _encode_set_latent(model, reduced)
+                cos_sim = F.cosine_similarity(mu_ref.unsqueeze(0), mu_k.unsqueeze(0), dim=-1).item()
+                cos_sim = float(max(min(cos_sim, 1.0), -1.0))
+                s_curve.append(cos_sim)
+
+        if len(s_curve) <= 1:
+            continue
+
+        k_values = list(range(len(s_curve)))
+        spearman = _spearman_corr(k_values, s_curve)
+        tau, tau_p = _kendall_tau_b(k_values, s_curve)
+        auc_decay = float(np.mean(s_curve))
+
+        def _delta_at(k: int) -> float:
+            if k < len(s_curve):
+                return float(s_curve[0] - s_curve[k])
+            return float("nan")
+
+        metrics_per_set.append({
+            "num_tokens": num_tokens,
+            "S_curve": s_curve,
+            "spearman": spearman,
+            "kendall_tau": tau,
+            "kendall_tau_p": tau_p,
+            "AUC_decay": auc_decay,
+            "delta@1": _delta_at(1),
+            "delta@3": _delta_at(3),
+            "delta@5": _delta_at(5),
+            "top_indices": ranking[:steps],
+            "top_contributions": [float(contributions[i]) for i in ranking[:steps]],
+        })
+        curves.append(s_curve)
+        processed += 1
+        if processed >= max_sets:
+            break
+
+    if not curves:
+        return {"status": "skipped", "reason": "no eligible sets"}
+
+    max_len = max(len(c) for c in curves)
+    padded = np.full((len(curves), max_len), np.nan, dtype=np.float64)
+    for i, curve in enumerate(curves):
+        padded[i, : len(curve)] = curve
+    mean_curve = np.nanmean(padded, axis=0)
+    std_curve = np.nanstd(padded, axis=0)
+
+    tau_vals = [m["kendall_tau"] for m in metrics_per_set if math.isfinite(m["kendall_tau"])]
+    spearman_vals = [m["spearman"] for m in metrics_per_set if math.isfinite(m["spearman"])]
+    auc_vals = [m["AUC_decay"] for m in metrics_per_set if math.isfinite(m["AUC_decay"])]
+
+    summary = {
+        "sets_evaluated": processed,
+        "mean_curve": mean_curve.tolist(),
+        "std_curve": std_curve.tolist(),
+        "avg_kendall_tau": float(np.nanmean(tau_vals) if tau_vals else float("nan")),
+        "avg_spearman": float(np.nanmean(spearman_vals) if spearman_vals else float("nan")),
+        "avg_auc_decay": float(np.nanmean(auc_vals) if auc_vals else float("nan")),
+    }
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "per_set": metrics_per_set,
+    }
+
+
+def evaluate_intraset_self_consistency(
+    model: torch.nn.Module,
+    batches: Sequence[Mapping[str, torch.Tensor]],
+    *,
+    device: torch.device,
+    max_sets: int,
+) -> Dict[str, Any]:
+    if getattr(model, "feature_types", None) is None or getattr(model, "enable_prob_head", False) is False:
+        return {"status": "skipped", "reason": "probabilistic head or feature schema unavailable"}
+
+    cont_pit: List[float] = []
+    cont_nll: List[float] = []
+    cont_coverage: Dict[float, float] = {}
+
+    bin_probs: List[float] = []
+    bin_labels: List[float] = []
+    bin_pit: List[float] = []
+    bin_nll: List[float] = []
+    bin_pred_conf: List[float] = []
+    bin_pred_correct: List[float] = []
+
+    cat_true_prob: List[float] = []
+    cat_pred_conf: List[float] = []
+    cat_pred_correct: List[float] = []
+    cat_pit: List[float] = []
+    cat_nll: List[float] = []
+
+    processed = 0
+
+    for set_dict in _iterate_sets(model, batches, device):
+        feat = set_dict.get("feat_id")
+        if feat is None:
+            continue
+        num_tokens = int(feat.size(1))
+        if num_tokens == 0:
+            continue
+        processed += 1
+        if processed > max_sets:
+            break
+
+        indices = list(range(num_tokens))
+        with torch.no_grad():
+            for idx in indices:
+                keep = [k for k in indices if k != idx]
+                reduced = _slice_set_by_indices(set_dict, keep)
+                if reduced is None:
+                    continue
+                mu_cond, _ = _encode_set_latent(model, reduced)
+                head = _predict_head_outputs(model, mu_cond)
+                if head is None:
+                    continue
+                cont_mu, cont_logvar, bin_logit, cat_logits = head
+
+                fid = int(set_dict["feat_id"][0, idx, 0].item())
+                tcode = int(model.feature_types[fid].item()) if model.feature_types is not None else 0
+                value = float(set_dict["val"][0, idx, 0].item())
+
+                if tcode == 0:
+                    mu = float(cont_mu[0, fid].item())
+                    logvar = float(cont_logvar[0, fid].item())
+                    var = max(math.exp(logvar), 1e-6)
+                    sigma = math.sqrt(var)
+                    z_score = (value - mu) / sigma
+                    pit = 0.5 * (1.0 + math.erf(z_score / math.sqrt(2.0)))
+                    nll = 0.5 * (math.log(2 * math.pi) + logvar + ((value - mu) ** 2) / var)
+                    cont_pit.append(float(pit))
+                    cont_nll.append(float(nll))
+                elif tcode == 1:
+                    p = float(torch.sigmoid(bin_logit[0, fid]).item())
+                    label = 1.0 if value > 0.5 else 0.0
+                    pit = (1 - p) + 0.5 * p if label > 0.5 else 0.5 * (1 - p)
+                    eps = 1e-8
+                    nll = -(label * math.log(max(p, eps)) + (1 - label) * math.log(max(1 - p, eps)))
+                    pred_label = 1.0 if p >= 0.5 else 0.0
+                    pred_conf = p if pred_label > 0.5 else (1 - p)
+                    correct = 1.0 if pred_label == label else 0.0
+                    bin_probs.append(p)
+                    bin_labels.append(label)
+                    bin_pit.append(float(pit))
+                    bin_nll.append(float(nll))
+                    bin_pred_conf.append(float(pred_conf))
+                    bin_pred_correct.append(float(correct))
+                elif tcode == 2 and cat_logits is not None:
+                    offset = int(model.cat_offsets[fid].item()) if hasattr(model, "cat_offsets") else -1
+                    card = int(model.cat_cardinalities[fid].item()) if hasattr(model, "cat_cardinalities") else 0
+                    if offset < 0 or card <= 0:
+                        continue
+                    logits = cat_logits[0, offset : offset + card]
+                    probs = torch.softmax(logits, dim=-1)
+                    klass = int(round(value))
+                    klass = max(0, min(card - 1, klass))
+                    prob_true = float(probs[klass].item())
+                    pit = float(torch.sum(probs[:klass]).item() + 0.5 * prob_true)
+                    eps = 1e-12
+                    nll = -math.log(max(prob_true, eps))
+                    pred_class = int(torch.argmax(probs).item())
+                    pred_conf = float(probs[pred_class].item())
+                    correct = 1.0 if pred_class == klass else 0.0
+                    cat_true_prob.append(prob_true)
+                    cat_pred_conf.append(pred_conf)
+                    cat_pred_correct.append(correct)
+                    cat_pit.append(pit)
+                    cat_nll.append(float(nll))
+
+    coverage_levels = [0.5, 0.8, 0.9, 0.95]
+    cont_coverage = {
+        str(level): float(np.mean(np.asarray(cont_pit) <= level)) if cont_pit else float("nan")
+        for level in coverage_levels
+    }
+
+    cont_ks, cont_p = _ks_test_uniform(cont_pit)
+    bin_ks, bin_p = _ks_test_uniform(bin_pit)
+    cat_ks, cat_p = _ks_test_uniform(cat_pit)
+
+    results = {
+        "status": "ok",
+        "sets_evaluated": processed,
+        "continuous": {
+            "count": len(cont_pit),
+            "ks_stat": cont_ks,
+            "ks_pvalue": cont_p,
+            "nll_mean": float(np.mean(cont_nll)) if cont_nll else float("nan"),
+            "pit_quantiles": np.quantile(cont_pit, [0.1, 0.25, 0.5, 0.75, 0.9]).tolist() if len(cont_pit) >= 5 else [],
+            "coverage": cont_coverage,
+        },
+        "binary": {
+            "count": len(bin_probs),
+            "ks_stat": bin_ks,
+            "ks_pvalue": bin_p,
+            "nll_mean": float(np.mean(bin_nll)) if bin_nll else float("nan"),
+            "ece": _expected_calibration_error(bin_pred_conf, bin_pred_correct) if bin_pred_conf else float("nan"),
+        },
+        "categorical": {
+            "count": len(cat_true_prob),
+            "ks_stat": cat_ks,
+            "ks_pvalue": cat_p,
+            "nll_mean": float(np.mean(cat_nll)) if cat_nll else float("nan"),
+            "ece": _expected_calibration_error(cat_pred_conf, cat_pred_correct) if cat_pred_conf else float("nan"),
+        },
+    }
+
+    return results
+
+
 def evaluate_reconstruction_setlevel(*args, **kwargs) -> Tuple[Dict[str, Any], List[str]]:
     return {
         "status": "TODO",
@@ -605,6 +1104,9 @@ class EvalConfig:
     n_z_samples: int
     save_dir: Path
     device: torch.device
+    info_top_k: int
+    info_max_sets: int
+    consistency_max_sets: int
 
 
 def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
@@ -618,6 +1120,9 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
         n_z_samples=args.n_z_samples,
         save_dir=Path(args.save_dir),
         device=device,
+        info_top_k=args.info_top_k,
+        info_max_sets=args.info_max_sets,
+        consistency_max_sets=args.consistency_max_sets,
     )
 
 
@@ -651,6 +1156,23 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
     # Section 2: information distribution
     metrics["latent_information_distribution"] = evaluate_information_distribution(metrics["posterior_health"])
 
+    # Section 3: information gain monotonicity
+    metrics["information_gain_monotonicity"] = evaluate_information_gain_monotonicity(
+        model,
+        batches,
+        device=cfg.device,
+        top_k=cfg.info_top_k,
+        max_sets=cfg.info_max_sets,
+    )
+
+    # Section 4: intra-set self consistency
+    metrics["intraset_self_consistency"] = evaluate_intraset_self_consistency(
+        model,
+        batches,
+        device=cfg.device,
+        max_sets=cfg.consistency_max_sets,
+    )
+
     # Placeholder evaluations for sections 3-8
     metrics["set_reconstruction"] = {"status": "pending"}
     per_scenario_feature_metrics: Dict[str, Any] = {}
@@ -679,6 +1201,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=17)
     ap.add_argument("--n_z_samples", type=int, default=1)
     ap.add_argument("--save_dir", default="./eval_outputs", help="Directory to write metrics & plots")
+    ap.add_argument("--info_top_k", type=int, default=20, help="Top-k variables to evaluate in information gain monotonicity")
+    ap.add_argument("--info_max_sets", type=int, default=128, help="Maximum number of sets sampled for information gain analysis")
+    ap.add_argument("--consistency_max_sets", type=int, default=128, help="Maximum sets sampled for intra-set consistency analysis")
     ap.add_argument("--log_level", default="INFO")
     return ap.parse_args(argv)
 
