@@ -39,11 +39,9 @@ except Exception:  # pragma: no cover - optional
 try:
     from sklearn.decomposition import PCA  # type: ignore
     from sklearn.preprocessing import StandardScaler  # type: ignore
-    from sklearn.neighbors import NearestNeighbors  # type: ignore
 except Exception:  # pragma: no cover - optional
     PCA = None  # type: ignore
     StandardScaler = None  # type: ignore
-    NearestNeighbors = None  # type: ignore
 try:
     import umap  # type: ignore
 except Exception:  # pragma: no cover - optional
@@ -257,65 +255,134 @@ def _to_numpy(t: torch.Tensor) -> np.ndarray:
     return t.detach().cpu().numpy()
 
 
-def _nn_from_a_to_b(a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    if NearestNeighbors is None or len(b) == 0:
-        return np.array([]), np.array([])
-    nn = NearestNeighbors(n_neighbors=1, metric="euclidean").fit(b)
-    dists, idxs = nn.kneighbors(a)
-    return dists.squeeze(1), idxs.squeeze(1)
-
-
-def compute_recon_metrics(orig: np.ndarray, recon: np.ndarray) -> Dict[str, float]:
-    metrics: Dict[str, float] = {}
-    if orig.size == 0 or recon.size == 0:
-        return {"error": 1.0}
-    d_ro, _ = _nn_from_a_to_b(recon, orig)
-    d_or, _ = _nn_from_a_to_b(orig, recon)
-    if d_ro.size == 0 or d_or.size == 0:
-        return {"error": 1.0}
-    chamfer = float(np.mean(d_ro**2) + np.mean(d_or**2)) / 2.0
-    metrics["chamfer_l2_mean"] = chamfer
-    metrics.update(
-        {
-            "nn_l2_mean": float(np.mean(d_ro)),
-            "nn_l2_median": float(np.median(d_ro)),
-            "nn_l2_p95": float(np.percentile(d_ro, 95)),
+@torch.no_grad()
+def _sinkhorn_alignment_metrics(
+    model: torch.nn.Module,
+    orig_np: np.ndarray,
+    recon_np: np.ndarray,
+) -> Dict[str, float]:
+    device = next(model.parameters()).device
+    if orig_np.size == 0 or recon_np.size == 0:
+        return {
+            "sinkhorn_cost": float("nan"),
+            "sinkhorn_dir_component": float("nan"),
+            "sinkhorn_mag_component": float("nan"),
+            "sinkhorn_vec_component": float("nan"),
+            "dir_similarity": float("nan"),
+            "mag_l1": float("nan"),
+            "vec_rmse": float("nan"),
+            "alignment_entropy": float("nan"),
+            "row_max_mean": float("nan"),
+            "col_max_mean": float("nan"),
+            "scale_ratio": float("nan"),
+            "mean_norm_orig": float("nan"),
+            "mean_norm_recon": float("nan"),
+            "token_count": 0,
         }
-    )
-    def _norm(x):
-        return np.linalg.norm(x, axis=1, keepdims=True) + 1e-8
-    u_recon = recon / _norm(recon)
-    u_orig = orig / _norm(orig)
-    _, idx_ro = _nn_from_a_to_b(recon, orig)
-    if idx_ro.size > 0:
-        paired_orig = u_orig[idx_ro]
-        cos_sim = np.sum(u_recon * paired_orig, axis=1)
-        metrics["dir_cosine_mean"] = float(np.mean(cos_sim))
-        metrics["dir_cosine_median"] = float(np.median(cos_sim))
-    norm_recon = np.linalg.norm(recon, axis=1)
-    norm_orig = np.linalg.norm(orig, axis=1)
-    if idx_ro.size > 0:
-        norm_orig_matched = norm_orig[idx_ro]
-        metrics["mag_mae"] = float(np.mean(np.abs(norm_recon - norm_orig_matched)))
-        metrics["mag_rmse"] = float(
-            np.sqrt(np.mean((norm_recon - norm_orig_matched) ** 2))
-        )
-        try:
-            if np.std(norm_recon) > 1e-8 and np.std(norm_orig_matched) > 1e-8:
-                metrics["mag_corr"] = float(
-                    np.corrcoef(norm_recon, norm_orig_matched)[0, 1]
-                )
-        except Exception:
-            pass
-    metrics["scale_ratio"] = float(
-        (np.mean(norm_recon) + 1e-8) / (np.mean(norm_orig) + 1e-8)
-    )
-    for th in [0.25, 0.5, 1.0, 2.0]:
-        metrics[f"coverage@{th}"] = float(np.mean(d_ro <= th))
-    metrics["orig_norm_mean"] = float(np.mean(norm_orig))
-    metrics["recon_norm_mean"] = float(np.mean(norm_recon))
-    metrics["orig_norm_std"] = float(np.std(norm_orig))
-    metrics["recon_norm_std"] = float(np.std(norm_recon))
+
+    orig_t = torch.from_numpy(np.asarray(orig_np, dtype=np.float32)).to(device)
+    recon_t = torch.from_numpy(np.asarray(recon_np, dtype=np.float32)).to(device)
+    if orig_t.dim() == 2:
+        orig_t = orig_t.unsqueeze(0)
+    if recon_t.dim() == 2:
+        recon_t = recon_t.unsqueeze(0)
+
+    N = min(orig_t.size(1), recon_t.size(1))
+    if N == 0:
+        return {
+            "sinkhorn_cost": float("nan"),
+            "sinkhorn_dir_component": float("nan"),
+            "sinkhorn_mag_component": float("nan"),
+            "sinkhorn_vec_component": float("nan"),
+            "dir_similarity": float("nan"),
+            "mag_l1": float("nan"),
+            "vec_rmse": float("nan"),
+            "alignment_entropy": float("nan"),
+            "row_max_mean": float("nan"),
+            "col_max_mean": float("nan"),
+            "scale_ratio": float("nan"),
+            "mean_norm_orig": float("nan"),
+            "mean_norm_recon": float("nan"),
+            "token_count": 0,
+        }
+
+    if orig_t.size(1) != recon_t.size(1):
+        orig_t = orig_t[:, :N, :]
+        recon_t = recon_t[:, :N, :]
+
+    epsilon = 1e-8
+    orig_norm = torch.norm(orig_t, dim=-1, keepdim=True)
+    recon_norm = torch.norm(recon_t, dim=-1, keepdim=True)
+    orig_unit = orig_t / (orig_norm + epsilon)
+    recon_unit = recon_t / (recon_norm + epsilon)
+
+    sim = torch.bmm(recon_unit, orig_unit.transpose(1, 2)).abs()
+    c_dir = 1.0 - sim
+    mag_recon = recon_norm.squeeze(-1)
+    mag_orig = orig_norm.squeeze(-1)
+    c_mag = (mag_recon.unsqueeze(-1) - mag_orig.unsqueeze(1)).abs()
+    r_exp = recon_t.unsqueeze(2)
+    t_exp = orig_t.unsqueeze(1)
+    d_pos = ((r_exp - t_exp) ** 2).sum(dim=-1)
+    d_neg = ((r_exp + t_exp) ** 2).sum(dim=-1)
+    c_vec = torch.minimum(d_pos, d_neg)
+
+    alpha = float(getattr(model, "recon_alpha", 1.0))
+    beta = float(getattr(model, "recon_beta", 1.0))
+    gamma = float(getattr(model, "recon_gamma", 3.0))
+    sinkhorn_eps = float(getattr(model, "sinkhorn_eps", 0.1) or 0.1)
+    sinkhorn_iters = int(getattr(model, "sinkhorn_iters", 100))
+
+    C = alpha * c_dir + beta * c_mag + gamma * c_vec
+    K = torch.exp(-C / max(1e-6, sinkhorn_eps)).clamp_min(1e-12)
+    B, N, _ = C.shape
+    a = torch.full((B, N), 1.0 / float(N), device=C.device, dtype=C.dtype)
+    b = torch.full((B, N), 1.0 / float(N), device=C.device, dtype=C.dtype)
+    u = torch.ones_like(a)
+    v = torch.ones_like(b)
+    for _ in range(sinkhorn_iters):
+        Kv = torch.bmm(K, v.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
+        u = a / Kv
+        Ktu = torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
+        v = b / Ktu
+    P = u.unsqueeze(-1) * K * v.unsqueeze(-2)
+    plan = P / P.sum(dim=(1, 2), keepdim=True).clamp_min(1e-12)
+
+    sinkhorn_cost = (plan * C).sum(dim=(1, 2))
+    dir_cost = (plan * c_dir).sum(dim=(1, 2))
+    mag_cost = (plan * c_mag).sum(dim=(1, 2))
+    vec_cost = (plan * c_vec).sum(dim=(1, 2))
+    dir_similarity = (plan * (1.0 - c_dir)).sum(dim=(1, 2))
+    entropy = -(plan * torch.log(plan + 1e-12)).sum(dim=(1, 2))
+    row_max = plan.max(dim=-1)[0].mean(dim=1)
+    col_max = plan.max(dim=-2)[0].mean(dim=1)
+
+    scale_ratio = (recon_norm.mean(dim=(1, 2)) + 1e-8) / (orig_norm.mean(dim=(1, 2)) + 1e-8)
+
+    return {
+        "sinkhorn_cost": float(sinkhorn_cost.mean().detach().cpu().item()),
+        "sinkhorn_dir_component": float((alpha * dir_cost).mean().detach().cpu().item()),
+        "sinkhorn_mag_component": float((beta * mag_cost).mean().detach().cpu().item()),
+        "sinkhorn_vec_component": float((gamma * vec_cost).mean().detach().cpu().item()),
+        "dir_similarity": float(dir_similarity.mean().detach().cpu().item()),
+        "mag_l1": float(mag_cost.mean().detach().cpu().item()),
+        "vec_rmse": float(torch.sqrt(vec_cost.mean() + 1e-12).detach().cpu().item()),
+        "alignment_entropy": float(entropy.mean().detach().cpu().item()),
+        "row_max_mean": float(row_max.mean().detach().cpu().item()),
+        "col_max_mean": float(col_max.mean().detach().cpu().item()),
+        "scale_ratio": float(scale_ratio.mean().detach().cpu().item()),
+        "mean_norm_orig": float(orig_norm.mean().detach().cpu().item()),
+        "mean_norm_recon": float(recon_norm.mean().detach().cpu().item()),
+        "token_count": int(N),
+    }
+
+
+def compute_recon_metrics(
+    model: torch.nn.Module,
+    orig: np.ndarray,
+    recon: np.ndarray,
+) -> Dict[str, float]:
+    metrics = _sinkhorn_alignment_metrics(model, orig, recon)
     return metrics
 
 
@@ -1028,7 +1095,7 @@ def _w2_diag(mu1: torch.Tensor, logvar1: torch.Tensor, mu2: torch.Tensor, logvar
 def _poe_combine_diag(
     mu_a: torch.Tensor, logvar_a: torch.Tensor, mu_b: torch.Tensor, logvar_b: torch.Tensor, prior_prec: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Combine two posteriors approximately: q_AB ∝ q_A * q_B / p, with p=N(0,I)
+    # Combine two posteriors approximately: q_AB ? q_A * q_B / p, with p=N(0,I)
     var_a = logvar_a.exp().clamp(min=1e-8)
     var_b = logvar_b.exp().clamp(min=1e-8)
     prec_a = 1.0 / var_a
@@ -1826,7 +1893,7 @@ def _run_named_recon_print(model: torch.nn.Module, args):
         dim_red = getattr(encoder, "dim_reducer", None)
         if dim_red is not None and hasattr(dim_red, "weight") and dim_red.weight is not None:
             # dim_reducer: y = W x + b, W shape [R, D]. To lift y->x_hat in original D,
-            # use x_hat ≈ (pinv(W)) y  (we implement as (y - b) @ (pinv(W))^T).
+            # use x_hat ? (pinv(W)) y  (we implement as (y - b) @ (pinv(W))^T).
             W = dim_red.weight  # [R, D]
             lift_A = torch.linalg.pinv(W).t().contiguous().to(device)  # (pinv(W))^T => [R, D]
             lift_b = (dim_red.bias.to(device) if getattr(dim_red, "bias", None) is not None else None)
@@ -2177,7 +2244,7 @@ def _run_var_scale_audit(model: torch.nn.Module, args):
             sizes = np.sqrt(df_var["count"].to_numpy(dtype=float)).clip(min=1.0) * 2.0
             fig, ax = plt.subplots(figsize=(7, 5))
             ax.scatter(x, y, s=sizes, alpha=0.65, c="tab:blue")
-            ax.set_xlabel(f"Prop(|val| ≤ {small_thr})")
+            ax.set_xlabel(f"Prop(|val| ? {small_thr})")
             ax.set_ylabel("Mean scale ratio (recon/|val|)")
             ax.set_title(f"Var-scale audit ({part} set)")
             ax.grid(True, alpha=0.3)
@@ -2235,7 +2302,7 @@ def _run_pretrain_eval():
     ap.add_argument("--collapse_var_tol", type=float, default=0.05, help="Dim considered collapsed if |mean var - 1| below this tolerance")
     ap.add_argument("--seed", type=int, default=42)
     # Named recon options
-    ap.add_argument("--named_recon", type=str, choices=["off", "set", "global"], default="off")
+    ap.add_argument("--named_recon", type=str, choices=["off", "set", "global"], default="global")
     ap.add_argument("--num_named_samples", type=int, default=10)
     ap.add_argument("--patient_index", type=int, default=None)
     ap.add_argument("--set_index", type=int, default=None)
@@ -2263,7 +2330,7 @@ def _run_pretrain_eval():
     # Mask consistency (enabled by default; add --no_eval_mask_consistency to disable)
     ap.add_argument("--eval_mask_consistency", dest="eval_mask_consistency", action="store_true", help="Evaluate latent consistency across different measurement masks")
     ap.add_argument("--no_eval_mask_consistency", dest="eval_mask_consistency", action="store_false", help="Disable mask consistency evaluation")
-    ap.set_defaults(eval_mask_consistency=True)
+    ap.set_defaults(eval_mask_consistency=False)
     ap.add_argument("--mask_ratios", type=float, nargs="*", default=[0.3, 0.5, 0.7], help="Mask ratios to test (fraction of tokens per subset)")
     ap.add_argument("--consistency_num_sets", type=int, default=200, help="#sets to sample for consistency eval")
     ap.add_argument("--consistency_repeats", type=int, default=3, help="Repeats per ratio per set")
@@ -2271,7 +2338,7 @@ def _run_pretrain_eval():
     # OOD scramble (enabled by default; add --no_eval_ood_scramble to disable)
     ap.add_argument("--eval_ood_scramble", dest="eval_ood_scramble", action="store_true", help="Evaluate outlier detection by scrambling values within sets")
     ap.add_argument("--no_eval_ood_scramble", dest="eval_ood_scramble", action="store_false", help="Disable OOD scramble evaluation")
-    ap.set_defaults(eval_ood_scramble=True)
+    ap.set_defaults(eval_ood_scramble=False)
     ap.add_argument("--ood_num_sets", type=int, default=200, help="#sets to sample for OOD scramble eval")
     ap.add_argument(
         "--ood_scheme",
@@ -2284,7 +2351,7 @@ def _run_pretrain_eval():
     ap.add_argument(
         "--plot_per_set_mask_curves",
         action="store_true",
-        default=True,
+        default=False,
         help="Plot consistency curves for randomly sampled sets under progressive masking",
     )
     ap.add_argument(
@@ -2392,10 +2459,10 @@ def _run_pretrain_eval():
     mu_std = moments["mu_std"]
     var_mean = moments["var_mean"]
     var_std = moments["var_std"]
-    _plot_hist_generic(mu_abs_mean, "Mean |μ| per dimension", os.path.join(args.output_dir, "mu_abs_mean_hist.png"), "mean |μ|")
-    _plot_hist_generic(var_mean, "Mean σ² per dimension", os.path.join(args.output_dir, "var_mean_hist.png"), "mean σ²")
-    _plot_scatter_generic(mu_abs_mean, np.abs(var_mean - 1.0), "|μ| vs |σ²-1| per-dimension", os.path.join(args.output_dir, "muabs_vs_varminus1_scatter.png"), "mean |μ|", "|mean σ² - 1|")
-    _plot_bar_topk(mu_abs_mean, args.topk_plot, title="Top-K mean |μ| per-dimension", out_file=os.path.join(args.output_dir, "mu_abs_topk.png"), ylabel="mean |μ|")
+    _plot_hist_generic(mu_abs_mean, "Mean |?| per dimension", os.path.join(args.output_dir, "mu_abs_mean_hist.png"), "mean |?|")
+    _plot_hist_generic(var_mean, "Mean ?? per dimension", os.path.join(args.output_dir, "var_mean_hist.png"), "mean ??")
+    _plot_scatter_generic(mu_abs_mean, np.abs(var_mean - 1.0), "|?| vs |??-1| per-dimension", os.path.join(args.output_dir, "muabs_vs_varminus1_scatter.png"), "mean |?|", "|mean ?? - 1|")
+    _plot_bar_topk(mu_abs_mean, args.topk_plot, title="Top-K mean |?| per-dimension", out_file=os.path.join(args.output_dir, "mu_abs_topk.png"), ylabel="mean |?|")
 
     collapsed_mask = (
         (kl_dim < args.collapse_kl_thresh)
@@ -2427,13 +2494,13 @@ def _run_pretrain_eval():
         mu_mat, var_mat = collect_mu_var_heatmaps(model, batch)
         _plot_heatmap(
             mu_mat,
-            title=f"Sample {i} - μ across sets",
+            title=f"Sample {i} - ? across sets",
             out_file=os.path.join(args.output_dir, f"heatmap_mu_sample_{i}.png"),
             value_type="mean",
         )
         _plot_heatmap(
             var_mat,
-            title=f"Sample {i} - σ² across sets",
+            title=f"Sample {i} - ?? across sets",
             out_file=os.path.join(args.output_dir, f"heatmap_var_sample_{i}.png"),
             value_type="var",
         )
@@ -2445,7 +2512,7 @@ def _run_pretrain_eval():
                 args.output_dir, f"overlay_orig_recon_sample_{i}.png"
             ),
         )
-        metrics = compute_recon_metrics(orig, recon)
+        metrics = compute_recon_metrics(model, orig, recon)
         kd = compute_kl_dim_stats_for_batch(model, batch)
         kd_np = kd.detach().cpu().numpy().astype(np.float32)
         metrics["kl_total"] = float(kd_np.sum())
@@ -2454,27 +2521,40 @@ def _run_pretrain_eval():
         recon_results.append(metrics)
         vis_count += 1
 
-    def _agg(key: str) -> float:
+    def _stats(key: str) -> Dict[str, float]:
         vals = [
             r[key]
             for r in recon_results
             if key in r and isinstance(r[key], (int, float)) and math.isfinite(r[key])
         ]
-        return float(np.mean(vals)) if vals else float("nan")
+        if not vals:
+            return {"mean": float("nan"), "median": float("nan"), "p10": float("nan"), "p90": float("nan")}
+        arr = np.asarray(vals, dtype=np.float32)
+        return {
+            "mean": float(np.mean(arr)),
+            "median": float(np.median(arr)),
+            "p10": float(np.percentile(arr, 10)),
+            "p90": float(np.percentile(arr, 90)),
+        }
 
     recon_summary = {
         "num_samples": vis_count,
-        "nn_l2_mean": _agg("nn_l2_mean"),
-        "nn_l2_median": _agg("nn_l2_median"),
-        "nn_l2_p95": _agg("nn_l2_p95"),
-        "dir_cosine_mean": _agg("dir_cosine_mean"),
-        "mag_mae": _agg("mag_mae"),
-        "mag_rmse": _agg("mag_rmse"),
-        "mag_corr": _agg("mag_corr"),
-        "scale_ratio": _agg("scale_ratio"),
-        "chamfer_l2_mean": _agg("chamfer_l2_mean"),
-        "kl_total_mean": _agg("kl_total"),
-        "active_ratio_mean": _agg("active_ratio"),
+        "total_tokens": int(sum(int(r.get("token_count", 0)) for r in recon_results)),
+        "metrics": {
+            "sinkhorn_cost": _stats("sinkhorn_cost"),
+            "sinkhorn_dir_component": _stats("sinkhorn_dir_component"),
+            "sinkhorn_mag_component": _stats("sinkhorn_mag_component"),
+            "sinkhorn_vec_component": _stats("sinkhorn_vec_component"),
+            "dir_similarity": _stats("dir_similarity"),
+            "mag_l1": _stats("mag_l1"),
+            "vec_rmse": _stats("vec_rmse"),
+            "scale_ratio": _stats("scale_ratio"),
+            "alignment_entropy": _stats("alignment_entropy"),
+            "row_max_mean": _stats("row_max_mean"),
+            "col_max_mean": _stats("col_max_mean"),
+            "kl_total": _stats("kl_total"),
+            "active_ratio": _stats("active_ratio"),
+        },
     }
 
     def _corr(a_key: str, b_key: str) -> float:
@@ -2500,11 +2580,10 @@ def _run_pretrain_eval():
         return c
 
     sample_correlations = {
-        "kl_total_vs_nn_l2_mean": _corr("kl_total", "nn_l2_mean"),
-        "kl_total_vs_chamfer_l2_mean": _corr("kl_total", "chamfer_l2_mean"),
-        "kl_total_vs_dir_cosine_mean": _corr("kl_total", "dir_cosine_mean"),
-        "kl_total_vs_mag_mae": _corr("kl_total", "mag_mae"),
-        "kl_total_vs_mag_rmse": _corr("kl_total", "mag_rmse"),
+        "kl_total_vs_sinkhorn_cost": _corr("kl_total", "sinkhorn_cost"),
+        "kl_total_vs_dir_similarity": _corr("kl_total", "dir_similarity"),
+        "kl_total_vs_mag_l1": _corr("kl_total", "mag_l1"),
+        "kl_total_vs_vec_rmse": _corr("kl_total", "vec_rmse"),
     }
 
     # Optional: probabilistic head likelihood metrics
@@ -2624,65 +2703,104 @@ def _run_pretrain_eval():
             print(f"[WARN] per-set masking curves plotting failed: {e}")
 
     ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
-    report = {
-        "checkpoint": args.checkpoint,
-        "ckpt_type": ckpt_type,
-        "split": args.split,
-        "active_threshold": args.active_threshold,
-        "active_thresholds": args.active_thresholds,
-        "latent_dim": int(getattr(model, "latent_dim", len(kl_dim))),
-        "prob_head": {
-            "enabled": bool(getattr(model, "enable_prob_head", False) and getattr(model, "prob_shared", None) is not None),
-            "num_features": int(getattr(model, "num_features", 0) or 0),
-            "likelihood": prob_head_metrics,
-        },
-        "kl": {
-            "mean_per_dim": kl_dim.tolist(),
-            "total_kl": total_kl,
-            "active_ratio": active_ratio,
-            "active_ratios": active_ratios_multi,
-            "dim90": dim90,
-            "dim95": dim95,
-            "effective_dimensions": eff_dims,
-        },
-        "posterior_moments": {
-            "mu_abs_mean": mu_abs_mean.tolist(),
-            "mu_mean": mu_mean.tolist(),
-            "mu_std": mu_std.tolist(),
-            "var_mean": var_mean.tolist(),
-            "var_std": var_std.tolist(),
-            "mu_abs_mean_stats": {
+
+    kl_stats = {
+        "total": total_kl,
+        "mean": float(np.mean(kl_dim)) if kl_dim.size > 0 else 0.0,
+        "median": float(np.median(kl_dim)) if kl_dim.size > 0 else 0.0,
+        "p90": float(np.percentile(kl_dim, 90)) if kl_dim.size > 0 else 0.0,
+        "p99": float(np.percentile(kl_dim, 99)) if kl_dim.size > 0 else 0.0,
+        "dim90": dim90,
+        "dim95": dim95,
+    }
+
+    posterior_stats = {
+        "mu_abs_mean": mu_abs_mean.tolist(),
+        "mu_mean": mu_mean.tolist(),
+        "mu_std": mu_std.tolist(),
+        "var_mean": var_mean.tolist(),
+        "var_std": var_std.tolist(),
+        "summary": {
+            "mu_abs_mean": {
                 "mean": float(np.mean(mu_abs_mean)) if mu_abs_mean.size > 0 else 0.0,
                 "median": float(np.median(mu_abs_mean)) if mu_abs_mean.size > 0 else 0.0,
                 "p95": float(np.percentile(mu_abs_mean, 95)) if mu_abs_mean.size > 0 else 0.0,
             },
-            "var_mean_stats": {
+            "var_mean": {
                 "mean": float(np.mean(var_mean)) if var_mean.size > 0 else 0.0,
                 "median": float(np.median(var_mean)) if var_mean.size > 0 else 0.0,
                 "p95_abs_var_minus_1": float(np.percentile(np.abs(var_mean - 1.0), 95)) if var_mean.size > 0 else 0.0,
             },
         },
-        "reconstruction": {
-            "summary": recon_summary,
-            "details": recon_results,
+    }
+
+    collapse_section = {
+        "criteria": {
+            "kl_thresh": args.collapse_kl_thresh,
+            "mu_abs_thresh": args.collapse_mu_abs_thresh,
+            "var_tol": args.collapse_var_tol,
         },
-        "collapsed_dims": {
-            "criteria": {
-                "kl_thresh": args.collapse_kl_thresh,
-                "mu_abs_thresh": args.collapse_mu_abs_thresh,
-                "var_tol": args.collapse_var_tol,
-            },
-            "count": collapsed_count,
-            "indices": collapsed_indices,
-        },
-        "sample_correlations": sample_correlations,
-        "collapse_flags": {
+        "count": collapsed_count,
+        "indices": collapsed_indices,
+        "flags": {
             "kl_active_ratio_below_0.1": active_ratio < 0.1,
             "total_kl_below_1e-2": total_kl < 1e-2,
             "risk": (active_ratio < 0.1) or (total_kl < 1e-2),
         },
-        "consistency_ood": extra_evals,
     }
+
+    latent_distribution = {
+        "latent_dim": int(getattr(model, "latent_dim", len(kl_dim))),
+        "kl_per_dimension": kl_dim.tolist(),
+        "kl_stats": kl_stats,
+        "active_ratio": active_ratio,
+        "active_ratios": active_ratios_multi,
+        "effective_dimensions": eff_dims,
+        "posterior_stats": posterior_stats,
+        "collapse": collapse_section,
+    }
+
+    prob_head_section = {
+        "enabled": bool(getattr(model, "enable_prob_head", False) and getattr(model, "prob_shared", None) is not None),
+        "num_features": int(getattr(model, "num_features", 0) or 0),
+        "likelihood": prob_head_metrics,
+    }
+
+    reconstruction_section = {
+        "visualized_samples": {
+            "requested": int(getattr(args, "num_vis_samples", 0)),
+            "generated": vis_count,
+            "recon_from": getattr(args, "recon_from", "auto"),
+        },
+        "sinkhorn_summary": recon_summary,
+        "per_sample_metrics": recon_results,
+        "probabilistic_head": prob_head_section,
+        "kl_vs_recon_correlations": sample_correlations,
+    }
+
+    if extra_evals:
+        reconstruction_section["additional_checks"] = extra_evals
+
+    report = {
+        "meta": {
+            "checkpoint": args.checkpoint,
+            "ckpt_type": ckpt_type,
+            "split": args.split,
+            "active_threshold": args.active_threshold,
+            "active_thresholds": args.active_thresholds,
+        },
+        "latent_distribution": latent_distribution,
+        "reconstruction": reconstruction_section,
+    }
+
+    if getattr(args, "named_recon", "off") != "off":
+        report["named_reconstruction"] = {
+            "mode": getattr(args, "named_recon", "off"),
+            "num_samples": int(getattr(args, "num_named_samples", 0)),
+            "match_space": getattr(args, "match_space", "auto"),
+            "stats_csv": getattr(args, "stats_csv", ""),
+            "event_emb_csv": getattr(args, "event_emb_csv", ""),
+        }
     out_json = os.path.join(args.output_dir, f"pretrain_eval_{ts}.json")
     with open(out_json, "w") as f:
         json.dump(report, f, indent=2)
