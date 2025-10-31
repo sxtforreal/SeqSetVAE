@@ -718,25 +718,28 @@ def build_data_cache(
                 batch_dev.get("carry_mask"),
             )
 
-        for local_idx, s in enumerate(patient_sets):
-            uid = f"set_{batch_idx:04d}_{local_idx:03d}"
-            with torch.no_grad():
-                mu, logvar = _encode_set_latent(model, s)
-                v_norm, target = model._compute_target(s)
-            cpu_tensors = {
-                key: tensor.detach().cpu() if torch.is_tensor(tensor) else tensor
-                for key, tensor in s.items()
-            }
-            sample = SetSample(
-                uid=uid,
-                tensors=cpu_tensors,
-                target=target.detach().cpu(),
-                v_norm=v_norm.detach().cpu(),
-                mu=mu.detach().cpu(),
-                logvar=logvar.detach().cpu(),
-                size=int(cpu_tensors["var"].shape[1]) if "var" in cpu_tensors else 0,
-            )
-            sets.append(sample)
+        local_counter = 0
+        for patient_samples in patient_sets:
+            for s in patient_samples:
+                uid = f"set_{batch_idx:04d}_{local_counter:03d}"
+                with torch.no_grad():
+                    mu, logvar = _encode_set_latent(model, s)
+                    v_norm, target = model._compute_target(s)
+                cpu_tensors = {
+                    key: tensor.detach().cpu() if torch.is_tensor(tensor) else tensor
+                    for key, tensor in s.items()
+                }
+                sample = SetSample(
+                    uid=uid,
+                    tensors=cpu_tensors,
+                    target=target.detach().cpu(),
+                    v_norm=v_norm.detach().cpu(),
+                    mu=mu.detach().cpu(),
+                    logvar=logvar.detach().cpu(),
+                    size=int(cpu_tensors["var"].shape[1]) if "var" in cpu_tensors else 0,
+                )
+                sets.append(sample)
+                local_counter += 1
 
     cache = DataCache(
         batches=list(batches),
