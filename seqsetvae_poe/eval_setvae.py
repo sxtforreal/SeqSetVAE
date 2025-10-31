@@ -17,6 +17,7 @@ import logging
 import math
 import random
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -48,6 +49,22 @@ ROBUST_DEFAULT_MODES = [
     "head_sinkhorn_only",
     "head_prob_only",
 ]
+
+
+try:
+    from torch.cuda.amp import autocast as _torch_autocast
+except Exception:  # pragma: no cover
+    @contextmanager
+    def _amp_autocast():
+        yield
+else:
+    @contextmanager
+    def _amp_autocast():
+        if torch.cuda.is_available():
+            with _torch_autocast():
+                yield
+        else:
+            yield
 
 
 def _setup_logging(level: str = "INFO") -> None:
@@ -114,6 +131,7 @@ class SetSample:
     mu: torch.Tensor
     logvar: torch.Tensor
     size: int
+    head_cache: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]] = field(default=None)
 
 
 @dataclass
@@ -164,6 +182,17 @@ class EvalConfig:
     save_raw: bool
     compare_ckpts: List[str]
     robust_modes: List[str]
+    tier: str
+    eval_sinkhorn: bool
+    eval_probes: bool
+    eval_active: bool
+    eval_ig: bool
+    eval_prior: bool
+    eval_subsystems: bool
+    eval_robustness: bool
+    mc_samples: int
+    intra_samples: int
+    active_topk: int
 
 
 # ---------------------------------------------------------------------------
@@ -388,14 +417,15 @@ def _clone_set_to_device(sample: SetSample, device: torch.device, indices: Optio
 
 
 def _encode_set_latent(model: torch.nn.Module, s: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    v_norm, _ = model._compute_target(s)
-    if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
-        x_input = model._build_token_inputs(v_norm, s)
-    else:
-        x_input = v_norm * s["val"]
-    z_list, _ = model.set_encoder.encode(x_input)
-    mu = z_list[-1][1].squeeze(1)
-    logvar = z_list[-1][2].squeeze(1)
+    with _amp_autocast():
+        v_norm, _ = model._compute_target(s)
+        if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
+            x_input = model._build_token_inputs(v_norm, s)
+        else:
+            x_input = v_norm * s["val"]
+        z_list, _ = model.set_encoder.encode(x_input)
+        mu = z_list[-1][1].squeeze(1)
+        logvar = z_list[-1][2].squeeze(1)
     return mu, logvar
 
 
@@ -839,6 +869,30 @@ def _aggregate_feature_targets(sample: SetSample, feature_types: torch.Tensor) -
     return cont, binaria, categorical
 
 
+def _get_head_outputs(
+    model: torch.nn.Module,
+    sample: SetSample,
+    device: torch.device,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+    if sample.head_cache is not None:
+        cached: List[Optional[torch.Tensor]] = []
+        for item in sample.head_cache:
+            if item is None:
+                cached.append(None)
+            else:
+                cached.append(item.to(device))
+        return tuple(cached)  # type: ignore[return-value]
+
+    z_mu = sample.mu.to(device)
+    head = _predict_head_outputs(model, z_mu)
+    if head is None:
+        sample.head_cache = None
+        return None
+    cached = tuple(t.detach().cpu() if t is not None else None for t in head)
+    sample.head_cache = cached
+    return _get_head_outputs(model, sample, device)
+
+
 # ---------------------------------------------------------------------------
 # Evaluation modules
 # ---------------------------------------------------------------------------
@@ -955,6 +1009,7 @@ def evaluate_latent_information_distribution(
     cache: DataCache,
     posterior_metrics: Mapping[str, Any],
     cfg: EvalConfig,
+    run_probes: bool = True,
 ) -> Dict[str, Any]:
     save_dir = _ensure_dir(cfg.save_dir / "info_dist")
     probe_dir = _ensure_dir(save_dir / "probe")
@@ -969,127 +1024,139 @@ def evaluate_latent_information_distribution(
     _write_json(save_dir / "gini.json", {"entropy": entropy, "entropy_norm": entropy / max_entropy if max_entropy > 0 else float("nan"), "gini": gini})
     pd.DataFrame({"dim": np.arange(len(p)), "kl_share": p}).to_csv(save_dir / "kl_share.csv", index=False)
 
-    latents = cache.latent_matrix
-    feature_types = cache.feature_types
-    cont_targets = []
-    bin_targets = []
-    cat_targets = []
-    for sample in cache.sets:
-        cont, binaria, categorical = _aggregate_feature_targets(sample, feature_types)
-        cont_targets.append(cont)
-        bin_targets.append(binaria)
-        cat_targets.append(categorical)
-    cont_targets = np.stack(cont_targets, axis=0)
-    bin_targets = np.stack(bin_targets, axis=0)
-    cat_targets = np.stack(cat_targets, axis=0)
+    probe_metrics = {
+        "ridge_r2_mean": float("nan"),
+        "binary_auc_mean": float("nan"),
+        "multiclass_f1_mean": float("nan"),
+    }
 
-    num_features = int(feature_types.numel())
-    rng = np.random.default_rng(cfg.seed)
-    idx = np.arange(latents.shape[0])
-    rng.shuffle(idx)
-    split = max(1, int(0.8 * len(idx)))
-    train_idx = idx[:split]
-    test_idx = idx[split:]
-    if len(test_idx) == 0:
-        test_idx = train_idx
+    if run_probes:
+        latents = cache.latent_matrix
+        feature_types = cache.feature_types
+        cont_targets = []
+        bin_targets = []
+        cat_targets = []
+        for sample in select_random_sets(cache, min(cfg.sample_sets, 300), cfg.seed):
+            cont, binaria, categorical = _aggregate_feature_targets(sample, feature_types)
+            cont_targets.append(cont)
+            bin_targets.append(binaria)
+            cat_targets.append(categorical)
+        cont_targets = np.stack(cont_targets, axis=0)
+        bin_targets = np.stack(bin_targets, axis=0)
+        cat_targets = np.stack(cat_targets, axis=0)
 
-    feature_names = []
-    for schema_feat in load_schema(cfg.schema).features:
-        feature_names.append(schema_feat.name or f"feat_{schema_feat.feature_id}")
-    while len(feature_names) < num_features:
-        feature_names.append(f"feat_{len(feature_names)}")
+        num_features = int(feature_types.numel())
+        rng = np.random.default_rng(cfg.seed)
+        idx = np.arange(latents.shape[0])
+        rng.shuffle(idx)
+        split = max(1, int(0.8 * len(idx)))
+        train_idx = idx[:split]
+        test_idx = idx[split:]
+        if len(test_idx) == 0:
+            test_idx = train_idx
 
-    ridge_rows = []
-    auc_rows = []
-    f1_rows = []
+        feature_names = []
+        for schema_feat in load_schema(cfg.schema).features:
+            feature_names.append(schema_feat.name or f"feat_{schema_feat.feature_id}")
+        while len(feature_names) < num_features:
+            feature_names.append(f"feat_{len(feature_names)}")
 
-    X_train = latents[train_idx].numpy()
-    X_test = latents[test_idx].numpy()
-    alpha = 1e-3
-    I = np.eye(X_train.shape[1])
+        ridge_rows: List[Dict[str, Any]] = []
+        auc_rows: List[Dict[str, Any]] = []
+        f1_rows: List[Dict[str, Any]] = []
 
-    for fid in range(num_features):
-        tcode = int(feature_types[fid].item())
-        name = feature_names[fid] if fid < len(feature_names) else f"feat_{fid}"
-        if tcode == 0:
-            y_train = cont_targets[train_idx, fid]
-            y_test = cont_targets[test_idx, fid]
-            mask = np.isfinite(y_train) & np.isfinite(y_test)
-            if y_train[np.isfinite(y_train)].size < 3:
-                continue
-            A = X_train.T @ X_train + alpha * I
-            b = X_train.T @ y_train
-            w = np.linalg.solve(A, b)
-            y_pred = X_test @ w
-            ss_res = np.sum((y_pred - y_test) ** 2)
-            ss_tot = np.sum((y_test - np.mean(y_test)) ** 2) + EPS
-            r2 = 1 - ss_res / ss_tot
-            ridge_rows.append({"feature_id": fid, "name": name, "count": int(np.isfinite(y_test).sum()), "r2": float(r2)})
-        elif tcode == 1:
-            y_train = bin_targets[train_idx, fid]
-            y_test = bin_targets[test_idx, fid]
-            mask_train = np.isfinite(y_train)
-            mask_test = np.isfinite(y_test)
-            if mask_train.sum() < 5 or mask_test.sum() < 2:
-                continue
-            X_tr = torch.tensor(X_train[mask_train], dtype=torch.float32)
-            y_tr = torch.tensor(y_train[mask_train], dtype=torch.float32)
-            X_te = torch.tensor(X_test[mask_test], dtype=torch.float32)
-            y_te = torch.tensor(y_test[mask_test], dtype=torch.float32)
-            w = torch.zeros(X_tr.shape[1], requires_grad=True)
-            b = torch.zeros(1, requires_grad=True)
-            optimizer = torch.optim.Adam([w, b], lr=0.05)
-            pos_weight = torch.tensor([(len(y_tr) - y_tr.sum()) / (y_tr.sum() + EPS)])
-            for _ in range(200):
-                optimizer.zero_grad()
-                logits = X_tr @ w + b
-                loss = F.binary_cross_entropy_with_logits(logits, y_tr, pos_weight=pos_weight)
-                loss.backward()
-                optimizer.step()
-            probs = torch.sigmoid(X_te @ w + b).detach().cpu().numpy()
-            labels = y_te.cpu().numpy()
-            metrics = compute_binary_metrics(probs.tolist(), labels.tolist())
-            metrics.update({"feature_id": fid, "name": name})
-            auc_rows.append(metrics)
-        elif tcode == 2:
-            y_train = cat_targets[train_idx, fid]
-            y_test = cat_targets[test_idx, fid]
-            mask_train = y_train >= 0
-            mask_test = y_test >= 0
-            if mask_train.sum() < 5 or mask_test.sum() < 2:
-                continue
-            cardinality = int(cache.cat_cardinalities[fid].item()) if cache.cat_cardinalities is not None else int(np.max(y_train[mask_train]) + 1)
-            X_tr = torch.tensor(X_train[mask_train], dtype=torch.float32)
-            y_tr = torch.tensor(y_train[mask_train], dtype=torch.long)
-            X_te = torch.tensor(X_test[mask_test], dtype=torch.float32)
-            y_te = torch.tensor(y_test[mask_test], dtype=torch.long)
-            head = torch.nn.Linear(X_tr.shape[1], cardinality)
-            optimizer = torch.optim.Adam(head.parameters(), lr=0.05)
-            for _ in range(300):
-                optimizer.zero_grad()
-                logits = head(X_tr)
-                loss = F.cross_entropy(logits, y_tr)
-                loss.backward()
-                optimizer.step()
-            logits = head(X_te).detach().cpu().numpy()
-            metrics = compute_multiclass_metrics(logits.tolist(), y_te.cpu().numpy().tolist(), [cardinality])
-            metrics.update({"feature_id": fid, "name": name})
-            f1_rows.append(metrics)
+        X_train = latents[train_idx].numpy()
+        X_test = latents[test_idx].numpy()
+        alpha = 1e-3
+        I = np.eye(X_train.shape[1])
 
-    if ridge_rows:
-        pd.DataFrame(ridge_rows).to_csv(probe_dir / "R2_per_feature.csv", index=False)
-    if auc_rows:
-        pd.DataFrame(auc_rows).to_csv(probe_dir / "AUC_per_feature.csv", index=False)
-    if f1_rows:
-        pd.DataFrame(f1_rows).to_csv(probe_dir / "macroF1_per_feature.csv", index=False)
+        for fid in range(num_features):
+            tcode = int(feature_types[fid].item())
+            name = feature_names[fid] if fid < len(feature_names) else f"feat_{fid}"
+            if tcode == 0:
+                y_train = cont_targets[train_idx, fid]
+                y_test = cont_targets[test_idx, fid]
+                if np.isfinite(y_train).sum() < 5 or np.isfinite(y_test).sum() < 5:
+                    continue
+                A = X_train.T @ X_train + alpha * I
+                b = X_train.T @ y_train
+                w = np.linalg.solve(A, b)
+                y_pred = X_test @ w
+                ss_res = np.sum((y_pred - y_test) ** 2)
+                ss_tot = np.sum((y_test - np.mean(y_test)) ** 2) + EPS
+                r2 = 1 - ss_res / ss_tot
+                ridge_rows.append({"feature_id": fid, "name": name, "r2": float(r2)})
+            elif tcode == 1:
+                y_train = bin_targets[train_idx, fid]
+                y_test = bin_targets[test_idx, fid]
+                mask_train = np.isfinite(y_train)
+                mask_test = np.isfinite(y_test)
+                if mask_train.sum() < 10 or mask_test.sum() < 5:
+                    continue
+                X_tr = torch.tensor(X_train[mask_train], dtype=torch.float32)
+                y_tr = torch.tensor(y_train[mask_train], dtype=torch.float32)
+                X_te = torch.tensor(X_test[mask_test], dtype=torch.float32)
+                y_te = torch.tensor(y_test[mask_test], dtype=torch.float32)
+                w = torch.zeros(X_tr.shape[1], requires_grad=True)
+                b = torch.zeros(1, requires_grad=True)
+                optimizer = torch.optim.SGD([w, b], lr=0.1)
+                pos_weight = torch.tensor([(len(y_tr) - y_tr.sum()) / (y_tr.sum() + EPS)])
+                for _ in range(100):
+                    optimizer.zero_grad()
+                    logits = X_tr @ w + b
+                    loss = F.binary_cross_entropy_with_logits(logits, y_tr, pos_weight=pos_weight)
+                    loss.backward()
+                    optimizer.step()
+                probs = torch.sigmoid(X_te @ w + b).detach().cpu().numpy()
+                labels = y_te.cpu().numpy()
+                metrics = compute_binary_metrics(probs.tolist(), labels.tolist())
+                metrics.update({"feature_id": fid, "name": name})
+                auc_rows.append(metrics)
+            elif tcode == 2:
+                y_train = cat_targets[train_idx, fid]
+                y_test = cat_targets[test_idx, fid]
+                mask_train = y_train >= 0
+                mask_test = y_test >= 0
+                if mask_train.sum() < 10 or mask_test.sum() < 5:
+                    continue
+                cardinality = int(cache.cat_cardinalities[fid].item()) if cache.cat_cardinalities is not None else int(np.max(y_train[mask_train]) + 1)
+                X_tr = torch.tensor(X_train[mask_train], dtype=torch.float32)
+                y_tr = torch.tensor(y_train[mask_train], dtype=torch.long)
+                X_te = torch.tensor(X_test[mask_test], dtype=torch.float32)
+                y_te = torch.tensor(y_test[mask_test], dtype=torch.long)
+                head = torch.nn.Linear(X_tr.shape[1], cardinality)
+                optimizer = torch.optim.SGD(head.parameters(), lr=0.1)
+                for _ in range(150):
+                    optimizer.zero_grad()
+                    logits = head(X_tr)
+                    loss = F.cross_entropy(logits, y_tr)
+                    loss.backward()
+                    optimizer.step()
+                logits = head(X_te).detach().cpu().numpy()
+                metrics = compute_multiclass_metrics(logits.tolist(), y_te.cpu().numpy().tolist(), [cardinality])
+                metrics.update({"feature_id": fid, "name": name})
+                f1_rows.append(metrics)
+
+        if ridge_rows:
+            pd.DataFrame(ridge_rows).to_csv(probe_dir / "R2_per_feature.csv", index=False)
+        if auc_rows:
+            pd.DataFrame(auc_rows).to_csv(probe_dir / "AUC_per_feature.csv", index=False)
+        if f1_rows:
+            pd.DataFrame(f1_rows).to_csv(probe_dir / "macroF1_per_feature.csv", index=False)
+
+        probe_metrics = {
+            "ridge_r2_mean": float(np.mean([row["r2"] for row in ridge_rows])) if ridge_rows else float("nan"),
+            "binary_auc_mean": float(np.mean([row.get("auc", np.nan) for row in auc_rows])) if auc_rows else float("nan"),
+            "multiclass_f1_mean": float(np.mean([row.get("macro_f1", np.nan) for row in f1_rows])) if f1_rows else float("nan"),
+        }
 
     aggregate = {
         "entropy": entropy,
         "entropy_norm": entropy / max_entropy if max_entropy > 0 else float("nan"),
         "gini": gini,
-        "ridge_r2_mean": float(np.mean([row["r2"] for row in ridge_rows])) if ridge_rows else float("nan"),
-        "binary_auc_mean": float(np.mean([row.get("auc", np.nan) for row in auc_rows])) if auc_rows else float("nan"),
-        "multiclass_f1_mean": float(np.mean([row.get("macro_f1", np.nan) for row in f1_rows])) if f1_rows else float("nan"),
+        "ridge_r2_mean": probe_metrics["ridge_r2_mean"],
+        "binary_auc_mean": probe_metrics["binary_auc_mean"],
+        "multiclass_f1_mean": probe_metrics["multiclass_f1_mean"],
     }
 
     _write_json(save_dir / "metrics.json", aggregate)
@@ -1142,9 +1209,11 @@ def evaluate_reconstruction(
     model: torch.nn.Module,
     cache: DataCache,
     cfg: EvalConfig,
+    eval_prob: bool = True,
+    eval_sinkhorn: bool = True,
 ) -> Dict[str, Any]:
-    sink_dir = _ensure_dir(cfg.save_dir / "recon" / "sinkhorn")
-    prob_dir = _ensure_dir(cfg.save_dir / "recon" / "probabilistic")
+    sink_dir = _ensure_dir(cfg.save_dir / "recon" / "sinkhorn") if eval_sinkhorn else None
+    prob_dir = _ensure_dir(cfg.save_dir / "recon" / "probabilistic") if eval_prob else None
 
     rows_sink: List[Dict[str, Any]] = []
     rows_plan: List[Dict[str, Any]] = []
@@ -1160,22 +1229,27 @@ def evaluate_reconstruction(
     device = next(model.parameters()).device
     sampled_sets = select_random_sets(cache, cfg.sample_sets, cfg.seed)
     for sample in sampled_sets:
-        s_dev = _clone_set_to_device(sample, device)
-        with torch.no_grad():
-            v_norm, target = model._compute_target(s_dev)
-            if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
-                x_input = model._build_token_inputs(v_norm, s_dev)
-            else:
-                x_input = v_norm * s_dev["val"]
-            z_list, _ = model.set_encoder.encode(x_input)
-            recon = model.set_encoder.decode(z_list, target_n=target.size(1), use_mean=True, noise_std=0.0)
+        if eval_sinkhorn:
+            s_dev = _clone_set_to_device(sample, device)
+            with torch.no_grad():
+                with _amp_autocast():
+                    v_norm, target = model._compute_target(s_dev)
+                    if hasattr(model, "_build_token_inputs") and getattr(model, "num_features", 0) > 0:
+                        x_input = model._build_token_inputs(v_norm, s_dev)
+                    else:
+                        x_input = v_norm * s_dev["val"]
+                    z_list, _ = model.set_encoder.encode(x_input)
+                    recon = model.set_encoder.decode(z_list, target_n=target.size(1), use_mean=True, noise_std=0.0)
 
-        plan, costs = _sinkhorn_plan(recon.detach(), target.detach(), getattr(model, "sinkhorn_eps", 0.1), getattr(model, "sinkhorn_iters", 100))
-        topk = torch.topk(plan.flatten(), min(10, plan.numel())).values.sum().item()
-        rows_sink.append({"uid": sample.uid, **costs})
-        rows_plan.append({"uid": sample.uid, "top10_mass": float(topk), "total_mass": float(plan.sum().item())})
+            plan, costs = _sinkhorn_plan(recon.detach(), target.detach(), getattr(model, "sinkhorn_eps", 0.1), getattr(model, "sinkhorn_iters", 100))
+            topk = torch.topk(plan.flatten(), min(10, plan.numel())).values.sum().item()
+            rows_sink.append({"uid": sample.uid, **costs})
+            rows_plan.append({"uid": sample.uid, "top10_mass": float(topk), "total_mass": float(plan.sum().item())})
 
-        head = _predict_head_outputs(model, sample.mu.to(device))
+        if not eval_prob:
+            continue
+
+        head = _get_head_outputs(model, sample, device)
         if head is None:
             continue
         cont_mu, cont_logvar, bin_logit, cat_logits_head = head
@@ -1206,32 +1280,36 @@ def evaluate_reconstruction(
                     cat_labels.append(int(max(0, min(card - 1, int(round(val[idx]))))))
                     cat_cards.append(card)
 
-    if rows_sink:
-        pd.DataFrame(rows_sink).to_csv(sink_dir / "ot_components.csv", index=False)
-    if rows_plan:
-        pd.DataFrame(rows_plan).to_csv(sink_dir / "plan_peakedness.csv", index=False)
-
-    sink_metrics = merge_metrics([{k: v for k, v in row.items() if k != "uid"} for row in rows_sink]) if rows_sink else {}
-    if rows_plan:
-        sink_metrics["plan_top10_share"] = _safe_mean([row["top10_mass"] / max(row["total_mass"], EPS) for row in rows_plan])
+    sink_metrics: Dict[str, Any] = {}
+    if eval_sinkhorn and rows_sink:
+        if sink_dir is not None:
+            pd.DataFrame(rows_sink).to_csv(sink_dir / "ot_components.csv", index=False)
+            if rows_plan:
+                pd.DataFrame(rows_plan).to_csv(sink_dir / "plan_peakedness.csv", index=False)
+        sink_metrics = merge_metrics([{k: v for k, v in row.items() if k != "uid"} for row in rows_sink])
+        if rows_plan:
+            sink_metrics["plan_top10_share"] = _safe_mean([row["top10_mass"] / max(row["total_mass"], EPS) for row in rows_plan])
 
     prob_metrics: Dict[str, Any] = {}
-    if cont_preds:
-        cont_metric = compute_continuous_metrics(cont_preds, cont_vars, cont_targets)
-        prob_metrics["continuous"] = {k: v for k, v in cont_metric.items() if k != "pit_values"}
-        if cfg.plots and plt is not None:
-            plt.figure(figsize=(4, 3))
-            plt.hist(cont_metric["pit_values"], bins=20, range=(0, 1))
-            plt.title("Continuous PIT")
-            plt.savefig(prob_dir / "continuous_pit.png", dpi=150)
-            plt.close()
-    if bin_probs:
-        prob_metrics["binary"] = compute_binary_metrics(bin_probs, bin_labels)
-    if cat_logits:
-        prob_metrics["categorical"] = compute_multiclass_metrics(cat_logits, cat_labels, cat_cards)
+    if eval_prob:
+        if cont_preds:
+            cont_metric = compute_continuous_metrics(cont_preds, cont_vars, cont_targets)
+            prob_metrics["continuous"] = {k: v for k, v in cont_metric.items() if k != "pit_values"}
+            if cfg.plots and plt is not None and prob_dir is not None and cfg.tier == "C":
+                plt.figure(figsize=(4, 3))
+                plt.hist(cont_metric.get("pit_values", []), bins=20, range=(0, 1))
+                plt.title("Continuous PIT")
+                plt.savefig(prob_dir / "continuous_pit.png", dpi=150)
+                plt.close()
+        if bin_probs:
+            prob_metrics["binary"] = compute_binary_metrics(bin_probs, bin_labels)
+        if cat_logits:
+            prob_metrics["categorical"] = compute_multiclass_metrics(cat_logits, cat_labels, cat_cards)
+        if prob_dir is not None:
+            _write_json(prob_dir / "metrics.json", prob_metrics)
 
-    _write_json(prob_dir / "metrics.json", prob_metrics)
-    _write_json(sink_dir / "metrics.json", sink_metrics)
+    if eval_sinkhorn and sink_dir is not None:
+        _write_json(sink_dir / "metrics.json", sink_metrics)
 
     return {
         "sinkhorn": sink_metrics,
@@ -1267,6 +1345,40 @@ def evaluate_conditional_inference(
 
         for sample in select_random_sets(cache, cfg.sample_sets, cfg.seed + scenarios.index(scenario)):
             keep_idx, mask_idx = apply_mask_scenario(sample, scenario, rng)
+            values = sample.tensors.get("val")
+            feat_id_full = sample.tensors.get("feat_id")
+            if values is None or feat_id_full is None:
+                continue
+
+            if scenario == "none":
+                head_full = _get_head_outputs(model, sample, device)
+                if head_full is None:
+                    continue
+                cont_mu, cont_logvar, bin_logit, cat_logits_head = head_full
+                fid_full = feat_id_full.squeeze(0).squeeze(-1).cpu().numpy().astype(int)
+                val_full = values.squeeze(0).squeeze(-1).numpy()
+                for local, f in enumerate(fid_full):
+                    if f < 0 or f >= cache.feature_types.numel():
+                        continue
+                    tcode = int(cache.feature_types[f].item())
+                    if tcode == 0:
+                        cont_preds.append(float(cont_mu[0, f].item()))
+                        cont_vars.append(float(torch.exp(cont_logvar[0, f]).item()))
+                        cont_targets.append(float(val_full[local]))
+                    elif tcode == 1:
+                        prob = float(torch.sigmoid(bin_logit[0, f]).item())
+                        bin_probs.append(prob)
+                        bin_labels.append(1.0 if val_full[local] > 0.5 else 0.0)
+                    elif tcode == 2 and cat_logits_head is not None and cache.cat_offsets is not None:
+                        offset = int(cache.cat_offsets[f].item())
+                        card = int(cache.cat_cardinalities[f].item()) if cache.cat_cardinalities is not None else 0
+                        if offset >= 0 and card > 0:
+                            logits = cat_logits_head[0, offset : offset + card].detach().cpu().numpy().tolist()
+                            cat_logits.append(logits)
+                            cat_labels.append(int(max(0, min(card - 1, int(round(val_full[local]))))))
+                            cat_cards.append(card)
+                continue
+
             if mask_idx.numel() == 0:
                 continue
             registry.register(scenario, mask_idx.numpy())
@@ -1278,13 +1390,12 @@ def evaluate_conditional_inference(
             if head is None:
                 continue
             cont_mu, cont_logvar, bin_logit, cat_logits_head = head
-            feat_id = masked.get("feat_id")
-            values = sample.tensors.get("val")
-            if feat_id is None or values is None:
+            fid = masked.get("feat_id")
+            if fid is None:
                 continue
-            fid = feat_id.squeeze(0).squeeze(-1).cpu().numpy().astype(int)
+            fid_np = fid.squeeze(0).squeeze(-1).cpu().numpy().astype(int)
             val = values.squeeze(0).squeeze(-1).numpy()[mask_idx.numpy()]
-            for local, f in enumerate(fid):
+            for local, f in enumerate(fid_np):
                 if f < 0 or f >= cache.feature_types.numel():
                     continue
                 tcode = int(cache.feature_types[f].item())
@@ -1346,15 +1457,14 @@ def evaluate_active_observation(
     delta_scores: Dict[int, List[float]] = defaultdict(list)
 
     device = next(model.parameters()).device
-    rng = torch.Generator(device=device)
-    rng.manual_seed(cfg.seed)
+    mask_rng = random.Random(cfg.seed)
 
     for sample in select_random_sets(cache, cfg.sample_sets, cfg.seed):
-        keep_idx, mask_idx = apply_mask_scenario(sample, "carry_only", random.Random(cfg.seed))
+        keep_idx, mask_idx = apply_mask_scenario(sample, "carry_only", mask_rng)
         observed = _clone_set_to_device(sample, device, keep_idx)
         with torch.no_grad():
             mu_base, logvar_base = _encode_set_latent(model, observed)
-        head_base = _predict_head_outputs(model, mu_base)
+        head_base = _get_head_outputs(model, sample, device)
         if head_base is None:
             continue
         feat_id = sample.tensors.get("feat_id")
@@ -1365,18 +1475,26 @@ def evaluate_active_observation(
         val = values.squeeze(0).squeeze(-1).numpy()
         full_set = _clone_set_to_device(sample, device)
 
+        ranked = []
         for idx, f in enumerate(fid):
             if f < 0 or f >= feature_types.numel():
                 continue
             if idx in keep_idx.tolist():
                 continue
             score = compute_token_uncertainty(model, head_base, f, feature_types)
+            ranked.append((idx, f, score))
+
+        if not ranked:
+            continue
+        ranked.sort(key=lambda x: x[2], reverse=True)
+        top_features = ranked[: cfg.active_topk]
+        for idx, f, score in top_features:
             proxy_scores[f].append(score)
 
             # Monte Carlo delta uncertainty
             tcode = int(feature_types[f].item())
             mu_samples = []
-            for _ in range(mc_samples):
+            for _ in range(min(mc_samples, cfg.mc_samples)):
                 if tcode == 0:
                     pred_mu = float(head_base[0][0, f].item())  # type: ignore[index]
                     pred_sigma = math.sqrt(float(torch.exp(head_base[1][0, f]).item()))  # type: ignore[index]
@@ -1394,8 +1512,8 @@ def evaluate_active_observation(
                     probs = torch.softmax(head_base[3][0, offset : offset + card], dim=-1).cpu().numpy()  # type: ignore[index]
                     sampled_val = int(np.random.choice(np.arange(card), p=probs))
 
-                augmented = full_set.copy()
-                augmented["val"] = full_set["val"].clone()
+                augmented = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in full_set.items()}
+                augmented["val"] = augmented["val"].clone()
                 augmented["val"][:, idx : idx + 1, :] = torch.tensor(sampled_val, dtype=augmented["val"].dtype, device=device).view(1, 1, 1)
                 with torch.no_grad():
                     mu_aug, logvar_aug = _encode_set_latent(model, augmented)
@@ -1603,23 +1721,24 @@ def evaluate_intra_set_consistency(
         df_pit = pd.DataFrame()
         ks_stat, ks_p = float("nan"), float("nan")
 
-    coverage_rows.append({
-        "level": 0.5,
-        "coverage": _coverage_rate(pit_values, 0.5),
-    })
-    coverage_rows.append({
-        "level": 0.8,
-        "coverage": _coverage_rate(pit_values, 0.8),
-    })
-    coverage_rows.append({
-        "level": 0.9,
-        "coverage": _coverage_rate(pit_values, 0.9),
-    })
-    coverage_rows.append({
-        "level": 0.95,
-        "coverage": _coverage_rate(pit_values, 0.95),
-    })
-    pd.DataFrame(coverage_rows).to_csv(coverage_path, index=False)
+    if cfg.tier != "A":
+        coverage_rows.append({
+            "level": 0.5,
+            "coverage": _coverage_rate(pit_values, 0.5),
+        })
+        coverage_rows.append({
+            "level": 0.8,
+            "coverage": _coverage_rate(pit_values, 0.8),
+        })
+        coverage_rows.append({
+            "level": 0.9,
+            "coverage": _coverage_rate(pit_values, 0.9),
+        })
+        coverage_rows.append({
+            "level": 0.95,
+            "coverage": _coverage_rate(pit_values, 0.95),
+        })
+        pd.DataFrame(coverage_rows).to_csv(coverage_path, index=False)
 
     if ece_rows:
         pd.DataFrame(ece_rows).to_csv(ece_path, index=False)
@@ -1667,6 +1786,34 @@ def _ari_score(labels_true: List[int], labels_pred: List[int]) -> float:
     if denom == 0:
         return float("nan")
     return float((sum_comb - expected) / denom)
+
+
+def _nmi_score(labels_true: List[int], labels_pred: List[int]) -> float:
+    from collections import Counter
+
+    n = len(labels_true)
+    if n == 0:
+        return float("nan")
+    counts_true = Counter(labels_true)
+    counts_pred = Counter(labels_pred)
+    joint = Counter(zip(labels_true, labels_pred))
+
+    def entropy(counts: Counter) -> float:
+        total = float(sum(counts.values()))
+        if total <= 0:
+            return 0.0
+        return -sum((c / total) * math.log((c + EPS) / total) for c in counts.values())
+
+    h_true = entropy(counts_true)
+    h_pred = entropy(counts_pred)
+    if h_true <= 0 or h_pred <= 0:
+        return float("nan")
+
+    mi = 0.0
+    for (t, p), c in joint.items():
+        p_tp = c / n
+        mi += p_tp * math.log((p_tp + EPS) / ((counts_true[t] / n) * (counts_pred[p] / n) + EPS))
+    return float(mi / math.sqrt(h_true * h_pred))
 
 
 def analyze_subsystems(
@@ -1752,7 +1899,8 @@ def analyze_subsystems(
     labels_true = [weight_labels.get(fid, -1) for fid in range(num_features)]
     labels_pred = [sens_labels.get(fid, -1) for fid in range(num_features)]
     ari = _ari_score(labels_true, labels_pred)
-    corr = {"ARI": ari}
+    nmi = _nmi_score(labels_true, labels_pred)
+    corr = {"ARI": ari, "NMI": nmi}
     _write_json(consistency_path, corr)
 
     return {
@@ -1865,7 +2013,9 @@ def evaluate_robustness_ablation(
     if delta_rows:
         pd.DataFrame(delta_rows).to_csv(delta_path, index=False)
 
-    return {"ablations": rows, "deltas": delta_rows}
+    delta_mean = _safe_mean([abs(row.get("delta_sinkhorn", 0.0)) for row in delta_rows]) if delta_rows else float("nan")
+
+    return {"ablations": rows, "deltas": delta_rows, "delta_mean": delta_mean}
 
 
 # ---------------------------------------------------------------------------
@@ -1881,7 +2031,11 @@ SUMMARY_THRESHOLDS = {
     "reconstruction.sinkhorn.total": ("<", 50.0),
     "conditional.none.binary.auc": (">", 0.65),
     "ig.stats.avg_kendall_tau": (">", 0.0),
+    "IG_AUCdecay": (">", 0.0),
+    "ActiveObs_corr": (">", 0.0),
     "prior.mmd": ("<", 0.5),
+    "Subsystem_ARI": (">", 0.2),
+    "Robust_delta": ("<", 5.0),
 }
 
 
@@ -1906,6 +2060,18 @@ def summarize_dashboard(results: Dict[str, Any], cfg: EvalConfig) -> None:
 
     pass_fail: Dict[str, bool] = {}
     for metric, (op, threshold) in SUMMARY_THRESHOLDS.items():
+        if metric.startswith("reconstruction.sinkhorn") and not cfg.eval_sinkhorn:
+            continue
+        if (metric.startswith("ig.") or metric.startswith("IG_")) and not cfg.eval_ig:
+            continue
+        if (metric.startswith("ActiveObs") or metric.startswith("active_observation")) and not cfg.eval_active:
+            continue
+        if (metric.startswith("prior") or metric.startswith("MMD")) and not cfg.eval_prior:
+            continue
+        if metric.startswith("Subsystem") and not cfg.eval_subsystems:
+            continue
+        if metric.startswith("Robust") and not cfg.eval_robustness:
+            continue
         value = flat.get(metric)
         if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
             pass_fail[metric] = False
@@ -1921,6 +2087,45 @@ def summarize_dashboard(results: Dict[str, Any], cfg: EvalConfig) -> None:
 
 def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
     save_dir = Path(args.save_dir)
+    tier = str(args.tier).upper()
+    if tier not in {"A", "B", "C"}:
+        raise ValueError(f"Unsupported tier: {tier}")
+
+    plots_flag = _str2bool(args.plots)
+    save_raw = _str2bool(args.save_raw)
+
+    sample_sets = args.sample_sets if args.sample_sets > 0 else {"A": 150, "B": 300, "C": 400}[tier]
+    intra_samples = args.intra_samples if args.intra_samples > 0 else {"A": 100, "B": 200, "C": 300}[tier]
+    mc_samples = args.mc_samples if args.mc_samples > 0 else {"A": 8, "B": 12, "C": 16}[tier]
+
+    if args.mask_scenarios:
+        mask_scenarios = parse_mask_scenarios(args.mask_scenarios)
+    else:
+        defaults = ["none", "mar_0.2", "mar_0.5"]
+        if tier == "C":
+            defaults.append("mar_0.8")
+        mask_scenarios = defaults
+
+    compare_ckpts = [s.strip() for s in args.compare_ckpts.split(",") if s.strip()] if args.compare_ckpts else []
+    if tier == "A":
+        compare_ckpts = []
+
+    robust_modes = [s.strip() for s in args.robust_modes.split(",") if s.strip()] if args.robust_modes else []
+    if tier != "C":
+        robust_modes = []
+    elif not robust_modes:
+        robust_modes = ROBUST_DEFAULT_MODES
+
+    eval_sinkhorn = tier in {"B", "C"}
+    eval_probes = tier in {"B", "C"}
+    eval_active = tier in {"B", "C"}
+    eval_ig = tier in {"B", "C"}
+    eval_prior = tier in {"B", "C"}
+    eval_subsystems = tier == "C"
+    eval_robustness = tier == "C"
+
+    active_topk = args.active_topk if args.active_topk > 0 else 10
+
     return EvalConfig(
         ckpt=args.ckpt,
         schema=args.schema,
@@ -1929,13 +2134,24 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
         batch_size=args.batch_size,
         seed=args.seed,
         n_probe_z=args.n_probe_z,
-        plots=_str2bool(args.plots),
-        mask_scenarios=parse_mask_scenarios(args.mask_scenarios),
+        plots=plots_flag and tier == "C",
+        mask_scenarios=mask_scenarios,
         topk_ig=args.topk_IG,
-        sample_sets=args.sample_sets,
-        save_raw=_str2bool(args.save_raw),
-        compare_ckpts=[s for s in args.compare_ckpts.split(",") if s] if getattr(args, "compare_ckpts", "") else [],
-        robust_modes=[s for s in args.robust_modes.split(",") if s] if getattr(args, "robust_modes", "") else ROBUST_DEFAULT_MODES,
+        sample_sets=sample_sets,
+        save_raw=save_raw,
+        compare_ckpts=compare_ckpts,
+        robust_modes=robust_modes,
+        tier=tier,
+        eval_sinkhorn=eval_sinkhorn,
+        eval_probes=eval_probes,
+        eval_active=eval_active,
+        eval_ig=eval_ig,
+        eval_prior=eval_prior,
+        eval_subsystems=eval_subsystems,
+        eval_robustness=eval_robustness,
+        mc_samples=mc_samples,
+        intra_samples=intra_samples,
+        active_topk=active_topk,
     )
 
 
@@ -1957,47 +2173,102 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
         setattr(model, "cat_offsets", cache.cat_offsets.to(device))
         setattr(model, "cat_cardinalities", cache.cat_cardinalities.to(device) if cache.cat_cardinalities is not None else None)
 
-    results: Dict[str, Any] = {}
+    results: Dict[str, Any] = {"meta": {"tier": cfg.tier, "sample_sets": cfg.sample_sets}}
 
     LOGGER.info("Evaluating posterior health")
     posterior = evaluate_posterior_health(model, cache, cfg)
     results["posterior"] = posterior
 
     LOGGER.info("Evaluating latent information distribution")
-    info_dist = evaluate_latent_information_distribution(model, cache, posterior, cfg)
+    info_dist = evaluate_latent_information_distribution(model, cache, posterior, cfg, run_probes=cfg.eval_probes)
     results["info_dist"] = info_dist
 
     LOGGER.info("Evaluating reconstruction quality")
-    recon = evaluate_reconstruction(model, cache, cfg)
+    recon = evaluate_reconstruction(model, cache, cfg, eval_prob=True, eval_sinkhorn=cfg.eval_sinkhorn)
     results["reconstruction"] = recon
 
     LOGGER.info("Evaluating conditional inference scenarios")
     cond = evaluate_conditional_inference(model, cache, cfg)
     results["conditional"] = cond
 
-    LOGGER.info("Evaluating active observation strategies")
-    active = evaluate_active_observation(model, cache, cfg, mc_samples=max(4, cfg.n_probe_z * 2))
-    results["active_observation"] = active
-
-    LOGGER.info("Evaluating information gain monotonicity")
-    ig = evaluate_ig_monotonicity(model, cache, cfg, topk=cfg.topk_ig)
-    results["ig"] = ig
-
     LOGGER.info("Evaluating intra-set consistency")
     intra = evaluate_intra_set_consistency(model, cache, cfg)
     results["intra_consistency"] = intra
 
-    LOGGER.info("Analyzing subsystems")
-    subsys = analyze_subsystems(model, cache, cfg)
-    results["subsystems"] = subsys
+    # Core summary metrics for tier A
+    results["KL_entropy"] = info_dist.get("entropy")
+    results["Gini"] = info_dist.get("gini")
+    results["PIT_KS_p"] = intra.get("ks", {}).get("ks_p")
 
-    LOGGER.info("Evaluating prior alignment")
-    prior = evaluate_prior_alignment(model, cache, cfg)
-    results["prior"] = prior
+    if cfg.eval_sinkhorn:
+        results["OT_total"] = recon.get("sinkhorn", {}).get("total")
+        results["plan_peaked"] = recon.get("sinkhorn", {}).get("plan_top10_share")
 
-    LOGGER.info("Evaluating robustness modes")
-    robust = evaluate_robustness_ablation(model, cache, cfg, cfg.robust_modes)
-    results["robustness"] = robust
+    if cfg.eval_probes:
+        results["Probe_R2_mean"] = info_dist.get("ridge_r2_mean")
+        results["Probe_AUC_mean"] = info_dist.get("binary_auc_mean")
+        results["Probe_F1_mean"] = info_dist.get("multiclass_f1_mean")
+
+    latent_dim = int(getattr(model, "latent_dim", len(posterior.get("KL_per_dim_mean", [])) or 1))
+    active_dims = posterior.get("ActiveDims", {}).get("@0.1")
+    collapse_detected = bool(active_dims is not None and latent_dim > 0 and active_dims < 0.3 * latent_dim)
+
+    # Scenario-specific summary for conditional metrics
+    for scenario_name, metrics in cond.items():
+        binary = metrics.get("binary", {})
+        if "nll" in binary:
+            results[f"NLL_{scenario_name}"] = binary.get("nll")
+        if "ece" in binary:
+            results[f"ECE_{scenario_name}"] = binary.get("ece")
+
+    if not collapse_detected and cfg.eval_active:
+        LOGGER.info("Evaluating active observation strategies")
+        active = evaluate_active_observation(model, cache, cfg, mc_samples=cfg.mc_samples)
+        results["active_observation"] = active
+        results["ActiveObs_corr"] = active.get("correlation", {}).get("spearman")
+    else:
+        results["active_observation"] = {}
+
+    if not collapse_detected and cfg.eval_ig:
+        LOGGER.info("Evaluating information gain monotonicity")
+        ig = evaluate_ig_monotonicity(model, cache, cfg, topk=cfg.topk_ig)
+        results["ig"] = ig
+        results["IG_tau"] = ig.get("stats", {}).get("avg_kendall_tau")
+        results["IG_AUCdecay"] = ig.get("stats", {}).get("avg_auc_decay")
+    else:
+        results["ig"] = {}
+
+    if not collapse_detected and cfg.eval_prior:
+        LOGGER.info("Evaluating prior alignment")
+        prior = evaluate_prior_alignment(model, cache, cfg)
+        results["prior"] = prior
+        results["MMD_qp"] = prior.get("mmd")
+    else:
+        results["prior"] = {}
+
+    if not collapse_detected and cfg.eval_subsystems:
+        LOGGER.info("Analyzing subsystems")
+        subsys = analyze_subsystems(model, cache, cfg)
+        results["subsystems"] = subsys
+        results["Subsystem_ARI"] = subsys.get("consistency", {}).get("ARI")
+        results["Subsystem_NMI"] = subsys.get("consistency", {}).get("NMI")
+    else:
+        results["subsystems"] = {}
+
+    if not collapse_detected and cfg.eval_robustness:
+        LOGGER.info("Evaluating robustness modes")
+        robust = evaluate_robustness_ablation(model, cache, cfg, cfg.robust_modes)
+        results["robustness"] = robust
+        results["Robust_delta"] = robust.get("delta_mean")
+    else:
+        results["robustness"] = {}
+
+    if collapse_detected:
+        LOGGER.warning(
+            "Active dimensions low (%.1f of %.1f); skipping higher-tier modules.",
+            active_dims or float("nan"),
+            0.3 * latent_dim,
+        )
 
     summarize_dashboard(results, cfg)
     return results
@@ -2010,15 +2281,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--seed", type=int, default=17)
+    ap.add_argument("--tier", choices=["A", "B", "C", "a", "b", "c"], default="A")
     ap.add_argument("--n_probe_z", type=int, default=1)
     ap.add_argument("--save_dir", default="./eval_outputs")
-    ap.add_argument("--plots", default="true")
-    ap.add_argument("--mask_scenarios", default="none")
-    ap.add_argument("--topk_IG", type=int, default=20)
-    ap.add_argument("--sample_sets", type=int, default=300)
+    ap.add_argument("--plots", default="false")
+    ap.add_argument("--mask_scenarios", default="")
+    ap.add_argument("--topk_IG", type=int, default=10)
+    ap.add_argument("--sample_sets", type=int, default=0)
     ap.add_argument("--save_raw", default="false")
     ap.add_argument("--compare_ckpts", default="")
     ap.add_argument("--robust_modes", default="")
+    ap.add_argument("--mc_samples", type=int, default=0)
+    ap.add_argument("--intra_samples", type=int, default=0)
+    ap.add_argument("--active_topk", type=int, default=10)
     ap.add_argument("--log_level", default="INFO")
     return ap.parse_args(argv)
 
