@@ -860,6 +860,77 @@ def _sample_diag_gaussians(
     return mu.unsqueeze(0) + eps * std.unsqueeze(0)
 
 
+def _mmd_rbf(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    bandwidths: Sequence[float] = (1.0,),
+) -> torch.Tensor:
+    if x.ndim == 0 or y.ndim == 0:
+        raise ValueError("x and y must have at least one dimension")
+    if not bandwidths:
+        raise ValueError("bandwidths must be a non-empty sequence")
+
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    else:
+        x = x.reshape(x.shape[0], -1)
+    if y.ndim == 1:
+        y = y.unsqueeze(0)
+    else:
+        y = y.reshape(y.shape[0], -1)
+
+    if x.shape[1] != y.shape[1]:
+        raise ValueError("x and y must have the same feature dimension")
+
+    device = x.device
+    dtype = x.dtype
+    y = y.to(device=device, dtype=dtype, copy=False)
+
+    valid_bandwidths = []
+    for bw in bandwidths:
+        bw_val = float(bw)
+        if bw_val <= 0:
+            raise ValueError("bandwidths must be positive")
+        valid_bandwidths.append(bw_val)
+
+    def _pairwise_sq_dists(a: torch.Tensor, b: Optional[torch.Tensor] = None) -> torch.Tensor:
+        b = a if b is None else b
+        a_norm = (a ** 2).sum(dim=1, keepdim=True)
+        b_norm = (b ** 2).sum(dim=1, keepdim=True)
+        dists = a_norm + b_norm.transpose(0, 1) - 2.0 * (a @ b.transpose(0, 1))
+        return torch.clamp(dists, min=0.0)
+
+    d_xx = _pairwise_sq_dists(x)
+    d_yy = _pairwise_sq_dists(y)
+    d_xy = _pairwise_sq_dists(x, y)
+
+    n = x.shape[0]
+    m = y.shape[0]
+    mmd_sum = torch.zeros((), device=device, dtype=dtype)
+
+    for bw in valid_bandwidths:
+        gamma = 1.0 / (2.0 * (bw ** 2))
+        k_xx = torch.exp(-gamma * d_xx)
+        k_yy = torch.exp(-gamma * d_yy)
+        k_xy = torch.exp(-gamma * d_xy)
+
+        if n > 1:
+            mean_kxx = (k_xx.sum() - k_xx.diagonal().sum()) / (n * (n - 1))
+        else:
+            mean_kxx = torch.zeros((), device=device, dtype=dtype)
+
+        if m > 1:
+            mean_kyy = (k_yy.sum() - k_yy.diagonal().sum()) / (m * (m - 1))
+        else:
+            mean_kyy = torch.zeros((), device=device, dtype=dtype)
+
+        mean_kxy = k_xy.mean()
+        mmd_sum = mmd_sum + mean_kxx + mean_kyy - 2.0 * mean_kxy
+
+    mmd = mmd_sum / len(valid_bandwidths)
+    return torch.clamp(mmd, min=0.0)
+
+
 def _spearman_corr(x: Sequence[float], y: Sequence[float]) -> float:
     if _scipy_stats is not None:
         try:
