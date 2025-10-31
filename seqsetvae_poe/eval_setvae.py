@@ -902,11 +902,29 @@ def evaluate_posterior_health(
     model: torch.nn.Module,
     cache: DataCache,
     cfg: EvalConfig,
+    subset_sets: Optional[List[SetSample]] = None,
 ) -> Dict[str, Any]:
     save_dir = _ensure_dir(cfg.save_dir / "posterior")
 
     mu_stack = cache.latent_matrix
     logvar_stack = torch.stack([s.logvar for s in cache.sets], dim=0)
+
+    if subset_sets is not None:
+        uid_to_idx = {s.uid: idx for idx, s in enumerate(cache.sets)}
+        subset_indices = [uid_to_idx[s.uid] for s in subset_sets if s.uid in uid_to_idx]
+        if subset_indices:
+            mu_stack = mu_stack[subset_indices]
+            logvar_stack = logvar_stack[subset_indices]
+
+    if cfg.tier == "A" and subset_sets is None:
+        total_sets = len(cache.sets)
+        target = min(200, max(1, int(0.1 * total_sets)))
+        if target < total_sets:
+            rng = np.random.default_rng(cfg.seed)
+            idx = rng.choice(total_sets, size=target, replace=False)
+            mu_stack = mu_stack[idx]
+            logvar_stack = logvar_stack[idx]
+
     kl_dim = _kl_diag_gaussian(mu_stack, logvar_stack)
     kl_mean = kl_dim.mean(dim=0)
     kl_std = kl_dim.std(dim=0, unbiased=False)
@@ -1010,6 +1028,7 @@ def evaluate_latent_information_distribution(
     posterior_metrics: Mapping[str, Any],
     cfg: EvalConfig,
     run_probes: bool = True,
+    probe_sets: Optional[List[SetSample]] = None,
 ) -> Dict[str, Any]:
     save_dir = _ensure_dir(cfg.save_dir / "info_dist")
     probe_dir = _ensure_dir(save_dir / "probe")
@@ -1033,18 +1052,31 @@ def evaluate_latent_information_distribution(
     if run_probes:
         latents = cache.latent_matrix
         feature_types = cache.feature_types
-        cont_targets = []
-        bin_targets = []
-        cat_targets = []
-        for sample in select_random_sets(cache, min(cfg.sample_sets, 300), cfg.seed):
-            cont, binaria, categorical = _aggregate_feature_targets(sample, feature_types)
-            cont_targets.append(cont)
-            bin_targets.append(binaria)
-            cat_targets.append(categorical)
-        cont_targets = np.stack(cont_targets, axis=0)
-        bin_targets = np.stack(bin_targets, axis=0)
-        cat_targets = np.stack(cat_targets, axis=0)
 
+        if probe_sets is None:
+            probe_sets = select_random_sets(cache, min(cfg.sample_sets, 300), cfg.seed)
+        if not probe_sets:
+            run_probes = False
+        else:
+            uid_to_idx = {s.uid: idx for idx, s in enumerate(cache.sets)}
+            probe_indices = [uid_to_idx[s.uid] for s in probe_sets if s.uid in uid_to_idx]
+            if not probe_indices:
+                probe_indices = list(range(min(len(cache.sets), cfg.sample_sets)))
+
+            latents = latents[probe_indices]
+            cont_targets = []
+            bin_targets = []
+            cat_targets = []
+            for sample in probe_sets:
+                cont, binaria, categorical = _aggregate_feature_targets(sample, feature_types)
+                cont_targets.append(cont)
+                bin_targets.append(binaria)
+                cat_targets.append(categorical)
+            cont_targets = np.stack(cont_targets, axis=0)
+            bin_targets = np.stack(bin_targets, axis=0)
+            cat_targets = np.stack(cat_targets, axis=0)
+
+    if run_probes:
         num_features = int(feature_types.numel())
         rng = np.random.default_rng(cfg.seed)
         idx = np.arange(latents.shape[0])
@@ -1211,6 +1243,7 @@ def evaluate_reconstruction(
     cfg: EvalConfig,
     eval_prob: bool = True,
     eval_sinkhorn: bool = True,
+    samples: Optional[List[SetSample]] = None,
 ) -> Dict[str, Any]:
     sink_dir = _ensure_dir(cfg.save_dir / "recon" / "sinkhorn") if eval_sinkhorn else None
     prob_dir = _ensure_dir(cfg.save_dir / "recon" / "probabilistic") if eval_prob else None
@@ -1227,7 +1260,7 @@ def evaluate_reconstruction(
     cat_cards: List[int] = []
 
     device = next(model.parameters()).device
-    sampled_sets = select_random_sets(cache, cfg.sample_sets, cfg.seed)
+    sampled_sets = samples if samples is not None else select_random_sets(cache, cfg.sample_sets, cfg.seed)
     for sample in sampled_sets:
         if eval_sinkhorn:
             s_dev = _clone_set_to_device(sample, device)
@@ -1321,6 +1354,7 @@ def evaluate_conditional_inference(
     model: torch.nn.Module,
     cache: DataCache,
     cfg: EvalConfig,
+    samples: Optional[List[SetSample]] = None,
 ) -> Dict[str, Any]:
     scenarios = cfg.mask_scenarios or ["none"]
     base_dir = _ensure_dir(cfg.save_dir / "cond_infer")
@@ -1343,7 +1377,8 @@ def evaluate_conditional_inference(
         cat_labels: List[int] = []
         cat_cards: List[int] = []
 
-        for sample in select_random_sets(cache, cfg.sample_sets, cfg.seed + scenarios.index(scenario)):
+        selected = samples if samples is not None else select_random_sets(cache, cfg.sample_sets, cfg.seed + scenarios.index(scenario))
+        for sample in selected:
             keep_idx, mask_idx = apply_mask_scenario(sample, scenario, rng)
             values = sample.tensors.get("val")
             feat_id_full = sample.tensors.get("feat_id")
@@ -1447,6 +1482,7 @@ def evaluate_active_observation(
     cache: DataCache,
     cfg: EvalConfig,
     mc_samples: int = 16,
+    samples: Optional[List[SetSample]] = None,
 ) -> Dict[str, Any]:
     base_dir = _ensure_dir(cfg.save_dir / "active_obs")
     proxy_path = base_dir / "proxy_rank.csv"
@@ -1459,7 +1495,9 @@ def evaluate_active_observation(
     device = next(model.parameters()).device
     mask_rng = random.Random(cfg.seed)
 
-    for sample in select_random_sets(cache, cfg.sample_sets, cfg.seed):
+    selected_sets = samples if samples is not None else select_random_sets(cache, cfg.sample_sets, cfg.seed)
+
+    for sample in selected_sets:
         keep_idx, mask_idx = apply_mask_scenario(sample, "carry_only", mask_rng)
         observed = _clone_set_to_device(sample, device, keep_idx)
         with torch.no_grad():
@@ -1494,7 +1532,7 @@ def evaluate_active_observation(
             # Monte Carlo delta uncertainty
             tcode = int(feature_types[f].item())
             mu_samples = []
-            for _ in range(min(mc_samples, cfg.mc_samples)):
+            for _ in range(mc_samples):
                 if tcode == 0:
                     pred_mu = float(head_base[0][0, f].item())  # type: ignore[index]
                     pred_sigma = math.sqrt(float(torch.exp(head_base[1][0, f]).item()))  # type: ignore[index]
@@ -1570,6 +1608,7 @@ def evaluate_ig_monotonicity(
     cache: DataCache,
     cfg: EvalConfig,
     topk: int,
+    samples: Optional[List[SetSample]] = None,
 ) -> Dict[str, Any]:
     save_dir = _ensure_dir(cfg.save_dir / "ig_monotonic")
     curves_path = save_dir / "curves.csv"
@@ -1580,7 +1619,9 @@ def evaluate_ig_monotonicity(
     w2_values: List[List[float]] = []
     stats_rows: List[Dict[str, Any]] = []
 
-    for sample in select_random_sets(cache, cfg.sample_sets, cfg.seed):
+    selected_sets = samples if samples is not None else select_random_sets(cache, cfg.sample_sets, cfg.seed)
+
+    for sample in selected_sets:
         full = _clone_set_to_device(sample, device)
         with torch.no_grad():
             mu_full, logvar_full = _encode_set_latent(model, full)
@@ -1619,6 +1660,10 @@ def evaluate_ig_monotonicity(
             curve.append(float(max(min(cos, 1.0), -1.0)))
             w2 = torch.norm(mu_full - mu_sub).item() + float(torch.abs(torch.exp(logvar_full) - torch.exp(logvar_sub)).mean().item())
             w2_curve.append(w2)
+            if cfg.tier == "A":
+                tau_partial, _ = _kendall_tau_b(list(range(len(curve))), curve)
+                if tau_partial is not None and not math.isnan(tau_partial) and tau_partial <= 0:
+                    break
 
         if len(curve) <= 1:
             continue
@@ -1659,6 +1704,7 @@ def evaluate_intra_set_consistency(
     model: torch.nn.Module,
     cache: DataCache,
     cfg: EvalConfig,
+    samples: Optional[List[SetSample]] = None,
 ) -> Dict[str, Any]:
     base_dir = _ensure_dir(cfg.save_dir / "intraconsistency")
     pit_path = base_dir / "pit.csv"
@@ -1672,15 +1718,24 @@ def evaluate_intra_set_consistency(
     ks_rows = []
     ece_rows = []
     coverage_rows = []
+    pit_counts: Dict[int, int] = defaultdict(int)
 
-    for sample in select_random_sets(cache, cfg.sample_sets, cfg.seed):
+    token_cap = 8 if cfg.tier == "A" else 16
+    selected_sets = samples if samples is not None else select_random_sets(cache, cfg.intra_samples if cfg.tier == "A" else cfg.sample_sets, cfg.seed)
+
+    for sample in selected_sets:
         feat_id = sample.tensors.get("feat_id")
         values = sample.tensors.get("val")
         if feat_id is None or values is None:
             continue
         fid = feat_id.squeeze(0).squeeze(-1)
         val = values.squeeze(0).squeeze(-1)
-        for idx in range(fid.shape[0]):
+        indices = list(range(fid.shape[0]))
+        if len(indices) > token_cap:
+            rng_local = random.Random(cfg.seed + hash(sample.uid) % (10**6))
+            rng_local.shuffle(indices)
+            indices = indices[:token_cap]
+        for idx in indices:
             keep = torch.tensor([i for i in range(fid.shape[0]) if i != idx], dtype=torch.long)
             masked = torch.tensor([idx], dtype=torch.long)
             observed = _clone_set_to_device(sample, device, keep)
@@ -1695,11 +1750,14 @@ def evaluate_intra_set_consistency(
             tcode = int(cache.feature_types[f].item())
             target_val = float(val[idx].item())
             if tcode == 0:
+                if pit_counts[f] >= 100:
+                    continue
                 mu = float(head[0][0, f].item())
                 sigma = math.sqrt(float(torch.exp(head[1][0, f]).item()))
                 z_score = (target_val - mu) / max(sigma, EPS)
                 pit = 0.5 * (1.0 + math.erf(z_score / math.sqrt(2.0)))
                 pit_values.append(pit)
+                pit_counts[f] += 1
             elif tcode == 1:
                 prob = float(torch.sigmoid(head[2][0, f]).item())
                 ece_rows.append({"feature_id": f, "prob": prob, "label": 1.0 if target_val > 0.5 else 0.0})
@@ -1925,6 +1983,10 @@ def evaluate_prior_alignment(
     generator.manual_seed(cfg.seed)
     q_samples = _sample_diag_gaussians(mu_stack, logvar_stack, max(1, cfg.n_probe_z), generator=generator).reshape(-1, mu_stack.shape[-1])
     p_samples = torch.randn_like(q_samples, generator=generator)
+    if cfg.tier == "A" and q_samples.shape[0] > 5000:
+        perm = torch.randperm(q_samples.shape[0], generator=generator)[:5000]
+        q_samples = q_samples[perm]
+        p_samples = p_samples[perm]
     mmd = float(_mmd_rbf(q_samples, p_samples, bandwidths=(0.5, 1.0, 2.0, 4.0, 8.0)).item())
     pd.DataFrame({"mmd": [mmd]}).to_csv(mmd_path, index=False)
 
@@ -2094,8 +2156,8 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
     plots_flag = _str2bool(args.plots)
     save_raw = _str2bool(args.save_raw)
 
-    sample_sets = args.sample_sets if args.sample_sets > 0 else {"A": 150, "B": 300, "C": 400}[tier]
-    intra_samples = args.intra_samples if args.intra_samples > 0 else {"A": 100, "B": 200, "C": 300}[tier]
+    sample_sets = args.sample_sets if args.sample_sets > 0 else {"A": 200, "B": 300, "C": 400}[tier]
+    intra_samples = args.intra_samples if args.intra_samples > 0 else {"A": 60, "B": 200, "C": 300}[tier]
     mc_samples = args.mc_samples if args.mc_samples > 0 else {"A": 8, "B": 12, "C": 16}[tier]
 
     if args.mask_scenarios:
@@ -2124,7 +2186,10 @@ def build_evaluation_config(args: argparse.Namespace) -> EvalConfig:
     eval_subsystems = tier == "C"
     eval_robustness = tier == "C"
 
-    active_topk = args.active_topk if args.active_topk > 0 else 10
+    if args.active_topk > 0:
+        active_topk = args.active_topk
+    else:
+        active_topk = {"A": 5, "B": 10, "C": 10}[tier]
 
     return EvalConfig(
         ckpt=args.ckpt,
@@ -2173,26 +2238,46 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
         setattr(model, "cat_offsets", cache.cat_offsets.to(device))
         setattr(model, "cat_cardinalities", cache.cat_cardinalities.to(device) if cache.cat_cardinalities is not None else None)
 
+    shared_sets = select_random_sets(cache, cfg.sample_sets, cfg.seed)
+    if cfg.tier == "A":
+        recon_sets = shared_sets[:100]
+        cond_sets = recon_sets
+        intra_sets = shared_sets[:min(len(shared_sets), cfg.intra_samples)]
+        active_sets = shared_sets[:100]
+        ig_sets = shared_sets[:100]
+        probe_sets = shared_sets[:200]
+        total_sets = len(cache.sets)
+        target = min(200, max(1, int(0.1 * total_sets)))
+        posterior_subset = shared_sets[: min(len(shared_sets), target)]
+    else:
+        recon_sets = shared_sets
+        cond_sets = shared_sets
+        intra_sets = shared_sets[: cfg.intra_samples]
+        active_sets = shared_sets
+        ig_sets = shared_sets
+        probe_sets = shared_sets
+        posterior_subset = None
+
     results: Dict[str, Any] = {"meta": {"tier": cfg.tier, "sample_sets": cfg.sample_sets}}
 
     LOGGER.info("Evaluating posterior health")
-    posterior = evaluate_posterior_health(model, cache, cfg)
+    posterior = evaluate_posterior_health(model, cache, cfg, subset_sets=posterior_subset)
     results["posterior"] = posterior
 
     LOGGER.info("Evaluating latent information distribution")
-    info_dist = evaluate_latent_information_distribution(model, cache, posterior, cfg, run_probes=cfg.eval_probes)
+    info_dist = evaluate_latent_information_distribution(model, cache, posterior, cfg, run_probes=cfg.eval_probes, probe_sets=probe_sets if cfg.eval_probes else None)
     results["info_dist"] = info_dist
 
     LOGGER.info("Evaluating reconstruction quality")
-    recon = evaluate_reconstruction(model, cache, cfg, eval_prob=True, eval_sinkhorn=cfg.eval_sinkhorn)
+    recon = evaluate_reconstruction(model, cache, cfg, eval_prob=True, eval_sinkhorn=cfg.eval_sinkhorn, samples=recon_sets)
     results["reconstruction"] = recon
 
     LOGGER.info("Evaluating conditional inference scenarios")
-    cond = evaluate_conditional_inference(model, cache, cfg)
+    cond = evaluate_conditional_inference(model, cache, cfg, samples=cond_sets)
     results["conditional"] = cond
 
     LOGGER.info("Evaluating intra-set consistency")
-    intra = evaluate_intra_set_consistency(model, cache, cfg)
+    intra = evaluate_intra_set_consistency(model, cache, cfg, samples=intra_sets)
     results["intra_consistency"] = intra
 
     # Core summary metrics for tier A
@@ -2212,6 +2297,7 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
     latent_dim = int(getattr(model, "latent_dim", len(posterior.get("KL_per_dim_mean", [])) or 1))
     active_dims = posterior.get("ActiveDims", {}).get("@0.1")
     collapse_detected = bool(active_dims is not None and latent_dim > 0 and active_dims < 0.3 * latent_dim)
+    results["meta"]["collapse"] = collapse_detected
 
     # Scenario-specific summary for conditional metrics
     for scenario_name, metrics in cond.items():
@@ -2223,7 +2309,7 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
 
     if not collapse_detected and cfg.eval_active:
         LOGGER.info("Evaluating active observation strategies")
-        active = evaluate_active_observation(model, cache, cfg, mc_samples=cfg.mc_samples)
+        active = evaluate_active_observation(model, cache, cfg, mc_samples=cfg.mc_samples, samples=active_sets)
         results["active_observation"] = active
         results["ActiveObs_corr"] = active.get("correlation", {}).get("spearman")
     else:
@@ -2231,7 +2317,8 @@ def run_evaluation(cfg: EvalConfig) -> Dict[str, Any]:
 
     if not collapse_detected and cfg.eval_ig:
         LOGGER.info("Evaluating information gain monotonicity")
-        ig = evaluate_ig_monotonicity(model, cache, cfg, topk=cfg.topk_ig)
+        ig_topk = 8 if cfg.tier == "A" else cfg.topk_ig
+        ig = evaluate_ig_monotonicity(model, cache, cfg, topk=ig_topk, samples=ig_sets)
         results["ig"] = ig
         results["IG_tau"] = ig.get("stats", {}).get("avg_kendall_tau")
         results["IG_AUCdecay"] = ig.get("stats", {}).get("avg_auc_decay")
